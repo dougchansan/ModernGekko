@@ -66,6 +66,36 @@ struct RuntimeConfig
   bool allow_interpreter = false;
   bool show_fps_in_title = true;
   std::optional<std::string> window_title;
+
+  // Benchmark automation. All of these hang off Dolphin's existing ~1 Hz
+  // Host_UpdateTitle tick, so they add no thread of their own and inherit its
+  // guarantee of running on the host thread with the core live.
+  //
+  // A benchmark needs a fixed scene, an uncapped run, and a machine-readable
+  // speed; without these the only signal is a present-rate counter in the
+  // window title, which measures nothing once the emulator is uncapped.
+  std::filesystem::path status_file;
+  std::filesystem::path load_state_path;
+  std::filesystem::path save_state_path;
+  double load_state_after_seconds = 5.0;
+  double save_state_after_seconds = 0.0;
+  double run_seconds = 0.0;
+  // Buttons held on port 0 once the run starts, as a GCPadStatus mask.
+  // Benchmarking a parked savestate understates load; holding accelerate
+  // keeps the kart driving so track geometry keeps streaming in.
+  unsigned int hold_buttons = 0;
+  // Buttons pressed and released repeatedly on port 0, as a GCPadStatus mask.
+  // A menu advances on the press *edge*, so a permanent hold advances at most
+  // one screen; walking a fresh boot through to a race needs a release between
+  // presses.
+  unsigned int spam_buttons = 0;
+  // Seconds each half of the press/release cycle lasts. Slow enough that a
+  // menu's own debounce and transition animations do not swallow the edge.
+  double spam_period_seconds = 0.25;
+  // Stop spamming this many seconds in, releasing the buttons. START pauses a
+  // race and A dismisses the pause, so spam that outlives the menus cycles the
+  // pause screen forever and the race never runs. 0 means never stop.
+  double spam_stop_seconds = 0.0;
 };
 
 enum class RuntimeErrorCode

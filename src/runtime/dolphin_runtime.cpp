@@ -8,16 +8,21 @@
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/CoreTiming.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/HW/GBACore.h"
 #include "Core/Host.h"
 #include "Core/NetPlay/NetPlayClient.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
+#include "Core/HW/GCPad.h"
+#include "Core/State.h"
 #include "Core/System.h"
 #include "DolphinNoGUI/Platform.h"
 #include "UICommon/UICommon.h"
 #include "VideoCommon/PerformanceMetrics.h"
+#include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/VideoConfig.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
@@ -31,7 +36,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -50,6 +58,156 @@ std::unique_ptr<BootSessionData> s_boot_session_data;
 u64 s_previous_net_wait_ns = 0;
 double s_net_wait_ms_per_second = 0.0;
 std::chrono::steady_clock::time_point s_previous_net_wait_sample;
+
+// Benchmark automation state, driven by a dedicated thread in Runtime::Run.
+//
+// It deliberately does not piggyback on the title-update thread: that one only
+// exists when a window is present and show_fps_in_title is set, so a headless
+// run would tick exactly once and report a permanent speed of 0. Headless is
+// the mode a benchmark most wants.
+//
+// State::LoadAs and SaveAs both hop to the CPU thread via Core::RunOnCPUThread,
+// so calling them from here is safe.
+std::filesystem::path s_status_file;
+std::filesystem::path s_load_state_path;
+std::filesystem::path s_save_state_path;
+double s_load_state_after_seconds = 5.0;
+double s_save_state_after_seconds = 0.0;
+double s_run_seconds = 0.0;
+double s_screenshot_after_seconds = 0.0;
+std::filesystem::path s_screenshot_trigger;
+unsigned int s_hold_buttons = 0;
+unsigned int s_spam_buttons = 0;
+double s_spam_period_seconds = 0.25;
+double s_spam_stop_seconds = 0.0;
+bool s_spam_pressed = false;
+double s_spam_next_toggle = 0.0;
+u64 s_spam_next_tick = 0;
+bool s_hold_applied = false;
+bool s_load_state_done = false;
+bool s_save_state_done = false;
+bool s_screenshot_done = false;
+bool s_automation_started = false;
+u64 s_status_updates = 0;
+std::chrono::steady_clock::time_point s_automation_start;
+
+void RunAutomationTick() {
+  if (s_status_file.empty() && s_load_state_path.empty() &&
+      s_save_state_path.empty() && s_run_seconds <= 0.0 && s_hold_buttons == 0 &&
+      s_spam_buttons == 0)
+    return;
+
+  const auto now = std::chrono::steady_clock::now();
+  if (!s_automation_started) {
+    s_automation_started = true;
+    s_automation_start = now;
+  }
+  const double elapsed =
+      std::chrono::duration<double>(now - s_automation_start).count();
+
+  auto &system = Core::System::GetInstance();
+
+  // Re-apply every tick rather than once: Pad::LoadConfig during boot
+  // reconstructs the controllers, and a hold applied before that is lost.
+  if (s_hold_buttons != 0 && (!s_hold_applied || !s_load_state_done)) {
+    Pad::SetHeldButtons(0, static_cast<u16>(s_hold_buttons));
+    s_hold_applied = true;
+  }
+
+  // Menus advance on the press edge, so a held button is not a press: it goes
+  // down once and then reads as permanently down, which advances at most one
+  // screen. Release between presses so each cycle produces a fresh edge, and
+  // a fresh boot can be walked through to a race unattended.
+  if (s_spam_buttons != 0 && s_spam_stop_seconds > 0.0 &&
+      elapsed >= s_spam_stop_seconds) {
+    s_spam_buttons = 0;
+    Pad::SetHeldButtons(0, static_cast<u16>(s_hold_buttons));
+    std::fprintf(stderr, "[spam] stopped at %.0fs\n", elapsed);
+  }
+
+  // Drive the spam from EMULATED time, not wall clock. This tick runs on a
+  // real-time thread, so a wall-clock cadence lands at wildly different points
+  // in the game depending on how fast the build runs -- 3.7x uncapped versus
+  // ~1x with the write journal. That made the same savestate walk different
+  // menu paths run to run, which read as an intermittent "race" until the cause
+  // was traced back to here. Emulated ticks make a given state reproducible.
+  // Hold off until the state is loaded, and re-sync afterwards: loading jumps
+  // the tick counter to the state's value, so a schedule started at boot is
+  // stale the moment the state lands -- which reintroduced exactly the
+  // wall-clock dependence this change was meant to remove.
+  if (s_spam_buttons != 0 && !s_load_state_path.empty() && !s_load_state_done) {
+    // no input before the state is in place
+  } else if (s_spam_buttons != 0) {
+    const u64 ticks = system.GetCoreTiming().GetTicks();
+    const u64 period =
+        static_cast<u64>(s_spam_period_seconds *
+                         static_cast<double>(system.GetSystemTimers().GetTicksPerSecond()));
+    if (period != 0 && ticks >= s_spam_next_tick) {
+      s_spam_pressed = !s_spam_pressed;
+      s_spam_next_tick = ticks + period;
+      // Release to nothing, not to the hold mask. --hold-accelerate holds A,
+      // and an A that never lifts produces no press edge, so combining the two
+      // would silently stop the spam from advancing anything.
+      Pad::SetHeldButtons(0, s_spam_pressed ? static_cast<u16>(s_spam_buttons) : 0);
+    }
+  }
+
+  if (!s_load_state_path.empty() && !s_load_state_done &&
+      elapsed >= s_load_state_after_seconds) {
+    s_load_state_done = true;
+    State::LoadAs(system, s_load_state_path.string());
+    s_spam_next_tick = system.GetCoreTiming().GetTicks();   // re-sync after the jump
+  }
+
+  if (!s_save_state_path.empty() && !s_save_state_done &&
+      elapsed >= s_save_state_after_seconds) {
+    s_save_state_done = true;
+    State::SaveAs(system, s_save_state_path.string());
+  }
+
+  const bool screenshot_time_reached =
+      s_screenshot_after_seconds > 0.0 && elapsed >= s_screenshot_after_seconds;
+  const bool screenshot_triggered =
+      !s_screenshot_trigger.empty() && std::filesystem::exists(s_screenshot_trigger);
+  if (!s_screenshot_done && (screenshot_time_reached || screenshot_triggered)) {
+    s_screenshot_done = true;
+    // This tick is deliberately off the CPU thread. Core::SaveScreenShot()
+    // acquires a CPUThreadGuard and can deadlock here; FrameDumper's request
+    // path is explicitly protected by its own mutex and consumed by video.
+    const char* path = std::getenv("KART_SCREENSHOT_PATH");
+    g_frame_dumper->SaveScreenshot(path ? path : "/tmp/kart-nine-course.png");
+    std::fprintf(stderr, "[screenshot] requested at %.0fs\n", elapsed);
+  }
+
+  if (!s_status_file.empty()) {
+    const auto &metrics = system.GetPerfMetrics();
+    // Rewrite in place rather than append: a poller only ever wants the
+    // latest sample. It can read a partial write, so the reader retries --
+    // see the benchmark harness.
+    const std::filesystem::path temporary =
+        s_status_file.string() + ".tmp";
+    {
+      std::ofstream out(temporary, std::ios::trunc);
+      if (out) {
+        out << "updates=" << ++s_status_updates << '\n'
+            << "elapsed=" << elapsed << '\n'
+            << "speed=" << metrics.GetSpeed() << '\n'
+            << "max_speed=" << metrics.GetMaxSpeed() << '\n'
+            << "vps=" << metrics.GetVPS() << '\n'
+            << "fps=" << metrics.GetFPS() << '\n'
+            << "state_loaded=" << (s_load_state_done ? 1 : 0) << '\n';
+      }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, s_status_file, rename_error);
+  }
+
+  // The Windows automation `stop` command was accepted but never exited the
+  // runner, and killing it instead skipped atexit hooks. Exiting on our own
+  // deadline avoids needing a kill at all.
+  if (s_run_seconds > 0.0 && elapsed >= s_run_seconds && s_platform)
+    s_platform->Stop();
+}
 
 std::string FormatWindowTitle(const std::string &title, double fps) {
   if (!std::isfinite(fps) || fps < 0.0)
@@ -237,6 +395,13 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
 
   if (!s_external_ui_common) {
     UICommon::SetUserDirectory(impl->config.user_directory.string());
+    // UICommon::Init() does not create the user directory tree; DolphinQt and
+    // the Android frontend both call CreateDirectories() themselves and this
+    // runner never did. StateSaves/ is only created here, so State::Save had
+    // nowhere to write and every savestate from the States menu failed
+    // silently -- no file, no error. Screenshots, logs and shader caches were
+    // missing their directories for the same reason.
+    UICommon::CreateDirectories();
     UICommon::Init();
     impl->ui_initialized = true;
   }
@@ -272,7 +437,26 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   impl->controllers_initialized = true;
   impl->platform->SetTitle(impl->title);
 
-  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
+  // MODERNGEKKO_CPU_CORE=jit lets a benchmark run Dolphin's own dynamic
+  // recompiler instead of the static one, which is the only way to answer
+  // whether the recompiled module is actually beating the JIT. Diagnostic
+  // only -- StaticRecomp remains the default and the shipped configuration.
+  PowerPC::CPUCore cpu_core = PowerPC::CPUCore::StaticRecomp;
+  if (const char *core_override = std::getenv("MODERNGEKKO_CPU_CORE")) {
+    const std::string requested = core_override;
+    if (requested == "jit" || requested == "jit64" || requested == "jitarm64")
+#if defined(_M_ARM_64) || defined(__aarch64__)
+      cpu_core = PowerPC::CPUCore::JITARM64;
+#else
+      cpu_core = PowerPC::CPUCore::JIT64;
+#endif
+    else if (requested == "interpreter")
+      cpu_core = PowerPC::CPUCore::Interpreter;
+    else if (requested == "cachedinterpreter")
+      cpu_core = PowerPC::CPUCore::CachedInterpreter;
+    std::fprintf(stderr, "[moderngekko] cpu core override: %s\n", core_override);
+  }
+  Config::SetBase(Config::MAIN_CPU_CORE, cpu_core);
   if (!impl->config.graphics.backend.empty())
     Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
   else if (impl->config.headless)
@@ -326,6 +510,33 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   s_platform = impl->platform.get();
   s_window_title = impl->title;
   s_show_fps_in_title = impl->config.show_fps_in_title;
+  s_status_file = impl->config.status_file;
+  s_load_state_path = impl->config.load_state_path;
+  s_save_state_path = impl->config.save_state_path;
+  s_load_state_after_seconds = impl->config.load_state_after_seconds;
+  s_save_state_after_seconds = impl->config.save_state_after_seconds;
+  s_run_seconds = impl->config.run_seconds;
+  if (const char* value = std::getenv("KART_SCREENSHOT_AFTER"))
+    s_screenshot_after_seconds = std::strtod(value, nullptr);
+  else
+    s_screenshot_after_seconds = 0.0;
+  if (const char* value = std::getenv("KART_SCREENSHOT_TRIGGER"))
+    s_screenshot_trigger = value;
+  else
+    s_screenshot_trigger.clear();
+  s_hold_buttons = impl->config.hold_buttons;
+  s_spam_buttons = impl->config.spam_buttons;
+  s_spam_period_seconds = impl->config.spam_period_seconds;
+  s_spam_stop_seconds = impl->config.spam_stop_seconds;
+  s_spam_pressed = false;
+  s_spam_next_toggle = 0.0;
+  s_spam_next_tick = 0;
+  s_hold_applied = false;
+  s_load_state_done = false;
+  s_save_state_done = false;
+  s_screenshot_done = false;
+  s_automation_started = false;
+  s_status_updates = 0;
   return {std::unique_ptr<Runtime>(new Runtime(std::move(impl))), {}};
 }
 
@@ -344,6 +555,18 @@ Runtime::~Runtime() {
   s_platform = nullptr;
   s_window_title.clear();
   s_show_fps_in_title = true;
+  s_status_file.clear();
+  s_load_state_path.clear();
+  s_save_state_path.clear();
+  s_run_seconds = 0.0;
+  s_screenshot_after_seconds = 0.0;
+  s_screenshot_trigger.clear();
+  s_hold_buttons = 0;
+  s_spam_buttons = 0;
+  s_spam_pressed = false;
+  s_spam_next_toggle = 0.0;
+  s_hold_applied = false;
+  s_automation_started = false;
   s_runtime_active = false;
 }
 
@@ -384,6 +607,19 @@ RuntimeRunResult Runtime::Run() {
   }
   m_impl->booted = true;
   std::jthread title_thread;
+  std::jthread automation_thread;
+  if (!s_status_file.empty() || !s_load_state_path.empty() ||
+      !s_save_state_path.empty() || s_run_seconds > 0.0 || s_hold_buttons != 0 ||
+      s_spam_buttons != 0) {
+    automation_thread = std::jthread([](std::stop_token stop_token) {
+      while (!stop_token.stop_requested()) {
+        RunAutomationTick();
+        for (int i = 0; i < 5 && !stop_token.stop_requested(); ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+    });
+  }
+
   if (!m_impl->config.headless && m_impl->config.show_fps_in_title) {
     title_thread = std::jthread([](std::stop_token stop_token) {
       while (!stop_token.stop_requested()) {
@@ -394,6 +630,9 @@ RuntimeRunResult Runtime::Run() {
     });
   }
   m_impl->platform->MainLoop();
+  automation_thread.request_stop();
+  if (automation_thread.joinable())
+    automation_thread.join();
   title_thread.request_stop();
   if (title_thread.joinable())
     title_thread.join();

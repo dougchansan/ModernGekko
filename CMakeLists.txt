@@ -122,8 +122,23 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(LINUX_LOCAL_DEV ON CACHE BOOL "" FORCE)
     set(DISTRIBUTOR "ModernGekko" CACHE STRING "" FORCE)
     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
-    target_sources(core PRIVATE
-        vendor/dolphin/GXRuntime/src/core/cpu_exception.c)
+    # Dolphin creates `core` before its Direct3D backend targets, so the
+    # conditional links in Core/CMakeLists.txt cannot see them during a
+    # standalone ModernGekko configure.  Add the Windows backends after the
+    # complete Dolphin target graph exists.
+    if(WIN32)
+        foreach(_moderngekko_d3d_target videod3d videod3d12)
+            if(TARGET "${_moderngekko_d3d_target}")
+                target_link_libraries(core PUBLIC "${_moderngekko_d3d_target}")
+            endif()
+        endforeach()
+    endif()
+    set(_moderngekko_cpu_exception_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/src/core/cpu_exception.c")
+    target_sources(core PRIVATE "${_moderngekko_cpu_exception_source}")
+    set_source_files_properties("${_moderngekko_cpu_exception_source}"
+        TARGET_DIRECTORY core
+        PROPERTIES LANGUAGE CXX)
     target_include_directories(core PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
     if(MODERNGEKKO_FRONTEND_SDK)

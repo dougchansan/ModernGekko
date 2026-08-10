@@ -36,8 +36,15 @@ bool ValidNetplayAddress(std::string_view value) {
 
 std::string NormalizeGraphicsBackend(std::string value) {
   const std::string lower = Lower(Trim(std::move(value)));
+#if defined(__APPLE__)
+  // Dolphin's backend name is "Metal"; macOS ships no Vulkan driver, so this
+  // is the only hardware path that is not the deprecated GL 4.1 one.
+  if (lower == "metal")
+    return "Metal";
+#else
   if (lower == "vulkan")
     return "Vulkan";
+#endif
   if (lower == "opengl" || lower == "ogl")
     return "OGL";
   return {};
@@ -85,7 +92,11 @@ const std::vector<ResolutionOption> &SupportedResolutions() {
 
 const std::vector<GraphicsBackendOption> &SupportedGraphicsBackends() {
   static const std::vector<GraphicsBackendOption> backends = {
+#if defined(__APPLE__)
+      {"Metal", "Metal"},
+#else
       {"Vulkan", "Vulkan"},
+#endif
       {"OpenGL", "OGL"},
   };
   return backends;
@@ -124,7 +135,11 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     else if (key == "backend" || key == "graphics_backend") {
       config.graphics_backend = NormalizeGraphicsBackend(raw_value);
       if (config.graphics_backend.empty())
+#if defined(__APPLE__)
+        return {.error = "graphics backend must be Metal or OpenGL"};
+#else
         return {.error = "graphics backend must be Vulkan or OpenGL"};
+#endif
     }
     else if (key == "controller")
       config.controller = raw_value;

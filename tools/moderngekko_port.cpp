@@ -35,6 +35,10 @@ constexpr std::string_view DOLRECOMP_REVISION =
 struct BuildOptions
 {
   std::string toolchain = "auto";
+  // Empty means "leave the module template's own default alone". Any other
+  // value is forwarded as RECOMPCORE_MODULE_OPT_LEVEL and folded into the
+  // cache key, so an -O3 module cannot collide with an -O2 one.
+  std::string opt_level;
 #if defined(MODERNGEKKO_DOLRECOMP_LLVM)
   std::string backend = "llvm";
 #else
@@ -456,10 +460,15 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
 #else
   constexpr std::string_view architecture = "unsupported";
 #endif
+  // The module template appends -O<level> after CMake's own
+  // CMAKE_C_FLAGS_RELEASE, so this is the level that actually reaches the
+  // per-translation-unit compiles.
+  const std::string opt = options.opt_level.empty() ? std::string("2") : options.opt_level;
   std::string flags;
   if (compiler == "clang")
   {
-    flags = "compile:-O2 -flto=thin -fvisibility=hidden -ffp-contract=off -fno-fast-math "
+    flags = "compile:-O" + opt +
+            " -flto=thin -fvisibility=hidden -ffp-contract=off -fno-fast-math "
             "link:-flto=thin";
 #if defined(__linux__)
     flags += " -fuse-ld=lld";
@@ -467,19 +476,42 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   }
   else if (compiler == "gcc")
   {
-    flags = "compile:-O2 -fvisibility=hidden -ffp-contract=off -fno-fast-math link:no-lto";
+    flags = "compile:-O" + opt +
+            " -fvisibility=hidden -ffp-contract=off -fno-fast-math link:no-lto";
   }
   else
   {
     flags = "compile:/O2 /fp:strict";
   }
+  // Environment that changes the generated or compiled code. None of it is in
+  // `flags`, so without this two builds that differ only here share a cache key:
+  // the second is served the first one's module, prints "cache hit", and an A/B
+  // silently compares a module against itself. That is not hypothetical -- it
+  // came within one --output root of invalidating a cross-chunk direct-call
+  // measurement, and CFLAGS is the documented mechanism by which PGO reaches
+  // the build at all, so the collision is reachable by the intended workflow.
+  //
+  // Hashing the values rather than listing them keeps the key short and avoids
+  // putting a profile path in a directory name.
+  std::string environment;
+  for (const char* name : {"CFLAGS", "LDFLAGS", "DOLRECOMP_NO_DIRECT_CALLS",
+                           "DOLRECOMP_C_CHUNK_INSTRUCTIONS",
+                           "DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS"})
+  {
+    if (const char* value = std::getenv(name); value && *value)
+      environment += std::string(name) + "=" + value + ";";
+  }
+  std::ostringstream environment_tail;
+  environment_tail << std::hex << std::setfill('0') << std::setw(16)
+                   << Fnv1a(environment);
+
   const std::string identity = std::string(RECOMPCORE_REVISION) + "|dolrecomp=" +
       std::string(DOLRECOMP_REVISION) + "|module-abi=" +
       std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) + "|cpu-abi=" +
       std::to_string(MODERNGEKKO_CPU_ABI_VERSION) + "|" + compiler_identity + "|" +
       std::string(architecture) + "|" + flags + "|backend=" + options.backend +
       "|patches=" + patches.fingerprint + "|dolrecomp_binary=" +
-      *dolrecomp_hash;
+      *dolrecomp_hash + "|env=" + environment_tail.str();
   std::ostringstream key_tail;
   key_tail << std::hex << std::setfill('0') << std::setw(16) << Fnv1a(identity);
   const std::string cache_key = game.dol_sha256 + "-" + key_tail.str();
@@ -509,6 +541,13 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
              << "compiler=" << compiler_identity << '\n'
              << "architecture=" << architecture << '\n'
              << "flags=" << flags << '\n'
+             // The flags line above is what this tool asks for, not necessarily
+             // what ran: CMake can decline part of it silently, as it did with
+             // -flto=thin on macOS for months. Record the environment too, since
+             // CFLAGS/LDFLAGS override it and nothing else here would show that
+             // a module was built with PGO, or with direct calls suppressed.
+             << "environment=" << (environment.empty() ? "(none)" : environment)
+             << '\n'
              << "backend=" << options.backend << '\n'
              << "patches=" << patches.fingerprint << '\n';
     fs::create_directories(options.output / game.disc_id);
@@ -583,6 +622,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
       " -DCMAKE_C_COMPILER=" + compiler + " -DGAME_ID=" + game.disc_id +
       " -DGENERATED_DIR=" + Quote(generated) +
       " -DGXRUNTIME_DIR=" + Quote(source_root / "vendor/dolphin/GXRuntime") +
+      (options.opt_level.empty()
+           ? std::string()
+           : " -DRECOMPCORE_MODULE_OPT_LEVEL=" + options.opt_level) +
       " -DCHASSIS_ABI_DIR=" +
       Quote(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp");
   if (!RunCommand(configure) ||
@@ -601,7 +643,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
 void Usage()
 {
   std::cerr << "usage: moderngekko-port inspect <game-root>\n"
-               "       moderngekko-port build <game-root> [--backend c|llvm] [--toolchain auto|clang|gcc|msvc] [--output path]\n"
+               "       moderngekko-port build <game-root> [--backend c|llvm] [--toolchain auto|clang|gcc|msvc] [--opt-level 0-3] [--output path]\n"
                "       moderngekko-port run <game-root> [build options] [-- runner options]\n";
 }
 }  // namespace
@@ -628,6 +670,8 @@ int main(int argc, char** argv)
       options.toolchain = argv[++i];
     else if (arg == "--backend" && i + 1 < argc)
       options.backend = argv[++i];
+    else if (arg == "--opt-level" && i + 1 < argc)
+      options.opt_level = argv[++i];
     else if (arg == "--output" && i + 1 < argc)
       options.output = argv[++i];
     else if (command == "run")
@@ -643,6 +687,12 @@ int main(int argc, char** argv)
   if (options.backend != "c" && options.backend != "llvm")
   {
     std::cerr << "unknown backend: " << options.backend << '\n';
+    return 2;
+  }
+  if (!options.opt_level.empty() &&
+      (options.opt_level.size() != 1 || options.opt_level[0] < '0' || options.opt_level[0] > '3'))
+  {
+    std::cerr << "opt level must be 0, 1, 2, or 3: " << options.opt_level << '\n';
     return 2;
   }
 #if !defined(MODERNGEKKO_DOLRECOMP_LLVM)

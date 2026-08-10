@@ -4,8 +4,11 @@
 #include "moderngekko/runtime.hpp"
 #include "netplay_session.hpp"
 
+#include "InputCommon/GCPadStatus.h"
+
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
@@ -15,6 +18,15 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+// For the affinity/priority setup in main(). WIN32_LEAN_AND_MEAN keeps the
+// winsock and GDI surface out of a translation unit that only needs the
+// processor-topology and process calls.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace {
 #ifndef MODERNGEKKO_RUNNER_NAME
@@ -40,6 +52,12 @@ void Usage() {
                "[--netplay-port <port>]\n"
                "       [--nickname <name>] [--buffer <auto|1-20>] "
                "[--controller <device>]...\n"
+               "       [--status-file <path>] [--run-seconds <sec>]\n"
+               "       [--load-state <path>] [--load-state-after <sec>]\n"
+               "       [--save-state <path>] [--save-state-after <sec>]\n"
+               "       [--hold-accelerate] [--spam-confirm] "
+               "[--spam-period <sec>]\n"
+               "       [--spam-stop <sec>]\n"
                "       With no --game, boots the path in "
                "<user-dir>/default-game.txt.\n";
 }
@@ -111,6 +129,20 @@ std::filesystem::path ExecutableDirectory(const char *argv0) {
   const std::filesystem::path executable =
       std::filesystem::weakly_canonical(argv0, ec);
   return ec ? std::filesystem::current_path() : executable.parent_path();
+}
+
+// A bad duration silently becoming 0 would turn --run-seconds into "never
+// exit" and --load-state-after into "load before the core is stepping", both
+// of which look like a hung benchmark rather than a typo.
+double ParseSeconds(const std::string &text, const char *option) {
+  const char *begin = text.c_str();
+  char *end = nullptr;
+  const double seconds = std::strtod(begin, &end);
+  if (end == begin + text.size() && !text.empty() && seconds >= 0.0 &&
+      std::isfinite(seconds))
+    return seconds;
+  std::cerr << option << " must be a non-negative number of seconds\n";
+  std::exit(2);
 }
 } // namespace
 
@@ -192,6 +224,36 @@ int RunMain(int argc, char **argv) {
       netplay_buffer = value("--buffer");
     else if (arg == "--controller")
       netplay_controllers.emplace_back(value("--controller"));
+    else if (arg == "--status-file")
+      config.status_file = value("--status-file");
+    else if (arg == "--load-state")
+      config.load_state_path = value("--load-state");
+    else if (arg == "--save-state")
+      config.save_state_path = value("--save-state");
+    else if (arg == "--load-state-after")
+      config.load_state_after_seconds = ParseSeconds(value("--load-state-after"),
+                                                     "--load-state-after");
+    else if (arg == "--save-state-after")
+      config.save_state_after_seconds = ParseSeconds(value("--save-state-after"),
+                                                     "--save-state-after");
+    else if (arg == "--hold-accelerate")
+      // PAD_BUTTON_A plus the analog R trigger, which is what MKDD reads.
+      config.hold_buttons = PAD_BUTTON_A | PAD_TRIGGER_R;
+    else if (arg == "--spam-confirm")
+      // A only. START also confirms menus, but in a race it opens the pause
+      // screen -- and since A then dismisses it, spamming both cycles the
+      // start screen forever and the race never runs. Pair with
+      // --spam-stop <sec> --hold-accelerate to press through the menus and
+      // then drive.
+      config.spam_buttons = PAD_BUTTON_A;
+    else if (arg == "--spam-stop")
+      config.spam_stop_seconds =
+          ParseSeconds(value("--spam-stop"), "--spam-stop");
+    else if (arg == "--spam-period")
+      config.spam_period_seconds =
+          ParseSeconds(value("--spam-period"), "--spam-period");
+    else if (arg == "--run-seconds")
+      config.run_seconds = ParseSeconds(value("--run-seconds"), "--run-seconds");
     else if (arg == "--help" || arg == "-h") {
       Usage();
       return 0;
@@ -386,8 +448,69 @@ int RunMain(int argc, char **argv) {
   return 0;
 }
 
+#if defined(_WIN32)
+// Confine the process to the cores that share the largest L3, and raise its
+// priority.
+//
+// The emulated CPU is a single serial instruction stream, so nothing here is
+// about parallelism -- core usage stays at 1.00 either way. It is about cache
+// residency. A recompiled module is one dispatch switch spanning the whole
+// game, which lives or dies on staying in L3, and on a chip with 3D V-Cache on
+// one CCD only, Windows migrating the thread between dies makes it repeatedly
+// lose its working set. Measured on a 9950X3D: 55.41 -> 70.42 fps, +27%.
+//
+// Selecting by "largest L3" rather than a hardcoded mask keeps this correct
+// elsewhere: where every core shares one L3 the mask covers all of them and
+// this is a no-op. Set MODERNGEKKO_NO_AFFINITY=1 to skip it entirely.
+void PinToLargestCache() {
+  if (const char *disabled = std::getenv("MODERNGEKKO_NO_AFFINITY");
+      disabled && disabled[0] && disabled[0] != '0')
+    return;
+
+  DWORD length = 0;
+  GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
+  if (length == 0)
+    return;
+  std::vector<char> buffer(length);
+  if (!GetLogicalProcessorInformationEx(
+          RelationCache,
+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &length))
+    return;
+
+  KAFFINITY best_mask = 0;
+  DWORD best_size = 0;
+  for (DWORD offset = 0; offset + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) <= length;) {
+    auto *entry =
+        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+    if (entry->Size == 0)
+      break;
+    if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
+        entry->Cache.CacheSize > best_size) {
+      // Multi-group machines would need every group considered; a single group
+      // covers up to 64 logical processors, which is all this targets.
+      best_size = entry->Cache.CacheSize;
+      best_mask = entry->Cache.GroupMask.Mask;
+    }
+    offset += entry->Size;
+  }
+  if (best_mask == 0)
+    return;
+
+  const HANDLE process = GetCurrentProcess();
+  if (SetProcessAffinityMask(process, best_mask)) {
+    std::cout << "[perf] pinned to the cores sharing the largest L3 (" << (best_size >> 20)
+              << " MB), mask 0x" << std::hex << static_cast<unsigned long long>(best_mask)
+              << std::dec << '\n';
+  }
+  SetPriorityClass(process, HIGH_PRIORITY_CLASS);
+}
+#endif
+
 int main(int argc, char **argv) {
   try {
+#if defined(_WIN32)
+    PinToLargestCache();
+#endif
     return RunMain(argc, argv);
   } catch (const std::exception &error) {
     std::cerr << "fatal error: " << error.what() << '\n';
