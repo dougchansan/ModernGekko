@@ -5,6 +5,10 @@
 #include "netplay_session.hpp"
 
 #include "InputCommon/GCPadStatus.h"
+#include "VideoCommon/KartDebugOverlay.h"
+#include "VideoCommon/Present.h"
+
+#include <SDL3/SDL.h>
 
 #include <charconv>
 #include <chrono>
@@ -146,6 +150,60 @@ double ParseSeconds(const std::string &text, const char *option) {
 }
 } // namespace
 
+
+// Route mouse input into the in-game ImGui overlay.
+//
+// Dolphin forwards mouse events to ImGui through Presenter::SetMousePos and
+// SetMousePress, but the ONLY caller in the tree is DolphinQt's RenderWidget.
+// This frontend is not Qt: it polls SDL in aurora's window layer, down in
+// GXRuntime, which handles window, gamepad and wheel events but not motion or
+// buttons -- and which knows nothing of VideoCommon to forward them to. So
+// ImGui receives no input at all here and its windows cannot be interacted
+// with. An SDL event watch is the least invasive fix: it needs no change to
+// the aurora layer and no new plumbing between layers.
+//
+// Registered only when the debug overlay is enabled, so a stock run behaves
+// exactly as before.
+bool SDLCALL KartDebugMouseWatch(void*, SDL_Event* event) {
+  if (g_presenter == nullptr)
+    return true;
+
+  switch (event->type) {
+  case SDL_EVENT_MOUSE_MOTION: {
+    KartDebug::NoteMouseEvent();
+    // Presenter wants native (framebuffer) pixels; SDL reports window points,
+    // which differ on HiDPI displays.
+    float density = 1.0f;
+    if (SDL_Window* window = SDL_GetWindowFromID(event->motion.windowID))
+      density = SDL_GetWindowPixelDensity(window);
+    if (!(density > 0.0f))
+      density = 1.0f;
+    g_presenter->SetMousePos(event->motion.x * density, event->motion.y * density);
+    break;
+  }
+  case SDL_EVENT_MOUSE_BUTTON_DOWN:
+  case SDL_EVENT_MOUSE_BUTTON_UP: {
+    // Remap SDL's button order to the Qt mask Presenter expects. SDL numbers
+    // them left=1, middle=2, right=3; the mask wants bit0 left, bit1 right,
+    // bit2 middle. Getting this wrong swaps right- and middle-click, which is
+    // the kind of thing nobody notices until a context menu misbehaves.
+    const SDL_MouseButtonFlags sdl_mask = SDL_GetMouseState(nullptr, nullptr);
+    u32 mask = 0;
+    if (sdl_mask & SDL_BUTTON_LMASK)
+      mask |= 1u << 0;
+    if (sdl_mask & SDL_BUTTON_RMASK)
+      mask |= 1u << 1;
+    if (sdl_mask & SDL_BUTTON_MMASK)
+      mask |= 1u << 2;
+    g_presenter->SetMousePress(mask);
+    break;
+  }
+  default:
+    break;
+  }
+  return true;  // never consume: the game and the rest of the frontend still need these
+}
+
 int RunMain(int argc, char **argv) {
 #if defined(_WIN32)
   if (!std::getenv("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD"))
@@ -237,14 +295,13 @@ int RunMain(int argc, char **argv) {
       config.save_state_after_seconds = ParseSeconds(value("--save-state-after"),
                                                      "--save-state-after");
     else if (arg == "--hold-accelerate")
-      // PAD_BUTTON_A plus the analog R trigger, which is what MKDD reads.
-      config.hold_buttons = PAD_BUTTON_A | PAD_TRIGGER_R;
+      // MKDD accelerates with A. R initiates a drift, so including it here
+      // forces the player to powerslide for the entire unattended run.
+      config.hold_buttons = PAD_BUTTON_A;
     else if (arg == "--spam-confirm")
-      // A only. START also confirms menus, but in a race it opens the pause
-      // screen -- and since A then dismisses it, spamming both cycles the
-      // start screen forever and the race never runs. Pair with
-      // --spam-stop <sec> --hold-accelerate to press through the menus and
-      // then drive.
+      // MKDD's retail single-player flow is A-driven. The runtime gates the
+      // course-select edge on its exact ready/latch state; START is actively
+      // harmful because blind A|START can poison that latch.
       config.spam_buttons = PAD_BUTTON_A;
     else if (arg == "--spam-stop")
       config.spam_stop_seconds =
@@ -439,7 +496,24 @@ int RunMain(int argc, char **argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   });
+  // Registration order is load-bearing: aurora does not initialise SDL's event
+  // subsystem until deep inside Run(), and a watch added before that simply is
+  // not there afterwards -- measured, the callback fired exactly zero times.
+  // Subsystem init is reference counted, so bringing events up here is harmless
+  // and aurora's later init just takes a second reference.
+  const bool kart_debug_input = KartDebug::OverlayEnabled();
+  if (kart_debug_input)
+  {
+    if (SDL_InitSubSystem(SDL_INIT_EVENTS))
+      SDL_AddEventWatch(KartDebugMouseWatch, nullptr);
+    else
+      std::cerr << "kart debug: SDL events unavailable, overlay input disabled: "
+                << SDL_GetError() << '\n';
+  }
+  KartDebug::SetInputRouted(kart_debug_input);
   const moderngekko::RuntimeRunResult result = created.runtime->Run();
+  if (kart_debug_input)
+    SDL_RemoveEventWatch(KartDebugMouseWatch, nullptr);
   signal_watcher.request_stop();
   if (result.error) {
     std::cerr << "runtime failed: " << result.error->message << '\n';

@@ -11,6 +11,7 @@
 #include "Core/CoreTiming.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/HW/GBACore.h"
+#include "Core/HW/Memmap.h"
 #include "Core/Host.h"
 #include "Core/NetPlay/NetPlayClient.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -90,6 +91,53 @@ bool s_screenshot_done = false;
 bool s_automation_started = false;
 u64 s_status_updates = 0;
 std::chrono::steady_clock::time_point s_automation_start;
+u32 s_last_mkdd_scene = 0xffffffffu;
+u64 s_last_mkdd_course_state = ~0ull;
+u32 s_last_mkdd_race_count = 0xffffffffu;
+
+struct MkddSceneState
+{
+  u32 scene = 0xffffffffu;
+  u32 object = 0;
+  u32 phase = 0xffffffffu;
+  u32 ready = 0xffffffffu;
+  u32 latch = 0xffffffffu;
+  u32 ready_float = 0xffffffffu;
+  u32 mode = 0xffffffffu;
+  u32 race_count = 0xffffffffu;
+  u32 race_manager = 0;
+};
+
+MkddSceneState ReadMkddSceneState(Core::System& system)
+{
+  MkddSceneState state;
+  auto& memory = system.GetMemory();
+  if (!memory.IsInitialized())
+    return state;
+  // These are fixed cached-MEM1 addresses. Device reads use the underlying
+  // physical offsets and avoid pausing StaticRecomp or depending on its MMU
+  // translation state from an automation thread.
+  const auto read = [&](u32 address) { return memory.Read_U32(address); };
+  state.scene = read(0x803c9ce0u);
+  state.race_count = read(0x803b1478u) >> 16;
+  state.race_manager = read(0x803cb7e8u);
+  const u32 app = read(0x803cbe20u);
+  if (app != 0)
+    state.object = read(app + 0x0cu);
+  if (state.scene == 3u && state.object != 0) {
+    state.phase = read(state.object + 0x338u);
+    state.ready = read(state.object + 0x384u);
+    state.latch = read(state.object + 0x388u);
+    state.ready_float = read(state.object + 0x14u);
+    const u32 mode_root = read(0x803cbd70u);
+    if (mode_root != 0) {
+      const u32 mode_owner = read(mode_root + 4u);
+      if (mode_owner != 0)
+        state.mode = read(mode_owner + 4u);
+    }
+  }
+  return state;
+}
 
 void RunAutomationTick() {
   if (s_status_file.empty() && s_load_state_path.empty() &&
@@ -106,6 +154,36 @@ void RunAutomationTick() {
       std::chrono::duration<double>(now - s_automation_start).count();
 
   auto &system = Core::System::GetInstance();
+  // Guest-memory inspection from this host automation thread is diagnostic
+  // only. It is not synchronized with StaticRecomp and must never be enabled
+  // for qualification or normal play.
+  const bool inspect_mkdd = std::getenv("MODERNGEKKO_UNSAFE_MKDD_INSPECT") != nullptr;
+  const MkddSceneState mkdd =
+      s_spam_buttons != 0 && inspect_mkdd ? ReadMkddSceneState(system) : MkddSceneState{};
+  if (s_spam_buttons != 0 && inspect_mkdd && mkdd.scene != s_last_mkdd_scene) {
+    std::fprintf(stderr,
+                 "[mkdd-scene] scene=%u object=%08x phase=%u ready=%u latch=%u float=%08x mode=%u\n",
+                 mkdd.scene, mkdd.object, mkdd.phase, mkdd.ready, mkdd.latch,
+                 mkdd.ready_float, mkdd.mode);
+    s_last_mkdd_scene = mkdd.scene;
+  }
+  if (s_spam_buttons != 0 && inspect_mkdd && mkdd.race_count != s_last_mkdd_race_count) {
+    std::fprintf(stderr, "[mkdd-race] count=%u manager=%08x\n",
+                 mkdd.race_count, mkdd.race_manager);
+    s_last_mkdd_race_count = mkdd.race_count;
+  }
+  if (s_spam_buttons != 0 && inspect_mkdd && mkdd.scene == 3u) {
+    const u64 course_state = (static_cast<u64>(mkdd.phase) << 32) |
+                             (static_cast<u64>(mkdd.ready) << 16) |
+                             (static_cast<u64>(mkdd.latch) << 8) | mkdd.mode;
+    if (course_state != s_last_mkdd_course_state) {
+      std::fprintf(stderr,
+                   "[mkdd-course] phase=%u ready=%u latch=%u float=%08x mode=%u\n",
+                   mkdd.phase, mkdd.ready, mkdd.latch, mkdd.ready_float,
+                   mkdd.mode);
+      s_last_mkdd_course_state = course_state;
+    }
+  }
 
   // Re-apply every tick rather than once: Pad::LoadConfig during boot
   // reconstructs the controllers, and a hold applied before that is lost.
@@ -138,6 +216,20 @@ void RunAutomationTick() {
   if (s_spam_buttons != 0 && !s_load_state_path.empty() && !s_load_state_done) {
     // no input before the state is in place
   } else if (s_spam_buttons != 0) {
+    // SceneCourseSelect treats an early A as a persistent latch. Only emit an
+    // edge at the exact Release_us course/buttonA gate reconstructed from
+    // 0x8016AD34..0x8016B128. Blind input here causes the post-select black
+    // screen that made otherwise healthy racer builds look broken.
+    const bool course_ready = !inspect_mkdd || mkdd.scene != 3u ||
+        (mkdd.object != 0 && mkdd.phase == 1u && mkdd.latch == 0u &&
+         mkdd.ready_float == 0x41200000u &&
+         (mkdd.ready == 0u || (mkdd.ready == 2u && mkdd.mode == 1u)));
+    if (!course_ready) {
+      if (s_spam_pressed) {
+        s_spam_pressed = false;
+        Pad::SetHeldButtons(0, 0);
+      }
+    } else {
     const u64 ticks = system.GetCoreTiming().GetTicks();
     const u64 period =
         static_cast<u64>(s_spam_period_seconds *
@@ -149,6 +241,7 @@ void RunAutomationTick() {
       // and an A that never lifts produces no press edge, so combining the two
       // would silently stop the spam from advancing anything.
       Pad::SetHeldButtons(0, s_spam_pressed ? static_cast<u16>(s_spam_buttons) : 0);
+    }
     }
   }
 
@@ -406,6 +499,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     impl->ui_initialized = true;
   }
   Config::SetBase(Config::MAIN_FULLSCREEN, impl->config.fullscreen);
+  if (std::getenv("MODERNGEKKO_MMU") != nullptr) {
+    Config::SetBase(Config::MAIN_MMU, true);
+    std::fprintf(stderr, "[moderngekko] MMU enabled by MODERNGEKKO_MMU\n");
+  }
 
   if (impl->config.headless)
     impl->platform = Platform::CreateHeadlessPlatform();
@@ -457,6 +554,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     std::fprintf(stderr, "[moderngekko] cpu core override: %s\n", core_override);
   }
   Config::SetBase(Config::MAIN_CPU_CORE, cpu_core);
+  if (const char *mem1_override = std::getenv("MODERNGEKKO_MEM1_MIB")) {
+    char *end = nullptr;
+    const unsigned long mib = std::strtoul(mem1_override, &end, 10);
+    if (!end || *end != '\0' || mib < 24 || mib > 64) {
+      std::fprintf(stderr,
+                   "[moderngekko] MODERNGEKKO_MEM1_MIB must be 24..64\n");
+      return {{}, RuntimeError{RuntimeErrorCode::InvalidGame,
+                               "invalid MODERNGEKKO_MEM1_MIB"}};
+    }
+    Config::SetBase(Config::MAIN_RAM_OVERRIDE_ENABLE, true);
+    Config::SetBase(Config::MAIN_MEM1_SIZE, static_cast<u32>(mib * 0x100000ul));
+    std::fprintf(stderr, "[moderngekko] MEM1 override: %lu MiB\n", mib);
+  }
   if (!impl->config.graphics.backend.empty())
     Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
   else if (impl->config.headless)
@@ -536,6 +646,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   s_save_state_done = false;
   s_screenshot_done = false;
   s_automation_started = false;
+  s_last_mkdd_scene = 0xffffffffu;
+  s_last_mkdd_course_state = ~0ull;
+  s_last_mkdd_race_count = 0xffffffffu;
   s_status_updates = 0;
   return {std::unique_ptr<Runtime>(new Runtime(std::move(impl))), {}};
 }
