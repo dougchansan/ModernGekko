@@ -494,11 +494,11 @@ fs::path SiblingExecutable(const char* argv0, std::string name)
 // cache entries it already has.
 std::string DolRecompCodegenIdentity()
 {
-  constexpr std::array<const char*, 7> names = {
+  constexpr std::array<const char*, 8> names = {
       "DOLRECOMP_C_CHUNK_INSTRUCTIONS", "DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS",
       "DOLRECOMP_LLVM_CPU",             "DOLRECOMP_LLVM_FEATURES",
       "DOLRECOMP_LLVM_TARGET",          "DOLRECOMP_DISPATCH_LOOKUP",
-      "DOLRECOMP_UNSAFE_DIRECT_CALLS"};
+      "DOLRECOMP_UNSAFE_DIRECT_CALLS", "DOLRECOMP_LLVM_WRITE_JOURNAL"};
   std::string identity;
   for (const char* name : names)
   {
