@@ -37,11 +37,17 @@ struct GraphicsSettings
 struct AudioSettings
 {
   std::string backend;
+  bool mute = false;
 };
 
 struct InputSettings
 {
   bool background_input = false;
+};
+
+struct AutomationSettings
+{
+  std::filesystem::path directory;
 };
 
 enum class WindowSystem
@@ -68,6 +74,7 @@ struct RuntimeConfig
   std::optional<std::string> window_title;
   // Boot straight into a savestate instead of from the title screen.
   std::optional<std::filesystem::path> load_state_path;
+  AutomationSettings automation;
 };
 
 enum class RuntimeErrorCode
@@ -133,6 +140,7 @@ public:
 private:
   struct Impl;
   explicit Runtime(std::unique_ptr<Impl> impl);
+  void StopAutomation();
   std::unique_ptr<Impl> m_impl;
 };
 }  // namespace moderngekko

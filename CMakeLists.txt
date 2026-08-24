@@ -122,8 +122,11 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(LINUX_LOCAL_DEV ON CACHE BOOL "" FORCE)
     set(DISTRIBUTOR "ModernGekko" CACHE STRING "" FORCE)
     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
-    target_sources(core PRIVATE
+    add_library(moderngekko_gxruntime_core STATIC
         vendor/dolphin/GXRuntime/src/core/cpu_exception.c)
+    target_include_directories(moderngekko_gxruntime_core PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
+    target_link_libraries(core PRIVATE moderngekko_gxruntime_core)
     target_include_directories(core PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
     if(MODERNGEKKO_FRONTEND_SDK)
@@ -219,6 +222,7 @@ target_compile_features(moderngekko_dolphin_video PUBLIC cxx_std_23)
 if(MSVC)
     target_compile_options(moderngekko_dolphin_video PUBLIC /Zc:preprocessor)
     target_compile_definitions(moderngekko_dolphin_video PUBLIC UNICODE _UNICODE)
+    target_compile_definitions(moderngekko PUBLIC UNICODE _UNICODE)
 endif()
 target_include_directories(moderngekko_dolphin_video
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -237,9 +241,15 @@ target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_sources(moderngekko PRIVATE
         src/runtime/dolphin_runtime.cpp
+        tools/automation_protocol.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )
+    if(NOT ANDROID)
+        target_sources(moderngekko PRIVATE
+            vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp)
+    endif()
+    target_include_directories(moderngekko PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     if(WIN32)
         target_sources(moderngekko PRIVATE
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp)
@@ -590,8 +600,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     endif()
     add_dependencies(moderngekko-launcher moderngekko-run)
 
-    add_executable(moderngekko-port tools/moderngekko_port.cpp)
+    add_executable(moderngekko-port
+        tools/moderngekko_port.cpp
+        tools/pgo_support.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
+    target_include_directories(moderngekko-port PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_definitions(moderngekko-port PRIVATE
         MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     if(DOLRECOMP_ENABLE_LLVM)
@@ -669,6 +683,24 @@ if(BUILD_TESTING)
     add_test(NAME moderngekko.launcher_savestates
              COMMAND moderngekko_launcher_savestates_test)
 
+    add_executable(moderngekko_pgo_support_test
+        tests/pgo_support_test.cpp
+        tools/pgo_support.cpp)
+    target_include_directories(moderngekko_pgo_support_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_features(moderngekko_pgo_support_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.pgo_support COMMAND moderngekko_pgo_support_test)
+
+    add_executable(moderngekko_port_command_line_test
+        tests/port_command_line_test.cpp
+        tools/pgo_support.cpp)
+    target_include_directories(moderngekko_port_command_line_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+    target_compile_features(moderngekko_port_command_line_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.port_command_line
+             COMMAND moderngekko_port_command_line_test)
+
     add_executable(moderngekko_frontend_config_gamecube_test
         tests/frontend_config_test.cpp
         tools/frontend_config.cpp)
@@ -681,6 +713,16 @@ if(BUILD_TESTING)
              COMMAND moderngekko_frontend_config_gamecube_test)
 
     if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+        add_executable(moderngekko_automation_protocol_test
+            tests/automation_protocol_test.cpp
+            tools/automation_protocol.cpp)
+        target_include_directories(moderngekko_automation_protocol_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+        target_compile_features(moderngekko_automation_protocol_test PRIVATE cxx_std_23)
+        add_test(NAME moderngekko.automation_protocol
+                 COMMAND moderngekko_automation_protocol_test)
+
         add_executable(moderngekko_netplay_protocol_test
             tests/netplay_protocol_test.cpp
             tools/netplay_compatibility.cpp)
