@@ -453,11 +453,12 @@ fs::path SiblingExecutable(const char* argv0, std::string name)
 
 std::string DolRecompCodegenIdentity()
 {
-  constexpr std::array<const char*, 8> names = {
+  constexpr std::array<const char*, 9> names = {
       "DOLRECOMP_C_CHUNK_INSTRUCTIONS", "DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS",
       "DOLRECOMP_LLVM_CPU",             "DOLRECOMP_LLVM_FEATURES",
       "DOLRECOMP_LLVM_TARGET",          "DOLRECOMP_DISPATCH_LOOKUP",
-      "DOLRECOMP_UNSAFE_DIRECT_CALLS", "DOLRECOMP_LLVM_WRITE_JOURNAL"};
+      "DOLRECOMP_UNSAFE_DIRECT_CALLS",  "DOLRECOMP_LLVM_WRITE_JOURNAL",
+      "DOLRECOMP_STATE_MEMORY"};
   std::string identity;
   for (const char* name : names)
   {
