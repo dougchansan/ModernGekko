@@ -1,5 +1,4 @@
 [submodule "vendor/dolphin"]
 	path = vendor/dolphin
-	url = https://github.com/ExpansionPak/RecompCore.git
-	branch = moderngekko-vendor
-	shallow = true
+	url = https://github.com/dougchansan/RecompCore-ModernGekko.git
+	branch = merge/onto-upstream
