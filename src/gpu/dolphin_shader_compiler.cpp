@@ -1,5 +1,9 @@
 #include "moderngekko/dolphin_shader_compiler.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
+#include <chrono>
+
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/GeometryShaderGen.h"
 #include "VideoCommon/NativeVertexFormat.h"
@@ -151,6 +155,8 @@ DolphinShaderBundle DolphinShaderCompiler::Compile(
     const GxStateView& state, GxTopology topology, std::uint8_t vat, DolphinShaderApi api,
     const DolphinShaderCapabilities& capabilities, const DolphinShaderOptions& options)
 {
+  MG_PERF_SCOPE(diagnostics::Zone::ShaderGeneration);
+  const auto shader_start = std::chrono::steady_clock::now();
   std::lock_guard lock{s_shader_mutex};
   LoadState(state);
   LoadVertexComponents(state, vat);
@@ -180,6 +186,19 @@ DolphinShaderBundle DolphinShaderCompiler::Compile(
   bundle.geometry_uid = HashUid(geometry_uid);
   bundle.uber_vertex_uid = HashUid(uber_vertex_uid);
   bundle.uber_pixel_uid = HashUid(uber_pixel_uid);
+
+  // Source generation is ModernGekko's own cost; driver-side pipeline
+  // compilation is reported separately by the graphics backend.
+  diagnostics::Count(diagnostics::Counter::ShaderCompilations);
+  if (diagnostics::Active(diagnostics::Level::Detailed))
+  {
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - shader_start)
+            .count();
+    diagnostics::Diagnostics::Get().RecordEvent(diagnostics::EventType::ShaderCompilation,
+                                                milliseconds, bundle.pixel_uid,
+                                                "shader source generation");
+  }
   return bundle;
 }
 }

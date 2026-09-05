@@ -17,10 +17,13 @@
 #include "Core/System.h"
 #include "DolphinNoGUI/Platform.h"
 #include "UICommon/UICommon.h"
+#include "VideoCommon/OnScreenDisplay.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/VideoConfig.h"
+#include "VideoCommon/VideoEvents.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
+#include "moderngekko/diagnostics.hpp"
 #include "moderngekko/mod_loader.hpp"
 #include "moderngekko/module_loader.hpp"
 
@@ -139,11 +142,123 @@ struct Runtime::Impl {
   std::unique_ptr<Platform> platform;
   std::unique_ptr<ModManager> mods;
   Common::EventHook state_hook;
+  Common::EventHook present_hook;
   bool ui_initialized = false;
   bool controllers_initialized = false;
   bool booted = false;
+  bool diagnostics_enabled = false;
+  std::atomic<bool> diagnostics_overlay{false};
   std::atomic<bool> running{false};
 };
+
+namespace {
+// Rebuilds the compact overlay line from the last second of telemetry. Called
+// at most a few times a second so it never allocates on the frame path.
+std::string FormatDiagnosticsOverlay() {
+  const std::vector<diagnostics::FrameRecord> frames =
+      diagnostics::Diagnostics::Get().RecentFrames(120);
+  if (frames.empty())
+    return {};
+  const auto zone = [&](diagnostics::Zone value) {
+    double total = 0.0;
+    for (const diagnostics::FrameRecord &frame : frames)
+      total += frame.zone_ms[static_cast<std::size_t>(value)];
+    return total / static_cast<double>(frames.size());
+  };
+  const auto counter = [&](diagnostics::Counter value) {
+    double total = 0.0;
+    for (const diagnostics::FrameRecord &frame : frames)
+      total += frame.counters[static_cast<std::size_t>(value)];
+    return total / static_cast<double>(frames.size());
+  };
+  double frame_ms = 0.0;
+  for (const diagnostics::FrameRecord &frame : frames)
+    frame_ms += frame.frame_ms;
+  frame_ms /= static_cast<double>(frames.size());
+
+  const double guest = zone(diagnostics::Zone::GuestCpu) +
+                       zone(diagnostics::Zone::StaticRecompDispatch) +
+                       zone(diagnostics::Zone::InterpreterFallback);
+  const double renderer = zone(diagnostics::Zone::RendererSubmission) +
+                          zone(diagnostics::Zone::Present);
+  const double sync = zone(diagnostics::Zone::GpuWait) +
+                      zone(diagnostics::Zone::Synchronization);
+  return fmt::format(
+      "MG {:.1f} FPS  {:.0f}% speed  frame {:.2f} ms\n"
+      "guest {:.2f}  GX {:.2f}  renderer {:.2f}  GPU {:.2f}  wait {:.2f} ms\n"
+      "fallbacks/frame {:.1f}  EFB copies/frame {:.1f}  shader compiles/frame {:.2f}{}",
+      frames.back().fps, frames.back().speed * 100.0, frame_ms, guest,
+      zone(diagnostics::Zone::GxCommandProcessor), renderer,
+      zone(diagnostics::Zone::GpuExecution), sync,
+      counter(diagnostics::Counter::InterpreterFallbacks),
+      counter(diagnostics::Counter::EfbCopies),
+      counter(diagnostics::Counter::ShaderCompilations),
+      diagnostics::Diagnostics::Get().IsCapturing() ? "\n[recording]" : "");
+}
+
+// Returns true when diagnostics were initialized for this run.
+bool SetUpDiagnostics(const RuntimeConfig &runtime_config,
+                      const GameMetadata &metadata) {
+  const DiagnosticsSettings &settings = runtime_config.diagnostics;
+  if (!settings.enabled)
+    return false;
+
+  diagnostics::Config config;
+  config.enabled = true;
+  config.level = settings.level;
+  config.overlay = settings.overlay;
+  config.anonymize = settings.anonymize;
+  config.capture_seconds = settings.capture_seconds;
+  config.history_seconds = settings.history_seconds;
+  config.sample_hz = settings.sample_hz;
+  config.output_directory =
+      settings.output_directory.empty()
+          ? runtime_config.user_directory / "Diagnostics"
+          : settings.output_directory;
+  diagnostics::Diagnostics &diag = diagnostics::Diagnostics::Get();
+  diag.Initialize(std::move(config));
+
+  diagnostics::GameIdentity game;
+  game.title = metadata.game_name;
+  game.disc_id = metadata.disc_id;
+  game.platform = metadata.platform == GamePlatform::Wii ? "Wii" : "GameCube";
+  game.dol_sha256 = metadata.dol_sha256;
+  game.rel_sha256 = metadata.rel_sha256;
+  game.assets_sha256 = metadata.assets_sha256;
+  game.entry_point = metadata.entry_point;
+  diag.SetGameIdentity(std::move(game));
+
+  diagnostics::ModuleIdentity module;
+  if (runtime_config.module.kind == ModuleSource::Kind::DynamicPath) {
+    module.kind = "dynamic";
+    module.file_name = runtime_config.module.path.filename().string();
+    if (const auto hash = HashFileSha256(runtime_config.module.path))
+      module.sha256 = *hash;
+  } else if (runtime_config.module.kind ==
+             ModuleSource::Kind::AttachedDescriptor) {
+    module.kind = "attached";
+  }
+  diag.SetModuleIdentity(std::move(module));
+
+  diagnostics::GraphicsIdentity graphics;
+  graphics.backend = Config::Get(Config::MAIN_GFX_BACKEND);
+  graphics.internal_resolution_scale = Config::Get(Config::GFX_EFB_SCALE);
+  // The runtime pins this mode during setup, so it is reported verbatim
+  // rather than read back from a setting the user cannot change here.
+  graphics.shader_compilation_mode = "AsynchronousUberShaders";
+  diag.SetGraphicsIdentity(std::move(graphics));
+
+  if (!settings.symbol_file.empty()) {
+    std::string error;
+    if (!diag.LoadGuestSymbols(settings.symbol_file, &error))
+      std::fprintf(stderr, "diagnostics: could not load symbols: %s\n",
+                   error.c_str());
+  }
+  diag.AppendLog("audio backend: " + runtime_config.audio.backend);
+  diag.AppendLog("graphics backend: " + Config::Get(Config::MAIN_GFX_BACKEND));
+  return true;
+}
+} // namespace
 
 namespace detail {
 void SetExternalUICommon(bool external) {
@@ -322,6 +437,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   }
   jit.SetStaticRecompModuleSource(std::move(recomp_source));
 
+  impl->diagnostics_enabled = SetUpDiagnostics(impl->config, impl->metadata);
+  impl->diagnostics_overlay.store(impl->diagnostics_enabled &&
+                                  impl->config.diagnostics.overlay);
+
   s_runtime_active = true;
   s_platform = impl->platform.get();
   s_window_title = impl->title;
@@ -331,6 +450,18 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
 
 Runtime::~Runtime() {
   RequestStop();
+  if (m_impl->diagnostics_enabled) {
+    diagnostics::Diagnostics &diag = diagnostics::Diagnostics::Get();
+    if (diag.IsCapturing()) {
+      const diagnostics::CaptureResult result = diag.StopCapture();
+      if (result.ok)
+        std::fprintf(stderr, "diagnostics: wrote %s\n",
+                     result.report_path.string().c_str());
+    }
+    m_impl->present_hook = {};
+    diag.Shutdown();
+    m_impl->diagnostics_enabled = false;
+  }
   if (m_impl->booted) {
     Core::Stop(Core::System::GetInstance());
     Core::Shutdown(Core::System::GetInstance());
@@ -369,6 +500,37 @@ RuntimeRunResult Runtime::Run() {
     return {RuntimeExitReason::BootFailed,
             RuntimeError{RuntimeErrorCode::BootFailed,
                          "Dolphin rejected the extracted disc"}};
+  }
+  if (m_impl->diagnostics_enabled) {
+    diagnostics::Diagnostics &diag = diagnostics::Diagnostics::Get();
+    diag.NameCurrentThread("Host");
+    m_impl->present_hook = GetVideoEvents().after_present_event.Register(
+        [this](const PresentInfo &) {
+          diagnostics::Diagnostics &diagnostics_state =
+              diagnostics::Diagnostics::Get();
+          const PerformanceMetrics &metrics =
+              Core::System::GetInstance().GetPerfMetrics();
+          diagnostics::FrameTelemetry telemetry;
+          telemetry.fps = metrics.GetFPS();
+          telemetry.vps = metrics.GetVPS();
+          telemetry.speed = metrics.GetSpeed();
+          diagnostics_state.NameCurrentThread("Present");
+          diagnostics_state.EndFrame(telemetry);
+          if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
+            return;
+          static thread_local std::chrono::steady_clock::time_point
+              last_overlay;
+          const auto now = std::chrono::steady_clock::now();
+          if (now - last_overlay < std::chrono::milliseconds(500))
+            return;
+          last_overlay = now;
+          std::string overlay = FormatDiagnosticsOverlay();
+          if (!overlay.empty())
+            OSD::AddMessage(std::move(overlay), 700, OSD::Color::CYAN);
+        });
+    if (m_impl->config.diagnostics.capture_on_boot ||
+        m_impl->config.diagnostics.capture_seconds > 0.0)
+      diag.StartCapture();
   }
   m_impl->state_hook =
       Core::AddOnStateChangedCallback([this](Core::State state) {
@@ -424,6 +586,49 @@ std::optional<RuntimeError> Runtime::Resume() {
                         "runtime is not running"};
   Core::SetState(Core::System::GetInstance(), Core::State::Running);
   return {};
+}
+
+bool Runtime::IsDiagnosticsEnabled() const {
+  return m_impl->diagnostics_enabled;
+}
+
+bool Runtime::IsDiagnosticsCapturing() const {
+  return m_impl->diagnostics_enabled &&
+         diagnostics::Diagnostics::Get().IsCapturing();
+}
+
+bool Runtime::ToggleDiagnosticsCapture(std::filesystem::path *written_report) {
+  if (!m_impl->diagnostics_enabled)
+    return false;
+  diagnostics::Diagnostics &diag = diagnostics::Diagnostics::Get();
+  if (!diag.IsCapturing())
+    return diag.StartCapture();
+  const diagnostics::CaptureResult result = diag.StopCapture();
+  if (result.ok && written_report != nullptr)
+    *written_report = result.report_path;
+  if (!result.ok)
+    std::fprintf(stderr, "diagnostics: %s\n", result.error.c_str());
+  return result.ok;
+}
+
+bool Runtime::SaveDiagnosticsHistory(std::filesystem::path *written_report) {
+  if (!m_impl->diagnostics_enabled)
+    return false;
+  const diagnostics::CaptureResult result =
+      diagnostics::Diagnostics::Get().SaveHistory();
+  if (result.ok && written_report != nullptr)
+    *written_report = result.report_path;
+  if (!result.ok)
+    std::fprintf(stderr, "diagnostics: %s\n", result.error.c_str());
+  return result.ok;
+}
+
+void Runtime::SetDiagnosticsOverlay(bool enabled) {
+  m_impl->diagnostics_overlay.store(enabled && m_impl->diagnostics_enabled);
+}
+
+bool Runtime::IsDiagnosticsOverlayEnabled() const {
+  return m_impl->diagnostics_overlay.load();
 }
 
 const RuntimeConfig &Runtime::GetConfig() const { return m_impl->config; }

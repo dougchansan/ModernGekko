@@ -1,5 +1,6 @@
 #pragma once
 
+#include "moderngekko/diagnostics.hpp"
 #include "moderngekko/game.hpp"
 #include "moderngekko/module_abi.h"
 
@@ -44,6 +45,24 @@ struct InputSettings
   bool background_input = false;
 };
 
+// Everything the runner needs to configure the diagnostics subsystem. When
+// `enabled` is false the runtime never initializes diagnostics at all.
+struct DiagnosticsSettings
+{
+  bool enabled = false;
+  diagnostics::Level level = diagnostics::Level::Basic;
+  bool overlay = false;
+  bool anonymize = true;
+  // Start capturing as soon as the game boots and stop after this many
+  // seconds. 0 means "wait for the capture hotkey".
+  double capture_seconds = 0.0;
+  bool capture_on_boot = false;
+  double history_seconds = 30.0;
+  unsigned sample_hz = 500;
+  std::filesystem::path output_directory;
+  std::filesystem::path symbol_file;
+};
+
 enum class WindowSystem
 {
   Default,
@@ -60,6 +79,7 @@ struct RuntimeConfig
   GraphicsSettings graphics;
   AudioSettings audio;
   InputSettings input;
+  DiagnosticsSettings diagnostics;
   WindowSystem window_system = WindowSystem::Default;
   bool headless = false;
   bool fullscreen = false;
@@ -127,6 +147,17 @@ public:
   const RuntimeConfig& GetConfig() const;
   const GameMetadata& GetGameMetadata() const;
   const std::string& GetWindowTitle() const;
+
+  // Diagnostics capture control. All of these are no-ops that return false
+  // when diagnostics were not enabled for this runtime.
+  bool IsDiagnosticsEnabled() const;
+  bool IsDiagnosticsCapturing() const;
+  // Starts a capture, or stops the running one and writes a report.
+  bool ToggleDiagnosticsCapture(std::filesystem::path* written_report = nullptr);
+  // Writes the rolling history buffer without disturbing a running capture.
+  bool SaveDiagnosticsHistory(std::filesystem::path* written_report = nullptr);
+  void SetDiagnosticsOverlay(bool enabled);
+  bool IsDiagnosticsOverlayEnabled() const;
 
 private:
   struct Impl;

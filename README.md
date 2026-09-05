@@ -10,6 +10,14 @@ The mod ABI supports dependency ordering, minimum versions, optional dependencie
 
 DolRecomp's optional MAP input emits named address constants for code mods. Literal addresses remain supported when a game has no MAP file. See `mod-template` for a minimal package.
 
+## Performance diagnostics
+
+`moderngekko-run --diagnostics` records per-frame telemetry, subsystem timings
+and StaticRecomp counters, and writes a single shareable `.mgdiag` report with a
+deterministic bottleneck verdict. `moderngekko-diag` inspects and compares
+reports from two machines. Reports carry no game content or personal paths. See
+[docs/diagnostics.md](docs/diagnostics.md).
+
 ## Credits
 
 SpecialK / aharonahdoot - RecompCore (referenced heavily)
