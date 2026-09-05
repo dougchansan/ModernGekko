@@ -30,6 +30,8 @@ set(MODERNGEKKO_LAUNCHER_OUTPUT_NAME "ModernGekko" CACHE STRING
     "Launcher executable filename without a platform suffix")
 set(MODERNGEKKO_RUNNER_OUTPUT_NAME "moderngekko-run" CACHE STRING
     "Runner executable filename without a platform suffix")
+set(MODERNGEKKO_DIAG_OUTPUT_NAME "moderngekko-diag" CACHE STRING
+    "Diagnostics report tool filename without a platform suffix")
 set(MODERNGEKKO_USER_DIRECTORY_NAME "moderngekko" CACHE STRING
     "Frontend user directory name")
 set(MODERNGEKKO_REQUIRED_DISC_ID "" CACHE STRING
@@ -156,6 +158,81 @@ target_include_directories(moderngekko_abi
         "$<INSTALL_INTERFACE:include>"
 )
 
+option(MODERNGEKKO_DIAGNOSTICS_EMBED_BUILD_TIMESTAMP
+       "Embed the configure-time timestamp in diagnostics reports" ON)
+
+# Build identity for diagnostics reports. Resolved at configure time so end
+# users never need Git installed to read a report's build stamp.
+set(MODERNGEKKO_DIAGNOSTICS_GIT_COMMIT "unknown")
+set(MODERNGEKKO_DIAGNOSTICS_GIT_STATE "unknown")
+set(MODERNGEKKO_DIAGNOSTICS_VERSION "dev")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _moderngekko_git_commit
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _moderngekko_git_status)
+    if(_moderngekko_git_status EQUAL 0 AND _moderngekko_git_commit)
+        set(MODERNGEKKO_DIAGNOSTICS_GIT_COMMIT "${_moderngekko_git_commit}")
+    endif()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _moderngekko_git_dirty
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _moderngekko_git_dirty_status)
+    if(_moderngekko_git_dirty_status EQUAL 0)
+        if(_moderngekko_git_dirty)
+            set(MODERNGEKKO_DIAGNOSTICS_GIT_STATE "dirty")
+        else()
+            set(MODERNGEKKO_DIAGNOSTICS_GIT_STATE "clean")
+        endif()
+    endif()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _moderngekko_git_describe
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _moderngekko_describe_status)
+    if(_moderngekko_describe_status EQUAL 0 AND _moderngekko_git_describe)
+        set(MODERNGEKKO_DIAGNOSTICS_VERSION "${_moderngekko_git_describe}")
+    endif()
+endif()
+
+add_library(moderngekko_diagnostics STATIC
+    src/diagnostics/diagnostics.cpp
+    src/diagnostics/perf_recorder.cpp
+    src/diagnostics/trace_buffer.cpp
+    src/diagnostics/system_info.cpp
+    src/diagnostics/zip_archive.cpp
+    src/diagnostics/report_writer.cpp
+    src/diagnostics/report_reader.cpp
+    src/diagnostics/report_render.cpp
+    src/diagnostics/bottleneck_analyzer.cpp
+)
+add_library(ModernGekko::Diagnostics ALIAS moderngekko_diagnostics)
+target_compile_features(moderngekko_diagnostics PUBLIC cxx_std_23)
+target_include_directories(moderngekko_diagnostics
+    PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+           "$<INSTALL_INTERFACE:include>"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/diagnostics"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/picojson"
+)
+find_package(Threads REQUIRED)
+target_link_libraries(moderngekko_diagnostics PUBLIC Threads::Threads)
+target_compile_definitions(moderngekko_diagnostics PRIVATE
+    MODERNGEKKO_BUILD_VERSION="${MODERNGEKKO_DIAGNOSTICS_VERSION}"
+    MODERNGEKKO_BUILD_GIT_COMMIT="${MODERNGEKKO_DIAGNOSTICS_GIT_COMMIT}"
+    MODERNGEKKO_BUILD_GIT_STATE="${MODERNGEKKO_DIAGNOSTICS_GIT_STATE}"
+    MODERNGEKKO_BUILD_CONFIGURATION="$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,unspecified>"
+    MODERNGEKKO_BUILD_LTO=$<IF:$<BOOL:${CMAKE_INTERPROCEDURAL_OPTIMIZATION}>,1,0>
+    MODERNGEKKO_BUILD_CPU_BACKEND="$<IF:$<BOOL:${MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME}>,StaticRecomp,LegacyDispatch>"
+)
+if(MODERNGEKKO_DIAGNOSTICS_EMBED_BUILD_TIMESTAMP)
+    string(TIMESTAMP _moderngekko_build_timestamp "%Y-%m-%dT%H:%M:%SZ" UTC)
+    target_compile_definitions(moderngekko_diagnostics PRIVATE
+        MODERNGEKKO_BUILD_TIMESTAMP="${_moderngekko_build_timestamp}")
+endif()
+
 add_library(moderngekko_legacy STATIC
     src/audio/audio_system.cpp
     src/hardware/mmio_bus.cpp
@@ -226,14 +303,16 @@ target_include_directories(moderngekko_dolphin_video
            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/picojson"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/dolphin_shims"
 )
-target_link_libraries(moderngekko_dolphin_video PUBLIC fmt::fmt)
+target_link_libraries(moderngekko_dolphin_video PUBLIC fmt::fmt ModernGekko::Diagnostics)
 
-target_link_libraries(moderngekko_legacy PUBLIC ModernGekko::ABI fmt::fmt)
+target_link_libraries(moderngekko_legacy PUBLIC ModernGekko::ABI fmt::fmt
+    ModernGekko::Diagnostics)
 target_compile_features(moderngekko_legacy PUBLIC cxx_std_23)
 target_include_directories(moderngekko_legacy PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin_legacy")
 
-target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
+target_link_libraries(moderngekko PUBLIC ModernGekko::ABI ModernGekko::Diagnostics
+    PRIVATE fmt::fmt)
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_sources(moderngekko PRIVATE
         src/runtime/dolphin_runtime.cpp
@@ -385,6 +464,15 @@ else()
     target_include_directories(moderngekko PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin_legacy")
 endif()
+
+add_executable(moderngekko-diag tools/moderngekko_diag.cpp)
+target_link_libraries(moderngekko-diag PRIVATE ModernGekko::Diagnostics)
+target_include_directories(moderngekko-diag PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/picojson")
+set_target_properties(moderngekko-diag PROPERTIES
+    OUTPUT_NAME "${MODERNGEKKO_DIAG_OUTPUT_NAME}")
+target_compile_definitions(moderngekko-diag PRIVATE
+    MODERNGEKKO_DIAG_NAME="${MODERNGEKKO_DIAG_OUTPUT_NAME}")
 
 add_executable(moderngekko-module-info
     tools/module_info.cpp
@@ -614,6 +702,8 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN NOMINMAX)
     foreach(_moderngekko_windows_target
             moderngekko
+            moderngekko_diagnostics
+            moderngekko-diag
             moderngekko-module-info
             moderngekko-run
             moderngekko-launcher
@@ -694,6 +784,22 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME moderngekko.netplay_protocol COMMAND moderngekko_netplay_protocol_test)
     endif()
+
+    add_executable(moderngekko_diagnostics_test tests/diagnostics_test.cpp)
+    target_link_libraries(moderngekko_diagnostics_test
+        PRIVATE ModernGekko::Diagnostics)
+    target_include_directories(moderngekko_diagnostics_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/diagnostics")
+    add_test(NAME moderngekko.diagnostics COMMAND moderngekko_diagnostics_test)
+
+    add_executable(moderngekko_diagnostics_report_test
+        tests/diagnostics_report_test.cpp)
+    target_link_libraries(moderngekko_diagnostics_report_test
+        PRIVATE ModernGekko::Diagnostics)
+    target_include_directories(moderngekko_diagnostics_report_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/diagnostics")
+    add_test(NAME moderngekko.diagnostics_report
+             COMMAND moderngekko_diagnostics_report_test)
 
     add_executable(moderngekko_game_inspect_test tests/game_inspect_test.cpp)
     target_link_libraries(moderngekko_game_inspect_test PRIVATE ModernGekko::LegacyRuntime)

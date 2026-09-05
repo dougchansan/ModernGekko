@@ -3,6 +3,8 @@
 
 #include "moderngekko/gx_command_processor.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #include "moderngekko/address_space.hpp"
 
 #include <algorithm>
@@ -111,8 +113,10 @@ void GxCommandProcessor::Write(std::uint64_t value, std::uint8_t size)
 
 void GxCommandProcessor::WriteBytes(std::span<const std::uint8_t> bytes)
 {
+  MG_PERF_SCOPE(diagnostics::Zone::GxCommandProcessor);
   m_buffer.insert(m_buffer.end(), bytes.begin(), bytes.end());
   std::size_t consumed = 0;
+  std::uint64_t decoded = 0;
   while (consumed < m_buffer.size())
   {
     const std::size_t size = DecodeOne(std::span{m_buffer}.subspan(consumed));
@@ -120,7 +124,9 @@ void GxCommandProcessor::WriteBytes(std::span<const std::uint8_t> bytes)
       break;
     consumed += size;
     ++m_command_count;
+    ++decoded;
   }
+  diagnostics::Count(diagnostics::Counter::GxCommands, decoded);
   if (consumed != 0u)
     m_buffer.erase(m_buffer.begin(), m_buffer.begin() + static_cast<std::ptrdiff_t>(consumed));
 }
@@ -260,15 +266,20 @@ std::size_t GxCommandProcessor::DecodeOne(std::span<const std::uint8_t> data)
     if (m_backend)
       m_backend->Draw({static_cast<GxPrimitive>((command & 0x78u) >> 3), vat, vertex_size,
                        count, data.subspan(3, size - 3)});
+    diagnostics::Count(diagnostics::Counter::DrawCalls);
+    diagnostics::Count(diagnostics::Counter::PrimitivesLoaded);
+    diagnostics::Count(diagnostics::Counter::VerticesLoaded, count);
     return size;
   }
 
   ++m_unknown_opcode_count;
+  diagnostics::Count(diagnostics::Counter::GxUnknownOpcodes);
   return 1;
 }
 
 void GxCommandProcessor::ExecuteDisplayList(std::uint32_t address, std::uint32_t size)
 {
+  diagnostics::Count(diagnostics::Counter::GxDisplayLists);
   if (m_backend)
     m_backend->CallDisplayList(address, size);
   if (m_memory == nullptr || size == 0u || m_display_list_depth >= 16u)
@@ -287,6 +298,7 @@ void GxCommandProcessor::ExecuteDisplayList(std::uint32_t address, std::uint32_t
       break;
     consumed += command_size;
     ++m_command_count;
+    diagnostics::Count(diagnostics::Counter::GxCommands);
   }
   --m_display_list_depth;
 }

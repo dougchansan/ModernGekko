@@ -3,6 +3,8 @@
 
 #include "moderngekko/gx_vertex_loader.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -226,6 +228,7 @@ bool GxVertexLoader::Decode(const GxDrawPacket& packet, std::span<const std::uin
 {
   if (output == nullptr || cp.size() < 256u)
     return false;
+  MG_PERF_SCOPE(diagnostics::Zone::VertexLoader);
   output->vertices.clear();
   output->indices.clear();
   output->vertices.reserve(packet.vertex_count);

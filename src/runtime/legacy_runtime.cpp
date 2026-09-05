@@ -1,5 +1,7 @@
 #include "moderngekko/legacy_runtime.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #include "Core/Boot/BootMemory.h"
 #include "Core/Boot/DolReader.h"
 #include "moderngekko/interpreter.hpp"
@@ -98,6 +100,7 @@ void LegacyRuntime::Reset()
 
 LegacyRunResult LegacyRuntime::Run(std::uint64_t dispatch_limit)
 {
+  MG_PERF_SCOPE(diagnostics::Zone::GuestCpu);
   LegacyRunResult result{};
   result.program_counter = m_cpu.pc;
 
@@ -116,17 +119,33 @@ LegacyRunResult LegacyRuntime::Run(std::uint64_t dispatch_limit)
     }
 
     m_cpu.downcount = 0;
+    // Publishing the guest PC is a single relaxed store; the sampler thread
+    // reads it, so no timer runs inside the dispatch loop.
+    diagnostics::NoteGuestPc(m_cpu.pc);
     if (!descriptor->dispatch(&m_cpu, m_cpu.pc))
     {
-      const InterpreterResult fallback = Interpreter::Step(m_cpu, m_address_space);
+      // The recompiled module has no block for this address, so execution
+      // drops into the interpreter for one instruction.
+      diagnostics::Count(diagnostics::Counter::StaticRecompDispatchMisses);
+      InterpreterResult fallback{};
+      {
+        MG_PERF_SCOPE_AT(diagnostics::Zone::InterpreterFallback, diagnostics::Level::Trace);
+        fallback = Interpreter::Step(m_cpu, m_address_space);
+      }
       if (fallback.status != InterpreterStatus::Executed)
       {
+        if (fallback.status == InterpreterStatus::UnsupportedInstruction)
+          diagnostics::Count(diagnostics::Counter::UnsupportedInstructionFallbacks);
+        else
+          diagnostics::Count(diagnostics::Counter::Exceptions);
         result.status = fallback.status == InterpreterStatus::MemoryFault ?
             LegacyRunStatus::MemoryFault : LegacyRunStatus::UnsupportedInstruction;
         result.program_counter = m_cpu.pc;
         return result;
       }
 
+      diagnostics::Count(diagnostics::Counter::InterpreterFallbacks);
+      diagnostics::Count(diagnostics::Counter::GuestInstructions);
       ++result.fallback_instructions;
       result.cycles += fallback.cycles;
       m_cpu.timebase += fallback.cycles;
@@ -135,6 +154,7 @@ LegacyRunResult LegacyRuntime::Run(std::uint64_t dispatch_limit)
       continue;
     }
 
+    diagnostics::Count(diagnostics::Counter::StaticRecompDispatches);
     ++result.dispatches;
     ++steps;
     if (m_cpu.downcount < 0)

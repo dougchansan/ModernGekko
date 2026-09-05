@@ -1,5 +1,7 @@
 #include "moderngekko/mmio_bus.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -44,18 +46,29 @@ const MmioBus::Range* MmioBus::Find(std::uint32_t address, std::uint8_t size) co
 
 bool MmioBus::Read(std::uint32_t address, std::uint8_t size, std::uint64_t* value) const
 {
+  MG_PERF_SCOPE_AT(diagnostics::Zone::Mmio, diagnostics::Level::Trace);
+  diagnostics::Count(diagnostics::Counter::MmioReads);
   const Range* range = Find(address, size);
   if (range == nullptr || !range->read || value == nullptr)
+  {
+    // Unmapped or unhandled accesses fall through to the caller's slow path.
+    diagnostics::Count(diagnostics::Counter::MmioSlowPaths);
     return false;
+  }
   *value = range->read(address, size);
   return true;
 }
 
 bool MmioBus::Write(std::uint32_t address, std::uint64_t value, std::uint8_t size)
 {
+  MG_PERF_SCOPE_AT(diagnostics::Zone::Mmio, diagnostics::Level::Trace);
+  diagnostics::Count(diagnostics::Counter::MmioWrites);
   const Range* range = Find(address, size);
   if (range == nullptr || !range->write)
+  {
+    diagnostics::Count(diagnostics::Counter::MmioSlowPaths);
     return false;
+  }
   range->write(address, value, size);
   return true;
 }
