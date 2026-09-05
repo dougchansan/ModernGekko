@@ -1,5 +1,7 @@
 #include "moderngekko/mod_loader.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #if defined(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
 #include "Common/DynamicLibrary.h"
 #endif
@@ -652,8 +654,15 @@ bool ModManager::Empty() const { return m_impl->mods.empty(); }
 
 bool ModManager::HostCall(CPUState *state, std::uint32_t address,
                           void *user_data) {
-  return user_data &&
-         static_cast<ModManager *>(user_data)->Dispatch(state, address);
+  MG_PERF_SCOPE_AT(diagnostics::Zone::Mods, diagnostics::Level::Trace);
+  diagnostics::Count(diagnostics::Counter::HostCalls);
+  if (user_data == nullptr)
+    return false;
+  const bool handled =
+      static_cast<ModManager *>(user_data)->Dispatch(state, address);
+  if (handled)
+    diagnostics::Count(diagnostics::Counter::ModHostCalls);
+  return handled;
 }
 
 bool ModManager::HostCallContains(std::uint32_t address, void *user_data) {

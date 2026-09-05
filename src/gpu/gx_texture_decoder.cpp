@@ -3,6 +3,8 @@
 
 #include "moderngekko/gx_texture_decoder.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #include <array>
 #include <limits>
 
@@ -162,6 +164,9 @@ bool GxTextureDecoder::Decode(std::span<const std::uint8_t> encoded, std::uint32
   {
     return false;
   }
+  MG_PERF_SCOPE(diagnostics::Zone::TextureDecoder);
+  diagnostics::Count(diagnostics::Counter::TextureDecodes);
+  diagnostics::Count(diagnostics::Counter::TextureDecodeBytes, encoded_size);
   output->width = width;
   output->height = height;
   output->rgba8.assign(static_cast<std::size_t>(width) * height, 0u);

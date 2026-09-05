@@ -3,6 +3,8 @@
 
 #include "moderngekko/event_scheduler.hpp"
 
+#include "moderngekko/diagnostics.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -29,6 +31,7 @@ bool EventScheduler::Cancel(EventId id)
 
 void EventScheduler::Advance(std::uint64_t cycles)
 {
+  MG_PERF_SCOPE_AT(diagnostics::Zone::Scheduler, diagnostics::Level::Trace);
   m_ticks = cycles > std::numeric_limits<std::uint64_t>::max() - m_ticks ?
       std::numeric_limits<std::uint64_t>::max() : m_ticks + cycles;
 
