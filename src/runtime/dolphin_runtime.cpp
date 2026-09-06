@@ -532,6 +532,8 @@ RuntimeRunResult Runtime::Run() {
     static std::atomic<std::uint64_t> s_draw_calls{0};
     static std::atomic<std::uint64_t> s_vertices{0};
     static std::atomic<std::uint64_t> s_tex_decodes{0};
+    static std::atomic<std::uint64_t> s_shader_ns{0};
+    static std::atomic<std::uint64_t> s_shader_compiles{0};
     static std::atomic<std::uint64_t> s_mmio_reads{0};
     static std::atomic<std::uint64_t> s_mmio_writes{0};
     static MmioObservers s_mmio_observers;
@@ -544,6 +546,8 @@ RuntimeRunResult Runtime::Run() {
       s_video_observers.draw_calls = &s_draw_calls;
       s_video_observers.vertices_loaded = &s_vertices;
       s_video_observers.texture_decodes = &s_tex_decodes;
+      s_video_observers.shader_generation_ns = &s_shader_ns;
+      s_video_observers.shader_compilations = &s_shader_compiles;
       SetVideoZoneObservers(&s_video_observers);
 
       // MMIO is the hottest of these paths, so it follows the same gate.
@@ -580,6 +584,8 @@ RuntimeRunResult Runtime::Run() {
           drain(s_cp_ns, last_cp_ns, diagnostics::Zone::GxCommandProcessor);
           drain(s_vtx_ns, last_vtx_ns, diagnostics::Zone::VertexLoader);
           drain(s_tex_ns, last_tex_ns, diagnostics::Zone::TextureDecoder);
+          static std::uint64_t last_shader_ns = 0;
+          drain(s_shader_ns, last_shader_ns, diagnostics::Zone::ShaderGeneration);
           // Same shape for tallies: report what accrued since the last frame.
           const auto tally = [](const std::atomic<std::uint64_t>& source,
                                 std::uint64_t& previous, diagnostics::Counter counter) {
@@ -606,6 +612,9 @@ RuntimeRunResult Runtime::Run() {
           static std::uint64_t last_mmio_writes = 0;
           tally(s_mmio_reads, last_mmio_reads, diagnostics::Counter::MmioReads);
           tally(s_mmio_writes, last_mmio_writes, diagnostics::Counter::MmioWrites);
+          static std::uint64_t last_shader_compiles = 0;
+          tally(s_shader_compiles, last_shader_compiles,
+                diagnostics::Counter::ShaderCompilations);
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;
