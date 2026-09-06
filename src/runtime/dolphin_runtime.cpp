@@ -22,6 +22,7 @@
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompObserver.h"
+#include "VideoCommon/VideoZoneObserver.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
 #include "moderngekko/diagnostics.hpp"
@@ -516,6 +517,19 @@ RuntimeRunResult Runtime::Run() {
     s_observers.guest_cpu_ns = &s_guest_cpu_ns;
     SetStaticRecompObservers(&s_observers);
     diagnostics::SetGuestPcSource(&s_guest_pc);
+
+    static std::atomic<std::uint64_t> s_cp_ns{0};
+    static std::atomic<std::uint64_t> s_vtx_ns{0};
+    static std::atomic<std::uint64_t> s_tex_ns{0};
+    static VideoZoneObservers s_video_observers;
+    // Per-subsystem GX timing is a detailed-level cost; basic stays cheap.
+    if (m_impl->config.diagnostics.level >= diagnostics::Level::Detailed)
+    {
+      s_video_observers.command_processor_ns = &s_cp_ns;
+      s_video_observers.vertex_loader_ns = &s_vtx_ns;
+      s_video_observers.texture_decode_ns = &s_tex_ns;
+      SetVideoZoneObservers(&s_video_observers);
+    }
     m_impl->present_hook = GetVideoEvents().after_present_event.Register(
         [this](const PresentInfo &) {
           diagnostics::Diagnostics &diagnostics_state =
@@ -527,15 +541,24 @@ RuntimeRunResult Runtime::Run() {
           telemetry.vps = metrics.GetVPS();
           telemetry.speed = metrics.GetSpeed();
           diagnostics_state.NameCurrentThread("Present");
+          // Each source is cumulative; report the delta since the last frame.
+          const auto drain = [](const std::atomic<std::uint64_t>& source,
+                                std::uint64_t& previous, diagnostics::Zone zone) {
+            const std::uint64_t total = source.load(std::memory_order_relaxed);
+            if (total > previous)
+            {
+              diagnostics::AddZoneNanos(zone, total - previous);
+              previous = total;
+            }
+          };
           static std::uint64_t last_guest_cpu_ns = 0;
-          const std::uint64_t total_guest_cpu_ns =
-              s_guest_cpu_ns.load(std::memory_order_relaxed);
-          if (total_guest_cpu_ns > last_guest_cpu_ns)
-          {
-            diagnostics::AddZoneNanos(diagnostics::Zone::GuestCpu,
-                                      total_guest_cpu_ns - last_guest_cpu_ns);
-            last_guest_cpu_ns = total_guest_cpu_ns;
-          }
+          static std::uint64_t last_cp_ns = 0;
+          static std::uint64_t last_vtx_ns = 0;
+          static std::uint64_t last_tex_ns = 0;
+          drain(s_guest_cpu_ns, last_guest_cpu_ns, diagnostics::Zone::GuestCpu);
+          drain(s_cp_ns, last_cp_ns, diagnostics::Zone::GxCommandProcessor);
+          drain(s_vtx_ns, last_vtx_ns, diagnostics::Zone::VertexLoader);
+          drain(s_tex_ns, last_tex_ns, diagnostics::Zone::TextureDecoder);
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;
