@@ -23,6 +23,7 @@
 #include "VideoCommon/VideoEvents.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompObserver.h"
 #include "VideoCommon/VideoZoneObserver.h"
+#include "Core/HW/MmioObserver.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
 #include "moderngekko/diagnostics.hpp"
@@ -531,6 +532,9 @@ RuntimeRunResult Runtime::Run() {
     static std::atomic<std::uint64_t> s_draw_calls{0};
     static std::atomic<std::uint64_t> s_vertices{0};
     static std::atomic<std::uint64_t> s_tex_decodes{0};
+    static std::atomic<std::uint64_t> s_mmio_reads{0};
+    static std::atomic<std::uint64_t> s_mmio_writes{0};
+    static MmioObservers s_mmio_observers;
     // Per-subsystem GX timing is a detailed-level cost; basic stays cheap.
     if (m_impl->config.diagnostics.level >= diagnostics::Level::Detailed)
     {
@@ -541,6 +545,11 @@ RuntimeRunResult Runtime::Run() {
       s_video_observers.vertices_loaded = &s_vertices;
       s_video_observers.texture_decodes = &s_tex_decodes;
       SetVideoZoneObservers(&s_video_observers);
+
+      // MMIO is the hottest of these paths, so it follows the same gate.
+      s_mmio_observers.reads = &s_mmio_reads;
+      s_mmio_observers.writes = &s_mmio_writes;
+      SetMmioObservers(&s_mmio_observers);
     }
     m_impl->present_hook = GetVideoEvents().after_present_event.Register(
         [this](const PresentInfo &) {
@@ -593,6 +602,10 @@ RuntimeRunResult Runtime::Run() {
           tally(s_draw_calls, last_draws, diagnostics::Counter::DrawCalls);
           tally(s_vertices, last_vertices, diagnostics::Counter::VerticesLoaded);
           tally(s_tex_decodes, last_tex_decodes, diagnostics::Counter::TextureDecodes);
+          static std::uint64_t last_mmio_reads = 0;
+          static std::uint64_t last_mmio_writes = 0;
+          tally(s_mmio_reads, last_mmio_reads, diagnostics::Counter::MmioReads);
+          tally(s_mmio_writes, last_mmio_writes, diagnostics::Counter::MmioWrites);
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;
