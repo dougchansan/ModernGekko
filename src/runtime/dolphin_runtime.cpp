@@ -21,6 +21,7 @@
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompObserver.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
 #include "moderngekko/diagnostics.hpp"
@@ -504,6 +505,17 @@ RuntimeRunResult Runtime::Run() {
   if (m_impl->diagnostics_enabled) {
     diagnostics::Diagnostics &diag = diagnostics::Diagnostics::Get();
     diag.NameCurrentThread("Host");
+
+    // The StaticRecomp core measures guest execution time but cannot reach the
+    // diagnostics library, which sits above it. Install the observation points
+    // and fold the cumulative counter into the GuestCpu zone once per frame.
+    static std::atomic<std::uint32_t> s_guest_pc{0};
+    static std::atomic<std::uint64_t> s_guest_cpu_ns{0};
+    static StaticRecompObservers s_observers;
+    s_observers.guest_pc = &s_guest_pc;
+    s_observers.guest_cpu_ns = &s_guest_cpu_ns;
+    SetStaticRecompObservers(&s_observers);
+    diagnostics::SetGuestPcSource(&s_guest_pc);
     m_impl->present_hook = GetVideoEvents().after_present_event.Register(
         [this](const PresentInfo &) {
           diagnostics::Diagnostics &diagnostics_state =
@@ -515,6 +527,15 @@ RuntimeRunResult Runtime::Run() {
           telemetry.vps = metrics.GetVPS();
           telemetry.speed = metrics.GetSpeed();
           diagnostics_state.NameCurrentThread("Present");
+          static std::uint64_t last_guest_cpu_ns = 0;
+          const std::uint64_t total_guest_cpu_ns =
+              s_guest_cpu_ns.load(std::memory_order_relaxed);
+          if (total_guest_cpu_ns > last_guest_cpu_ns)
+          {
+            diagnostics::AddZoneNanos(diagnostics::Zone::GuestCpu,
+                                      total_guest_cpu_ns - last_guest_cpu_ns);
+            last_guest_cpu_ns = total_guest_cpu_ns;
+          }
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;

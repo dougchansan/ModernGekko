@@ -294,6 +294,9 @@ inline void Count(Counter counter, std::uint64_t amount = 1)
   detail::AddCounter(detail::Tls(), static_cast<std::size_t>(counter), amount);
 }
 
+// Samples this for hotspots when the guest PC lives below this library.
+void SetGuestPcSource(const std::atomic<std::uint32_t>* source);
+
 // Adds externally measured time to a zone (GPU timestamp queries, for example).
 inline void AddZoneNanos(Zone zone, std::uint64_t nanoseconds)
 {
