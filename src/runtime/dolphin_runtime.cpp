@@ -517,17 +517,29 @@ RuntimeRunResult Runtime::Run() {
     s_observers.guest_cpu_ns = &s_guest_cpu_ns;
     SetStaticRecompObservers(&s_observers);
     diagnostics::SetGuestPcSource(&s_guest_pc);
+    static std::atomic<std::uint64_t> s_dispatches{0};
+    static std::atomic<std::uint64_t> s_fallbacks{0};
+    static std::atomic<std::uint64_t> s_exceptions{0};
+    s_observers.dispatches = &s_dispatches;
+    s_observers.interpreter_fallbacks = &s_fallbacks;
+    s_observers.exceptions = &s_exceptions;
 
     static std::atomic<std::uint64_t> s_cp_ns{0};
     static std::atomic<std::uint64_t> s_vtx_ns{0};
     static std::atomic<std::uint64_t> s_tex_ns{0};
     static VideoZoneObservers s_video_observers;
+    static std::atomic<std::uint64_t> s_draw_calls{0};
+    static std::atomic<std::uint64_t> s_vertices{0};
+    static std::atomic<std::uint64_t> s_tex_decodes{0};
     // Per-subsystem GX timing is a detailed-level cost; basic stays cheap.
     if (m_impl->config.diagnostics.level >= diagnostics::Level::Detailed)
     {
       s_video_observers.command_processor_ns = &s_cp_ns;
       s_video_observers.vertex_loader_ns = &s_vtx_ns;
       s_video_observers.texture_decode_ns = &s_tex_ns;
+      s_video_observers.draw_calls = &s_draw_calls;
+      s_video_observers.vertices_loaded = &s_vertices;
+      s_video_observers.texture_decodes = &s_tex_decodes;
       SetVideoZoneObservers(&s_video_observers);
     }
     m_impl->present_hook = GetVideoEvents().after_present_event.Register(
@@ -559,6 +571,28 @@ RuntimeRunResult Runtime::Run() {
           drain(s_cp_ns, last_cp_ns, diagnostics::Zone::GxCommandProcessor);
           drain(s_vtx_ns, last_vtx_ns, diagnostics::Zone::VertexLoader);
           drain(s_tex_ns, last_tex_ns, diagnostics::Zone::TextureDecoder);
+          // Same shape for tallies: report what accrued since the last frame.
+          const auto tally = [](const std::atomic<std::uint64_t>& source,
+                                std::uint64_t& previous, diagnostics::Counter counter) {
+            const std::uint64_t total = source.load(std::memory_order_relaxed);
+            if (total > previous)
+            {
+              diagnostics::Count(counter, total - previous);
+              previous = total;
+            }
+          };
+          static std::uint64_t last_dispatches = 0;
+          static std::uint64_t last_fallbacks = 0;
+          static std::uint64_t last_exceptions = 0;
+          static std::uint64_t last_draws = 0;
+          static std::uint64_t last_vertices = 0;
+          static std::uint64_t last_tex_decodes = 0;
+          tally(s_dispatches, last_dispatches, diagnostics::Counter::StaticRecompDispatches);
+          tally(s_fallbacks, last_fallbacks, diagnostics::Counter::InterpreterFallbacks);
+          tally(s_exceptions, last_exceptions, diagnostics::Counter::Exceptions);
+          tally(s_draw_calls, last_draws, diagnostics::Counter::DrawCalls);
+          tally(s_vertices, last_vertices, diagnostics::Counter::VerticesLoaded);
+          tally(s_tex_decodes, last_tex_decodes, diagnostics::Counter::TextureDecodes);
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;
