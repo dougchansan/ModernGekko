@@ -1,20 +1,30 @@
 #include "frontend_config.hpp"
 #include "dol_patch.hpp"
+#include "moderngekko/diagnostics.hpp"
 #include "moderngekko/game.hpp"
 #include "moderngekko/runtime.hpp"
 #include "netplay_session.hpp"
 
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 #ifndef MODERNGEKKO_RUNNER_NAME
@@ -40,8 +50,22 @@ void Usage() {
                "[--netplay-port <port>]\n"
                "       [--nickname <name>] [--buffer <auto|1-20>] "
                "[--controller <device>]...\n"
+               "       [--diagnostics] [--diagnostics-overlay]\n"
+               "       [--diagnostics-level <basic|detailed|trace>]\n"
+               "       [--diagnostics-output <directory>] "
+               "[--diagnostics-capture <seconds>]\n"
+               "       [--diagnostics-history <seconds>] "
+               "[--diagnostics-sample-hz <hz>]\n"
+               "       [--diagnostics-symbols <recomp_symbols.json>] "
+               "[--diagnostics-no-anonymize]\n"
                "       With no --game, boots the path in "
-               "<user-dir>/default-game.txt.\n";
+               "<user-dir>/default-game.txt.\n"
+               "\n"
+               "       While diagnostics are enabled the runner reads capture "
+               "commands from\n"
+               "       standard input: 'c' starts or stops a capture, 'h' saves "
+               "the rolling\n"
+               "       history and 'o' toggles the overlay.\n";
 }
 
 std::filesystem::path
@@ -96,6 +120,31 @@ std::string LibrarySuffix() {
   return ".dylib";
 #else
   return ".so";
+#endif
+}
+
+double ParsePositiveNumber(const char *text, const char *option) {
+  char *end = nullptr;
+  const double value = std::strtod(text, &end);
+  if (end == text || *end != '\0' || !(value >= 0.0)) {
+    std::cerr << option << " expects a non-negative number\n";
+    std::exit(2);
+  }
+  return value;
+}
+
+// Shared between RunMain and the detached console reader so the reader can
+// never use the runtime after RunMain has torn it down.
+struct DiagnosticsConsole {
+  std::mutex mutex;
+  moderngekko::Runtime *runtime = nullptr;
+};
+
+bool StandardInputIsInteractive() {
+#if defined(_WIN32)
+  return _isatty(_fileno(stdin)) != 0;
+#else
+  return ::isatty(STDIN_FILENO) != 0;
 #endif
 }
 
@@ -169,6 +218,41 @@ int RunMain(int argc, char **argv) {
       config.headless = true;
     else if (arg == "--allow-interpreter")
       config.allow_interpreter = true;
+    else if (arg == "--diagnostics")
+      config.diagnostics.enabled = true;
+    else if (arg == "--diagnostics-overlay") {
+      config.diagnostics.enabled = true;
+      config.diagnostics.overlay = true;
+    } else if (arg == "--diagnostics-level") {
+      const std::string level = value("--diagnostics-level");
+      if (!moderngekko::diagnostics::ParseLevel(level,
+                                               &config.diagnostics.level)) {
+        std::cerr << "--diagnostics-level must be basic, detailed or trace\n";
+        return 2;
+      }
+      config.diagnostics.enabled =
+          config.diagnostics.level != moderngekko::diagnostics::Level::Off;
+    } else if (arg == "--diagnostics-output") {
+      config.diagnostics.enabled = true;
+      config.diagnostics.output_directory = value("--diagnostics-output");
+    } else if (arg == "--diagnostics-capture") {
+      config.diagnostics.enabled = true;
+      config.diagnostics.capture_seconds =
+          ParsePositiveNumber(value("--diagnostics-capture"),
+                              "--diagnostics-capture");
+    } else if (arg == "--diagnostics-history") {
+      config.diagnostics.history_seconds = ParsePositiveNumber(
+          value("--diagnostics-history"), "--diagnostics-history");
+    } else if (arg == "--diagnostics-sample-hz") {
+      config.diagnostics.sample_hz = static_cast<unsigned>(ParsePositiveNumber(
+          value("--diagnostics-sample-hz"), "--diagnostics-sample-hz"));
+    } else if (arg == "--diagnostics-symbols") {
+      config.diagnostics.enabled = true;
+      config.diagnostics.symbol_file = value("--diagnostics-symbols");
+    } else if (arg == "--diagnostics-anonymize")
+      config.diagnostics.anonymize = true;
+    else if (arg == "--diagnostics-no-anonymize")
+      config.diagnostics.anonymize = false;
     else if (arg == "--netplay-host")
       netplay_role = moderngekko::frontend::NetplayRole::Host;
     else if (arg == "--netplay-join") {
@@ -357,6 +441,14 @@ int RunMain(int argc, char **argv) {
         std::move(config), std::move(frontend_config), std::move(options));
   }
 
+  const moderngekko::diagnostics::Level config_diagnostics_level =
+      config.diagnostics.level;
+  const double diagnostics_history_seconds = config.diagnostics.history_seconds;
+  const std::filesystem::path diagnostics_output =
+      config.diagnostics.output_directory.empty()
+          ? config.user_directory / "Diagnostics"
+          : config.diagnostics.output_directory;
+
   auto created = moderngekko::Runtime::Create(std::move(config));
   if (!created) {
     std::cerr << "initialization failed: " << created.error->message << '\n';
@@ -365,8 +457,67 @@ int RunMain(int argc, char **argv) {
   std::cout << "audio backend: " << created.runtime->GetConfig().audio.backend
             << '\n';
 
+  if (created.runtime->IsDiagnosticsEnabled()) {
+    std::cout << "diagnostics: enabled at level "
+              << moderngekko::diagnostics::LevelName(config_diagnostics_level)
+              << "; reports are written to " << diagnostics_output << '\n';
+    if (StandardInputIsInteractive())
+      std::cout << "diagnostics: press c<enter> to start or stop a capture, "
+                   "h<enter> to save the last "
+                << diagnostics_history_seconds
+                << " s of history, o<enter> to toggle the overlay\n";
+  }
+
   std::signal(SIGINT, HandleStopSignal);
   std::signal(SIGTERM, HandleStopSignal);
+  // A console command loop keeps capture control working on every platform,
+  // including headless hosts with no game window to receive a hotkey. The
+  // reader thread is detached because it blocks in getline until the process
+  // exits, so the runtime pointer is cleared under a lock before teardown.
+  auto console = std::make_shared<DiagnosticsConsole>();
+  if (created.runtime->IsDiagnosticsEnabled() && StandardInputIsInteractive()) {
+    console->runtime = created.runtime.get();
+    std::thread([console] {
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        char command = '\0';
+        for (const char c : line) {
+          if (std::isspace(static_cast<unsigned char>(c)) == 0) {
+            command = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c)));
+            break;
+          }
+        }
+        if (command != 'c' && command != 'h' && command != 'o')
+          continue;
+        std::lock_guard lock(console->mutex);
+        moderngekko::Runtime *runtime = console->runtime;
+        if (runtime == nullptr)
+          return;
+        std::filesystem::path written;
+        if (command == 'c') {
+          const bool capturing = runtime->IsDiagnosticsCapturing();
+          if (!runtime->ToggleDiagnosticsCapture(&written))
+            std::cout << "diagnostics: capture command failed\n";
+          else if (capturing)
+            std::cout << "diagnostics: wrote " << written << '\n';
+          else
+            std::cout << "diagnostics: capture started\n";
+        } else if (command == 'h') {
+          if (runtime->SaveDiagnosticsHistory(&written))
+            std::cout << "diagnostics: wrote " << written << '\n';
+          else
+            std::cout << "diagnostics: could not save history\n";
+        } else {
+          const bool enabled = !runtime->IsDiagnosticsOverlayEnabled();
+          runtime->SetDiagnosticsOverlay(enabled);
+          std::cout << "diagnostics: overlay " << (enabled ? "on" : "off")
+                    << '\n';
+        }
+      }
+    }).detach();
+  }
+
   std::jthread signal_watcher([&](std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
       if (s_stop_requested) {
@@ -378,6 +529,11 @@ int RunMain(int argc, char **argv) {
     }
   });
   const moderngekko::RuntimeRunResult result = created.runtime->Run();
+  {
+    // Stop the console thread from touching the runtime once Run has returned.
+    std::lock_guard lock(console->mutex);
+    console->runtime = nullptr;
+  }
   signal_watcher.request_stop();
   if (result.error) {
     std::cerr << "runtime failed: " << result.error->message << '\n';
