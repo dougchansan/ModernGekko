@@ -534,6 +534,7 @@ RuntimeRunResult Runtime::Run() {
     static std::atomic<std::uint64_t> s_tex_decodes{0};
     static std::atomic<std::uint64_t> s_shader_ns{0};
     static std::atomic<std::uint64_t> s_shader_compiles{0};
+    static std::atomic<std::uint64_t> s_efb_copies{0};
     static std::atomic<std::uint64_t> s_mmio_reads{0};
     static std::atomic<std::uint64_t> s_mmio_writes{0};
     static MmioObservers s_mmio_observers;
@@ -548,6 +549,7 @@ RuntimeRunResult Runtime::Run() {
       s_video_observers.texture_decodes = &s_tex_decodes;
       s_video_observers.shader_generation_ns = &s_shader_ns;
       s_video_observers.shader_compilations = &s_shader_compiles;
+      s_video_observers.efb_copies = &s_efb_copies;
       SetVideoZoneObservers(&s_video_observers);
 
       // MMIO is the hottest of these paths, so it follows the same gate.
@@ -615,6 +617,8 @@ RuntimeRunResult Runtime::Run() {
           static std::uint64_t last_shader_compiles = 0;
           tally(s_shader_compiles, last_shader_compiles,
                 diagnostics::Counter::ShaderCompilations);
+          static std::uint64_t last_efb_copies = 0;
+          tally(s_efb_copies, last_efb_copies, diagnostics::Counter::EfbCopies);
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;
