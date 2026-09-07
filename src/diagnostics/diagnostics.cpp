@@ -18,6 +18,12 @@ namespace moderngekko::diagnostics
 {
 namespace
 {
+// Set when a lower layer owns the guest PC.
+std::atomic<const std::atomic<std::uint32_t>*> g_guest_pc_source{nullptr};
+}  // namespace
+
+namespace
+{
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kMaxLogLines = 2000;
@@ -129,11 +135,7 @@ struct Diagnostics::Impl
       }
       if (!active)
         continue;
-      for (detail::ThreadState* state : detail::RegisteredThreads())
-      {
-        if (state->guest_pc_epoch.load(std::memory_order_relaxed) == 0)
-          continue;
-        const std::uint32_t pc = state->guest_pc.load(std::memory_order_relaxed);
+      const auto record = [this](std::uint32_t pc) {
         std::lock_guard lock(hotspot_mutex);
         ++hotspot_samples;
         auto it = hotspots.find(pc);
@@ -141,10 +143,28 @@ struct Diagnostics::Impl
           ++it->second;
         else if (hotspots.size() < 65536)
           hotspots.emplace(pc, 1);
+      };
+      for (detail::ThreadState* state : detail::RegisteredThreads())
+      {
+        if (state->guest_pc_epoch.load(std::memory_order_relaxed) == 0)
+          continue;
+        record(state->guest_pc.load(std::memory_order_relaxed));
+      }
+      // The recompiled core publishes its PC from below; sample it here.
+      // Zero means it has not published yet, so it is not a real address.
+      if (const auto* source = g_guest_pc_source.load(std::memory_order_relaxed))
+      {
+        if (const std::uint32_t pc = source->load(std::memory_order_relaxed))
+          record(pc);
       }
     }
   }
 };
+
+void SetGuestPcSource(const std::atomic<std::uint32_t>* source)
+{
+  g_guest_pc_source.store(source, std::memory_order_relaxed);
+}
 
 Diagnostics::Diagnostics() : m_impl(std::make_unique<Impl>()) {}
 

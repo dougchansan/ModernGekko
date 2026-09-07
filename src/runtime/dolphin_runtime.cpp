@@ -21,6 +21,9 @@
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompObserver.h"
+#include "VideoCommon/VideoZoneObserver.h"
+#include "Core/HW/MmioObserver.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
 #include "moderngekko/diagnostics.hpp"
@@ -504,6 +507,56 @@ RuntimeRunResult Runtime::Run() {
   if (m_impl->diagnostics_enabled) {
     diagnostics::Diagnostics &diag = diagnostics::Diagnostics::Get();
     diag.NameCurrentThread("Host");
+
+    // The StaticRecomp core measures guest execution time but cannot reach the
+    // diagnostics library, which sits above it. Install the observation points
+    // and fold the cumulative counter into the GuestCpu zone once per frame.
+    static std::atomic<std::uint32_t> s_guest_pc{0};
+    static std::atomic<std::uint64_t> s_guest_cpu_ns{0};
+    static StaticRecompObservers s_observers;
+    s_observers.guest_pc = &s_guest_pc;
+    s_observers.guest_cpu_ns = &s_guest_cpu_ns;
+    SetStaticRecompObservers(&s_observers);
+    diagnostics::SetGuestPcSource(&s_guest_pc);
+    static std::atomic<std::uint64_t> s_dispatches{0};
+    static std::atomic<std::uint64_t> s_fallbacks{0};
+    static std::atomic<std::uint64_t> s_exceptions{0};
+    s_observers.dispatches = &s_dispatches;
+    s_observers.interpreter_fallbacks = &s_fallbacks;
+    s_observers.exceptions = &s_exceptions;
+
+    static std::atomic<std::uint64_t> s_cp_ns{0};
+    static std::atomic<std::uint64_t> s_vtx_ns{0};
+    static std::atomic<std::uint64_t> s_tex_ns{0};
+    static VideoZoneObservers s_video_observers;
+    static std::atomic<std::uint64_t> s_draw_calls{0};
+    static std::atomic<std::uint64_t> s_vertices{0};
+    static std::atomic<std::uint64_t> s_tex_decodes{0};
+    static std::atomic<std::uint64_t> s_shader_ns{0};
+    static std::atomic<std::uint64_t> s_shader_compiles{0};
+    static std::atomic<std::uint64_t> s_efb_copies{0};
+    static std::atomic<std::uint64_t> s_mmio_reads{0};
+    static std::atomic<std::uint64_t> s_mmio_writes{0};
+    static MmioObservers s_mmio_observers;
+    // Per-subsystem GX timing is a detailed-level cost; basic stays cheap.
+    if (m_impl->config.diagnostics.level >= diagnostics::Level::Detailed)
+    {
+      s_video_observers.command_processor_ns = &s_cp_ns;
+      s_video_observers.vertex_loader_ns = &s_vtx_ns;
+      s_video_observers.texture_decode_ns = &s_tex_ns;
+      s_video_observers.draw_calls = &s_draw_calls;
+      s_video_observers.vertices_loaded = &s_vertices;
+      s_video_observers.texture_decodes = &s_tex_decodes;
+      s_video_observers.shader_generation_ns = &s_shader_ns;
+      s_video_observers.shader_compilations = &s_shader_compiles;
+      s_video_observers.efb_copies = &s_efb_copies;
+      SetVideoZoneObservers(&s_video_observers);
+
+      // MMIO is the hottest of these paths, so it follows the same gate.
+      s_mmio_observers.reads = &s_mmio_reads;
+      s_mmio_observers.writes = &s_mmio_writes;
+      SetMmioObservers(&s_mmio_observers);
+    }
     m_impl->present_hook = GetVideoEvents().after_present_event.Register(
         [this](const PresentInfo &) {
           diagnostics::Diagnostics &diagnostics_state =
@@ -515,6 +568,57 @@ RuntimeRunResult Runtime::Run() {
           telemetry.vps = metrics.GetVPS();
           telemetry.speed = metrics.GetSpeed();
           diagnostics_state.NameCurrentThread("Present");
+          // Each source is cumulative; report the delta since the last frame.
+          const auto drain = [](const std::atomic<std::uint64_t>& source,
+                                std::uint64_t& previous, diagnostics::Zone zone) {
+            const std::uint64_t total = source.load(std::memory_order_relaxed);
+            if (total > previous)
+            {
+              diagnostics::AddZoneNanos(zone, total - previous);
+              previous = total;
+            }
+          };
+          static std::uint64_t last_guest_cpu_ns = 0;
+          static std::uint64_t last_cp_ns = 0;
+          static std::uint64_t last_vtx_ns = 0;
+          static std::uint64_t last_tex_ns = 0;
+          drain(s_guest_cpu_ns, last_guest_cpu_ns, diagnostics::Zone::GuestCpu);
+          drain(s_cp_ns, last_cp_ns, diagnostics::Zone::GxCommandProcessor);
+          drain(s_vtx_ns, last_vtx_ns, diagnostics::Zone::VertexLoader);
+          drain(s_tex_ns, last_tex_ns, diagnostics::Zone::TextureDecoder);
+          static std::uint64_t last_shader_ns = 0;
+          drain(s_shader_ns, last_shader_ns, diagnostics::Zone::ShaderGeneration);
+          // Same shape for tallies: report what accrued since the last frame.
+          const auto tally = [](const std::atomic<std::uint64_t>& source,
+                                std::uint64_t& previous, diagnostics::Counter counter) {
+            const std::uint64_t total = source.load(std::memory_order_relaxed);
+            if (total > previous)
+            {
+              diagnostics::Count(counter, total - previous);
+              previous = total;
+            }
+          };
+          static std::uint64_t last_dispatches = 0;
+          static std::uint64_t last_fallbacks = 0;
+          static std::uint64_t last_exceptions = 0;
+          static std::uint64_t last_draws = 0;
+          static std::uint64_t last_vertices = 0;
+          static std::uint64_t last_tex_decodes = 0;
+          tally(s_dispatches, last_dispatches, diagnostics::Counter::StaticRecompDispatches);
+          tally(s_fallbacks, last_fallbacks, diagnostics::Counter::InterpreterFallbacks);
+          tally(s_exceptions, last_exceptions, diagnostics::Counter::Exceptions);
+          tally(s_draw_calls, last_draws, diagnostics::Counter::DrawCalls);
+          tally(s_vertices, last_vertices, diagnostics::Counter::VerticesLoaded);
+          tally(s_tex_decodes, last_tex_decodes, diagnostics::Counter::TextureDecodes);
+          static std::uint64_t last_mmio_reads = 0;
+          static std::uint64_t last_mmio_writes = 0;
+          tally(s_mmio_reads, last_mmio_reads, diagnostics::Counter::MmioReads);
+          tally(s_mmio_writes, last_mmio_writes, diagnostics::Counter::MmioWrites);
+          static std::uint64_t last_shader_compiles = 0;
+          tally(s_shader_compiles, last_shader_compiles,
+                diagnostics::Counter::ShaderCompilations);
+          static std::uint64_t last_efb_copies = 0;
+          tally(s_efb_copies, last_efb_copies, diagnostics::Counter::EfbCopies);
           diagnostics_state.EndFrame(telemetry);
           if (!m_impl->diagnostics_overlay.load(std::memory_order_relaxed))
             return;
