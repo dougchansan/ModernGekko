@@ -63,6 +63,17 @@ option(MODERNGEKKO_USER_DIRECTORY_IN_DOCUMENTS
 set(MODERNGEKKO_FRONTEND_SDK "" CACHE PATH
     "Optional non-root sysroot containing X11 and audio development packages")
 
+# Optional NVIDIA NGX/Vulkan bootstrap used by the DLSS proof of concept.
+# This remains OFF by default so normal ModernGekko builds do not require
+# NVIDIA's proprietary SDK.
+option(MODERNGEKKO_ENABLE_NGX
+       "Enable the experimental NVIDIA NGX Vulkan integration" OFF)
+set(MODERNGEKKO_NGX_SDK_ROOT "" CACHE PATH
+    "Path to the NVIDIA DLSS/NGX SDK root (contains include/ and lib/)")
+set(MODERNGEKKO_NGX_PROJECT_ID
+    "6dcb2b20-dcf8-4b79-a5ea-d7c50e3eefc8" CACHE STRING
+    "GUID-like project identifier supplied to NVIDIA NGX")
+
 if(MODERNGEKKO_FRONTEND_SDK)
     set(_moderngekko_sdk_usr "${MODERNGEKKO_FRONTEND_SDK}/usr")
     set(_moderngekko_sdk_lib "${_moderngekko_sdk_usr}/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
