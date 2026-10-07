@@ -1,6 +1,10 @@
+#include "automation_protocol.hpp"
+#include "cache_affinity.hpp"
 #include "frontend_config.hpp"
+#include "launcher_savestates.hpp"
 #include "dol_patch.hpp"
 #include "moderngekko/game.hpp"
+#include "moderngekko/hd_texture_pack.hpp"
 #include "netplay_session.hpp"
 
 #include "DiscIO/DiscExtractor.h"
@@ -131,8 +135,11 @@ int FindController(const std::vector<ControllerOption>& controllers, std::string
   return found == controllers.end() ? -1 : static_cast<int>(found - controllers.begin());
 }
 
-fs::path DefaultUserDirectory()
+fs::path DefaultUserDirectory(const fs::path& release_directory)
 {
+#ifdef MODERNGEKKO_PORTABLE_USER_DIRECTORY
+  return release_directory / "User";
+#else
 #ifdef MODERNGEKKO_USER_DIRECTORY_IN_DOCUMENTS
 #if defined(_WIN32)
   if (const char* user_profile = std::getenv("USERPROFILE"))
@@ -150,6 +157,7 @@ fs::path DefaultUserDirectory()
   if (const char* home = std::getenv("HOME"))
     return fs::path(home) / ".local/share" / MODERNGEKKO_USER_DIRECTORY_NAME;
   return std::string(MODERNGEKKO_USER_DIRECTORY_NAME) + "-user";
+#endif
 }
 
 fs::path DocumentsDirectory()
@@ -268,7 +276,24 @@ std::vector<fs::path> FindDiscImages()
       std::ranges::transform(extension, extension.begin(),
                              [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (extension == ".wbfs" || extension == ".iso" || extension == ".rvz")
+      {
+#ifdef MODERNGEKKO_REQUIRED_DISC_ID
+        const std::unique_ptr<DiscIO::Volume> volume =
+            DiscIO::CreateVolume(iterator->path().string());
+        if (volume)
+        {
+          const std::string disc_id = volume->GetGameID(volume->GetGamePartition());
+          bool supported = disc_id == MODERNGEKKO_REQUIRED_DISC_ID;
+#ifdef MODERNGEKKO_ACCEPTED_SOURCE_DISC_ID
+          supported = supported || disc_id == MODERNGEKKO_ACCEPTED_SOURCE_DISC_ID;
+#endif
+          if (supported)
+            images.push_back(iterator->path());
+        }
+#else
         images.push_back(iterator->path());
+#endif
+      }
     }
     iterator.increment(ec);
     if (ec)
@@ -499,8 +524,57 @@ fs::path SiblingRunner(const char* argv0)
 }
 } // namespace
 
+
+#if defined(_WIN32)
+// The runner pins itself to the largest shared L3 when MODERNGEKKO_CACHE_AFFINITY=1,
+// and nothing ever set it, so every packaged launch ran unpinned. Measured on the
+// seven benchmark scenes, windowed, shipping module, arms differing only by this
+// variable: +15.9% mean (95% CI [+13.7%, +18.1%]), 21 of 21 interleaved pairs
+// favouring pinned, and it is what takes battle-mid from straddling 60 to holding
+// it on every run.
+//
+// It is set here rather than in the runner's own default because the runner
+// cannot know it was launched by us, and a bare `moderngekko-run` invocation --
+// every benchmark harness, every developer command line -- must keep its current
+// behaviour so old measurements stay comparable.
+//
+// Gated on DominantSharedCache, not LargestSharedCache: pinning pays only where
+// one cache domain is genuinely bigger than the rest. On a part whose dies are
+// identical it would halve the available cores and buy nothing, so there it
+// declines and the child runs exactly as before.
+//
+// An explicit setting always wins, in either direction, so anyone measuring can
+// force the question.
+void EnableCacheAffinityIfDominant()
+{
+  if (std::getenv("MODERNGEKKO_CACHE_AFFINITY") != nullptr)
+    return;
+
+  DWORD length = 0;
+  GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
+  if (length == 0)
+    return;
+  std::vector<char> buffer(length);
+  if (!GetLogicalProcessorInformationEx(
+          RelationCache,
+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &length))
+  {
+    return;
+  }
+
+  if (!moderngekko::frontend::DominantSharedCache(buffer.data(), length))
+    return;
+  SetEnvironmentVariableA("MODERNGEKKO_CACHE_AFFINITY", "1");
+}
+#endif
+
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+  // Before any child is spawned: SDL_CreateProcess gives the runner this
+  // process's environment.
+  EnableCacheAffinityIfDominant();
+#endif
   bool use_wayland = false;
   std::optional<fs::path> extract_only;
   for (int i = 1; i < argc; ++i)
@@ -513,8 +587,8 @@ int main(int argc, char** argv)
       extract_only = argv[++i];
   }
 
-  const fs::path user_directory = DefaultUserDirectory();
   const fs::path release_directory = ExecutableDirectory(argv[0]);
+  const fs::path user_directory = DefaultUserDirectory(release_directory);
   if (extract_only)
   {
     ExtractionState extraction;
@@ -537,6 +611,10 @@ int main(int argc, char** argv)
                              config.error.c_str(), nullptr);
     return 2;
   }
+  moderngekko::CommunityHdTexturePackStatus community_pack_status =
+      moderngekko::GetCommunityHdTexturePackStatus(user_directory);
+  config.community_hd_texture_pack = community_pack_status.installed;
+  std::string community_pack_message;
 
 #if defined(__linux__)
   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, use_wayland ? "wayland" : "x11");
@@ -546,8 +624,8 @@ int main(int argc, char** argv)
     return 1;
 
   const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-  SDL_Window* window = SDL_CreateWindow(MODERNGEKKO_FRONTEND_NAME, static_cast<int>(820 * scale),
-                                        static_cast<int>(700 * scale),
+  SDL_Window* window = SDL_CreateWindow(MODERNGEKKO_FRONTEND_NAME, static_cast<int>(900 * scale),
+                                        static_cast<int>(820 * scale),
                                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
   if (!window)
   {
@@ -616,6 +694,57 @@ int main(int argc, char** argv)
     if (config.graphics_backend == graphics_backends[i].value)
       graphics_backend_index = static_cast<int>(i);
   }
+  static constexpr std::array aspect_labels = {
+      "Auto (game-controlled)", "16:9 widescreen", "4:3 original",
+      "32:9 native ultrawide (Hor+)"};
+  static constexpr std::array aspect_values = {
+      moderngekko::frontend::kFrontendAspectAuto,
+      moderngekko::frontend::kFrontendAspectWidescreen,
+      moderngekko::frontend::kFrontendAspectStandard,
+      moderngekko::frontend::kFrontendAspectUltrawide};
+  static constexpr std::array texture_filter_labels = {
+      "Game default", "Nearest (sharp pixels)", "Linear (smooth)"};
+  static constexpr std::array anisotropy_labels = {
+      "Game default", "1x", "2x", "4x", "8x", "16x"};
+  static constexpr std::array anisotropy_values = {-1, 0, 1, 2, 3, 4};
+  static constexpr std::array navigation_labels = {
+      "Off", "Compact minimap", "Debug map + coordinates"};
+  static constexpr std::array ultrawide_quality_labels = {
+      "3x Performance", "4x Balanced", "5x Quality", "6x Ultra"};
+  static constexpr std::array ultrawide_quality_values = {3, 4, 5, 6};
+  int aspect_index = 0;
+  for (std::size_t i = 0; i < aspect_values.size(); ++i)
+  {
+    if (config.aspect_ratio == aspect_values[i])
+      aspect_index = static_cast<int>(i);
+  }
+  int texture_filter_index =
+      std::clamp(config.force_texture_filtering, 0, 2);
+  int anisotropy_index = 0;
+  for (std::size_t i = 0; i < anisotropy_values.size(); ++i)
+  {
+    if (config.max_anisotropy == anisotropy_values[i])
+      anisotropy_index = static_cast<int>(i);
+  }
+  int navigation_index = std::clamp(config.navigation_overlay, 0, 2);
+  int ultrawide_quality_index = 0;
+  for (std::size_t i = 0; i < ultrawide_quality_values.size(); ++i)
+  {
+    if (config.ultrawide_efb_scale == ultrawide_quality_values[i])
+      ultrawide_quality_index = static_cast<int>(i);
+  }
+  // StateSaves is Dolphin's own state directory, so states written in-game land
+  // here without any extra configuration and show up on the next launch.
+  //
+  // Listed once at startup rather than every frame, so the dropdown does not
+  // hit the filesystem on each redraw. A state written while the launcher is
+  // open therefore appears on the next launch, which is the case that matters:
+  // states are written by the running game, not by the launcher.
+  const std::vector<fs::path> launcher_savestates =
+      moderngekko::frontend::ListLauncherSavestates(user_directory / "StateSaves");
+  // Normal boot keeps ordinary memory-card progression as the default.
+  // Loading a savestate must always be an explicit launcher choice.
+  int selected_savestate = -1;
 
   DialogState dialog;
   std::vector<ControllerOption> controllers = EnumerateControllers();
@@ -772,6 +901,40 @@ int main(int argc, char** argv)
     {
       ImGui::Text("Ready: %s [%s]", current_metadata.metadata->game_name.c_str(),
                   current_metadata.metadata->disc_id.c_str());
+      if (!launcher_savestates.empty())
+      {
+        ImGui::TextUnformatted("Start from savestate");
+        const std::string savestate_preview =
+            selected_savestate >= 0 ?
+                moderngekko::frontend::LauncherSavestateLabel(
+                    launcher_savestates[static_cast<std::size_t>(selected_savestate)],
+                    selected_savestate == 0) :
+                "Normal boot (memory card)";
+        if (ImGui::BeginCombo("##launch_savestate", savestate_preview.c_str()))
+        {
+          const bool normal_boot_selected = selected_savestate < 0;
+          if (ImGui::Selectable("Normal boot (memory card)", normal_boot_selected))
+            selected_savestate = -1;
+          if (normal_boot_selected)
+            ImGui::SetItemDefaultFocus();
+
+          for (std::size_t i = 0; i < launcher_savestates.size(); ++i)
+          {
+            const std::string label =
+                moderngekko::frontend::LauncherSavestateLabel(launcher_savestates[i], i == 0);
+            const bool selected = selected_savestate == static_cast<int>(i);
+            if (ImGui::Selectable(label.c_str(), selected))
+              selected_savestate = static_cast<int>(i);
+            if (selected)
+              ImGui::SetItemDefaultFocus();
+          }
+          ImGui::EndCombo();
+        }
+        // Netplay starts every player from the same boot, so a state chosen by
+        // one side would desync the session immediately.
+        ImGui::TextDisabled("Solo play only.");
+        ImGui::Spacing();
+      }
       if (ImGui::Button("Play", ImVec2(180 * scale, 42 * scale)))
       {
         if (ensure_controller())
@@ -915,6 +1078,375 @@ int main(int argc, char** argv)
         }
       }
       ImGui::EndCombo();
+    }
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Widescreen, texture, and navigation options",
+                                ImGuiTreeNodeFlags_DefaultOpen))
+    {
+      ImGui::TextUnformatted("Aspect ratio");
+      if (ImGui::BeginCombo("##aspect_ratio", aspect_labels[aspect_index]))
+      {
+        for (std::size_t i = 0; i < aspect_labels.size(); ++i)
+        {
+          const bool selected = aspect_index == static_cast<int>(i);
+          if (ImGui::Selectable(aspect_labels[i], selected))
+          {
+            const int previous = config.aspect_ratio;
+            config.aspect_ratio = aspect_values[i];
+            std::string error;
+            if (moderngekko::frontend::SaveConfig(user_directory, config,
+                                                  &error))
+              aspect_index = static_cast<int>(i);
+            else
+            {
+              config.aspect_ratio = previous;
+              std::lock_guard lock(dialog.mutex);
+              dialog.error = std::move(error);
+            }
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+
+      ImGui::TextDisabled(
+          "32:9 expands Colosseum's camera horizontally without stretching it. "
+          "Auto selects it on an ultrawide display.");
+
+      ImGui::TextUnformatted("Native ultrawide render quality");
+      if (ImGui::BeginCombo(
+              "##ultrawide_render_quality",
+              ultrawide_quality_labels[ultrawide_quality_index]))
+      {
+        for (std::size_t i = 0; i < ultrawide_quality_labels.size(); ++i)
+        {
+          const bool selected =
+              ultrawide_quality_index == static_cast<int>(i);
+          if (ImGui::Selectable(ultrawide_quality_labels[i], selected))
+          {
+            const int previous = config.ultrawide_efb_scale;
+            config.ultrawide_efb_scale = ultrawide_quality_values[i];
+            std::string error;
+            if (moderngekko::frontend::SaveConfig(user_directory, config,
+                                                  &error))
+            {
+              ultrawide_quality_index = static_cast<int>(i);
+            }
+            else
+            {
+              config.ultrawide_efb_scale = previous;
+              std::lock_guard lock(dialog.mutex);
+              dialog.error = std::move(error);
+            }
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextDisabled(
+          "5x Quality targets roughly 4K work at 32:9.");
+
+      ImGui::TextUnformatted("Texture filtering");
+      if (ImGui::BeginCombo("##texture_filter",
+                            texture_filter_labels[texture_filter_index]))
+      {
+        for (std::size_t i = 0; i < texture_filter_labels.size(); ++i)
+        {
+          const bool selected =
+              texture_filter_index == static_cast<int>(i);
+          if (ImGui::Selectable(texture_filter_labels[i], selected))
+          {
+            const int previous = config.force_texture_filtering;
+            config.force_texture_filtering = static_cast<int>(i);
+            std::string error;
+            if (moderngekko::frontend::SaveConfig(user_directory, config,
+                                                  &error))
+              texture_filter_index = static_cast<int>(i);
+            else
+            {
+              config.force_texture_filtering = previous;
+              std::lock_guard lock(dialog.mutex);
+              dialog.error = std::move(error);
+            }
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+
+      ImGui::TextUnformatted("Anisotropic filtering");
+      if (ImGui::BeginCombo("##anisotropy",
+                            anisotropy_labels[anisotropy_index]))
+      {
+        for (std::size_t i = 0; i < anisotropy_labels.size(); ++i)
+        {
+          const bool selected = anisotropy_index == static_cast<int>(i);
+          if (ImGui::Selectable(anisotropy_labels[i], selected))
+          {
+            const int previous = config.max_anisotropy;
+            config.max_anisotropy = anisotropy_values[i];
+            std::string error;
+            if (moderngekko::frontend::SaveConfig(user_directory, config,
+                                                  &error))
+              anisotropy_index = static_cast<int>(i);
+            else
+            {
+              config.max_anisotropy = previous;
+              std::lock_guard lock(dialog.mutex);
+              dialog.error = std::move(error);
+            }
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+
+      ImGui::Spacing();
+      ImGui::BeginDisabled(!community_pack_status.available);
+      if (ImGui::Checkbox("Community HD texture pack (Sephie)",
+                          &config.community_hd_texture_pack))
+      {
+        const bool enabled = config.community_hd_texture_pack;
+        std::string error;
+        if (moderngekko::SetCommunityHdTexturePackEnabled(
+                user_directory, enabled, &error))
+        {
+          if (enabled)
+            config.hires_textures = true;
+          if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
+          {
+            community_pack_status =
+                moderngekko::GetCommunityHdTexturePackStatus(user_directory);
+            community_pack_message = enabled ?
+                                         "Installed and enabled. ModernGekko's cleaner UI overrides take priority." :
+                                         "Disabled and removed from the active texture directory.";
+          }
+          else
+          {
+            std::string rollback_error;
+            moderngekko::SetCommunityHdTexturePackEnabled(
+                user_directory, !enabled, &rollback_error);
+            config.community_hd_texture_pack = !enabled;
+            std::lock_guard lock(dialog.mutex);
+            dialog.error = std::move(error);
+          }
+        }
+        else
+        {
+          config.community_hd_texture_pack = !enabled;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+      ImGui::EndDisabled();
+      if (community_pack_status.available)
+      {
+        // Say what is actually installed. The override count was a literal 9,
+        // which was only ever true of one packaging configuration and reads as
+        // a plain falsehood when none ship.
+        if (community_pack_status.override_count)
+        {
+          ImGui::TextDisabled(
+              "%zu community textures; %zu curated ModernGekko UI/title overrides.",
+              community_pack_status.texture_count,
+              community_pack_status.override_count);
+        }
+        else
+        {
+          ImGui::TextDisabled("%zu community textures.",
+                              community_pack_status.texture_count);
+        }
+      }
+      else
+      {
+        ImGui::TextDisabled(
+            "Not installed: add Pokemon Colosseum HD Pack.zip to User/ResourcePacks.\n"
+            "Get it from Sephie's post: https://www.reddit.com/r/DolphinEmulator/s/IgXkBDodBC");
+      }
+      if (!community_pack_message.empty())
+        ImGui::TextWrapped("%s", community_pack_message.c_str());
+
+      if (ImGui::Checkbox("Upscale dynamic game text (4x)",
+                          &config.text_upscale))
+      {
+        const bool selected = config.text_upscale;
+        config.text_upscale = selected;
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config,
+                                               &error))
+        {
+          config.text_upscale = !selected;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+      ImGui::TextDisabled(
+          "Rebuilds Colosseum's dynamic text surfaces on the GPU.");
+
+      ImGui::TextUnformatted("Navigation overlay");
+      if (ImGui::BeginCombo("##navigation",
+                            navigation_labels[navigation_index]))
+      {
+        for (std::size_t i = 0; i < navigation_labels.size(); ++i)
+        {
+          const bool selected = navigation_index == static_cast<int>(i);
+          if (ImGui::Selectable(navigation_labels[i], selected))
+          {
+            const int previous = config.navigation_overlay;
+            config.navigation_overlay = static_cast<int>(i);
+            std::string error;
+            if (moderngekko::frontend::SaveConfig(user_directory, config,
+                                                  &error))
+              navigation_index = static_cast<int>(i);
+            else
+            {
+              config.navigation_overlay = previous;
+              std::lock_guard lock(dialog.mutex);
+              dialog.error = std::move(error);
+            }
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+
+      const int previous_font_size = config.osd_font_size;
+      if (ImGui::SliderInt("Overlay text size", &config.osd_font_size, 8, 48))
+      {
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          config.osd_font_size = previous_font_size;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+    }
+    if (ImGui::CollapsingHeader("Quality of life and accessibility",
+                                ImGuiTreeNodeFlags_DefaultOpen))
+    {
+      const auto save_toggle = [&](bool* value, const char* label)
+      {
+        const bool previous = *value;
+        if (!ImGui::Checkbox(label, value))
+          return;
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          *value = previous;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      };
+
+      save_toggle(&config.sixty_fps, "60 FPS gameplay patch");
+      ImGui::TextDisabled(
+          "Presents every video field instead of every other one. 60 FPS is the\n"
+          "ceiling: the console's field rate is 59.94 Hz and this halves the\n"
+          "wait, it does not add frames. Costs roughly twice the emulation\n"
+          "work, so a slower machine will run below full speed.");
+
+      save_toggle(&config.guest_idle_skip, "Guest idle skip");
+      ImGui::TextDisabled(
+          "Lets the emulated console sleep through the game's idle loop\n"
+          "instead of spinning in it. This is what lets heavy battle scenes\n"
+          "hold 60. It is a trade: in the field the game almost always has\n"
+          "work queued, so the check costs about 8%% there and buys nothing.\n"
+          "Leave it on unless the field runs short of full speed for you.");
+
+      save_toggle(&config.fast_forward, "Hold Space to fast-forward");
+      ImGui::BeginDisabled(!config.fast_forward);
+      const int previous_multiplier = config.fast_forward_multiplier;
+      if (ImGui::SliderInt("Fast-forward multiplier",
+                           &config.fast_forward_multiplier, 2, 4))
+      {
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          config.fast_forward_multiplier = previous_multiplier;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+      ImGui::EndDisabled();
+
+      save_toggle(&config.autosave, "Rotating room-transition autosaves");
+      ImGui::BeginDisabled(!config.autosave);
+      const int previous_slots = config.autosave_slots;
+      if (ImGui::SliderInt("Autosave slots", &config.autosave_slots, 1, 10))
+      {
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          config.autosave_slots = previous_slots;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+      ImGui::EndDisabled();
+      ImGui::TextDisabled(
+          "The newest autosave doubles as the crash-recovery checkpoint.");
+
+      save_toggle(&config.crash_watchdog,
+                  "Restore latest checkpoint after an emulation stall");
+      ImGui::BeginDisabled(!config.crash_watchdog);
+      const int previous_watchdog_seconds = config.crash_watchdog_seconds;
+      if (ImGui::SliderInt("Stall timeout (seconds)",
+                           &config.crash_watchdog_seconds, 10, 60))
+      {
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          config.crash_watchdog_seconds = previous_watchdog_seconds;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+      ImGui::EndDisabled();
+
+      save_toggle(&config.input_overlay, "Show controller input overlay");
+      const bool previous_minimap_high_contrast =
+          config.minimap_high_contrast;
+      const int previous_navigation_overlay = config.navigation_overlay;
+      if (ImGui::Checkbox("High-contrast minimap colors",
+                          &config.minimap_high_contrast))
+      {
+        config.navigation_overlay =
+            moderngekko::automation::ResolveColosseumNavigationOverlayMode(
+                config.navigation_overlay, config.minimap_high_contrast);
+        std::string error;
+        if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          navigation_index = config.navigation_overlay;
+        }
+        else
+        {
+          config.minimap_high_contrast = previous_minimap_high_contrast;
+          config.navigation_overlay = previous_navigation_overlay;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
+      ImGui::TextDisabled(
+          "Enabling this starts the Compact minimap when the overlay is Off.");
+
+      const int previous_ui_scale = config.accessibility_ui_scale;
+      if (ImGui::SliderInt("Overlay UI scale (%)",
+                           &config.accessibility_ui_scale, 75, 200))
+      {
+        std::string error;
+        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        {
+          config.accessibility_ui_scale = previous_ui_scale;
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::move(error);
+        }
+      }
     }
     const bool previous_show_fps_in_title = show_fps_in_title;
     if (ImGui::Checkbox("Show FPS in window title", &show_fps_in_title))
@@ -1069,7 +1601,16 @@ int main(int argc, char** argv)
     {
       std::vector<std::string> argument_storage = {SiblingRunner(argv[0]).string(), "--game",
                                                    current_game.string(), "--user-dir",
-                                                   user_directory.string()};
+                                                   user_directory.string(), "--automation-dir",
+                                                   (user_directory / "automation").string()};
+      // Solo only: see the note by the dropdown.
+      if (launch_mode == LaunchMode::Solo && selected_savestate >= 0 &&
+          static_cast<std::size_t>(selected_savestate) < launcher_savestates.size())
+      {
+        argument_storage.emplace_back("--load-state");
+        argument_storage.emplace_back(
+            launcher_savestates[static_cast<std::size_t>(selected_savestate)].string());
+      }
       if (launch_mode == LaunchMode::Host)
         argument_storage.emplace_back("--netplay-host");
       else if (launch_mode == LaunchMode::Join)

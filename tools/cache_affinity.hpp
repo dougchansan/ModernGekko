@@ -62,6 +62,59 @@ inline CacheDomain LargestSharedCache(const void* records, std::size_t bytes, BY
   return best;
 }
 
+// Whether pinning to the largest cache domain is worth doing at all.
+//
+// LargestSharedCache always names a domain, because some domain is always the
+// largest. That is the wrong question for a default-on pin: on a part whose
+// dies are identical, pinning to one of them halves the available cores and
+// buys no extra cache. So this returns a domain only when it dominates its
+// closest rival by at least half again as much cache -- 96 MB against 32 MB
+// pins, 32 against 32 does not, and 48 against 32 is exactly the boundary.
+//
+// A domain with no rival is dominant by definition: a single L3 across every
+// core has nothing to lose to, and its mask covers everything, so applying it
+// is a no-op rather than a restriction.
+//
+// The same physical cache can be reported more than once. A duplicate is not a
+// rival -- treating it as one would suppress every pin on hardware that repeats
+// itself -- so records matching the leader mask are skipped.
+inline CacheDomain DominantSharedCache(const void* records, std::size_t bytes,
+                                       BYTE level = 3)
+{
+  const CacheDomain best = LargestSharedCache(records, bytes, level);
+  if (!best)
+    return {};
+
+  // Largest cache at this level that is neither the leader nor a duplicate.
+  DWORD rival = 0;
+  const auto* base = static_cast<const char*>(records);
+  for (std::size_t offset = 0;
+       offset + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) <= bytes;)
+  {
+    const auto* entry =
+        reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(base + offset);
+    if (entry->Size == 0)
+      break;
+    if (entry->Relationship == RelationCache && entry->Cache.Level == level &&
+        entry->Cache.GroupMask.Mask != best.mask && entry->Cache.CacheSize > rival)
+    {
+      rival = entry->Cache.CacheSize;
+    }
+    offset += entry->Size;
+  }
+
+  if (rival == 0)
+    return best;
+
+  // best >= 1.5 * rival, in 64-bit: a cache size in bytes times a small factor
+  // overflows 32 bits on a part with a gigabyte of L3.
+  const unsigned long long scaled_best =
+      static_cast<unsigned long long>(best.size) * 2ULL;
+  const unsigned long long scaled_rival =
+      static_cast<unsigned long long>(rival) * 3ULL;
+  return scaled_best >= scaled_rival ? best : CacheDomain{};
+}
+
 // Process-wide affinity can interfere with Dolphin's worker threads, so require
 // an exact, explicit opt-in instead of changing every launch by default.
 inline bool AffinityEnabled(const char* value)

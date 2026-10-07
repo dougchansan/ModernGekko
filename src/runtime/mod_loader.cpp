@@ -131,6 +131,23 @@ struct ModManager::Impl {
       callbacks;
   std::vector<ModernGekkoModFunction *> import_slots;
   std::vector<PendingReturn> pending_returns;
+  // Conservative filter over every address a patch, hook or pending return
+  // can intercept. HandlesAddress/Dispatch run on every chassis dispatch, and
+  // without this each one paid two hash lookups plus a linear scan of up to
+  // 4096 pending returns. Bits are only cleared on unload, so a stale bit
+  // merely falls through to the exact check below.
+  std::array<std::uint64_t, 64> intercept_bits{};
+  static std::uint32_t InterceptBit(std::uint32_t address) {
+    return (address >> 2) & 4095u;
+  }
+  void MarkIntercept(std::uint32_t address) {
+    const std::uint32_t bit = InterceptBit(address);
+    intercept_bits[bit >> 6] |= std::uint64_t{1} << (bit & 63u);
+  }
+  bool MayIntercept(std::uint32_t address) const {
+    const std::uint32_t bit = InterceptBit(address);
+    return (intercept_bits[bit >> 6] >> (bit & 63u)) & 1u;
+  }
   bool runtime_started = false;
   ModernGekkoModHostApi host_api{};
 
@@ -408,6 +425,7 @@ ModLoadReport ModManager::Load(const std::vector<ModSource> &sources,
         continue;
       }
       m_impl->patches[patch.address] = patch.function;
+      m_impl->MarkIntercept(patch.address);
     }
     for (std::uint32_t i = 0; i < desc->num_hooks; ++i) {
       const auto &hook = desc->hooks[i];
@@ -417,6 +435,7 @@ ModLoadReport ModManager::Load(const std::vector<ModSource> &sources,
         continue;
       }
       auto &hooks = m_impl->hooks[hook.address];
+      m_impl->MarkIntercept(hook.address);
       if (hook.kind == MODERNGEKKO_MOD_HOOK_ENTRY)
         hooks.entry.push_back(hook.function);
       else
@@ -546,6 +565,7 @@ void ModManager::Unload() {
       *slot = nullptr;
   }
   m_impl->pending_returns.clear();
+  m_impl->intercept_bits.fill(0);
   m_impl->callbacks.clear();
   m_impl->hooks.clear();
   m_impl->patches.clear();
@@ -564,6 +584,8 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
     m_impl->runtime_started = true;
     TriggerEvent("*", "runtime_start", state);
   }
+  if (!m_impl->MayIntercept(address))
+    return false;
   if (!m_impl->pending_returns.empty() &&
       m_impl->pending_returns.back().address == address &&
       m_impl->pending_returns.back().stack_pointer == state->gpr[1]) {
@@ -588,6 +610,7 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
         m_impl->pending_returns.erase(m_impl->pending_returns.begin());
       m_impl->pending_returns.push_back(
           {state->lr, state->gpr[1], hooks->second.returning});
+      m_impl->MarkIntercept(state->lr);
     }
   }
   const auto patch = m_impl->patches.find(address);
@@ -625,6 +648,8 @@ const std::vector<LoadedModInfo> &ModManager::GetLoadedMods() const {
 }
 
 bool ModManager::HandlesAddress(std::uint32_t address) const {
+  if (!m_impl->MayIntercept(address))
+    return false;
   if (m_impl->patches.contains(address) || m_impl->hooks.contains(address))
     return true;
   return std::ranges::any_of(m_impl->pending_returns,

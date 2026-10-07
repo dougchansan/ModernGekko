@@ -40,6 +40,16 @@ std::string NormalizeGraphicsBackend(std::string value) {
     return "Vulkan";
   if (lower == "opengl" || lower == "ogl")
     return "OGL";
+  if (lower == "metal")
+    return "Metal";
+#ifdef _WIN32
+  // DXGI flip-model swap chains are what AMD Fluid Motion Frames hooks most
+  // reliably on Windows.
+  if (lower == "d3d12" || lower == "direct3d12" || lower == "dx12")
+    return "D3D12";
+  if (lower == "d3d11" || lower == "d3d" || lower == "direct3d11" || lower == "dx11")
+    return "D3D";
+#endif
   return {};
 }
 
@@ -53,6 +63,23 @@ bool ParseBoolean(const std::string &value, bool *result) {
     return true;
   }
   return false;
+}
+
+bool ParseIntValue(const std::string &value, int *result, int min, int max) {
+  int parsed = 0;
+  const auto parsed_result =
+      std::from_chars(value.data(), value.data() + value.size(), parsed);
+  if (parsed_result.ec != std::errc{} ||
+      parsed_result.ptr != value.data() + value.size())
+    return false;
+  if (parsed < min || parsed > max)
+    return false;
+  *result = parsed;
+  return true;
+}
+
+bool ValidUltrawideEfbScale(int scale) {
+  return scale >= 3 && scale <= 6;
 }
 
 fs::path ControllerConfigPath(const fs::path &user_directory) {
@@ -78,13 +105,16 @@ const std::vector<ResolutionOption> &SupportedResolutions() {
   // scales.
   static const std::vector<ResolutionOption> resolutions = {
       {"640x528", 1},   {"1280x720", 2},  {"1920x1080", 3},  {"2560x1440", 4},
-      {"3840x2160", 6}, {"5120x2880", 8}, {"7680x4320", 12},
+      {"3200x2640", 5}, {"3840x2160", 6}, {"5120x2880", 8}, {"7680x4320", 12},
   };
   return resolutions;
 }
 
 const std::vector<GraphicsBackendOption> &SupportedGraphicsBackends() {
   static const std::vector<GraphicsBackendOption> backends = {
+#ifdef __APPLE__
+      {"Metal", "Metal"},
+#endif
       {"Vulkan", "Vulkan"},
       {"OpenGL", "OGL"},
   };
@@ -137,6 +167,87 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     } else if (key == "show_fps_in_title") {
       if (!ParseBoolean(value, &config.show_fps_in_title))
         return {.error = "show_fps_in_title must be true or false"};
+    } else if (key == "widescreen_hack") {
+      if (!ParseBoolean(value, &config.widescreen_hack))
+        return {.error = "widescreen_hack must be true or false"};
+    } else if (key == "aspect_ratio") {
+      // Parse the retired range and migrate rather than refusing to start: a
+      // load error is fatal, and 4/5 were legal raw Dolphin AspectMode values
+      // (Custom/CustomStretch) in earlier releases even though the launcher
+      // never offered them. 3 now means 32:9 Hor+, not Stretch.
+      if (!ParseIntValue(value, &config.aspect_ratio, 0, 5))
+        return {.error = "aspect_ratio must be in range 0 to 3"};
+      if (config.aspect_ratio > kFrontendAspectMax)
+        config.aspect_ratio = kFrontendAspectAuto;
+    } else if (key == "force_texture_filtering") {
+      if (!ParseIntValue(value, &config.force_texture_filtering, 0, 2))
+        return {.error = "force_texture_filtering must be in range 0 to 2"};
+    } else if (key == "max_anisotropy") {
+      if (!ParseIntValue(value, &config.max_anisotropy, -1, 4))
+        return {.error = "max_anisotropy must be in range -1 to 4"};
+    } else if (key == "osd_font_size") {
+      if (!ParseIntValue(value, &config.osd_font_size, 8, 48))
+        return {.error = "osd_font_size must be in range 8 to 48"};
+    } else if (key == "navigation_overlay") {
+      if (!ParseIntValue(value, &config.navigation_overlay, 0, 2))
+        return {.error = "navigation_overlay must be in range 0 to 2"};
+    } else if (key == "hires_textures") {
+      if (!ParseBoolean(value, &config.hires_textures))
+        return {.error = "hires_textures must be true or false"};
+    } else if (key == "community_hd_texture_pack") {
+      if (!ParseBoolean(value, &config.community_hd_texture_pack))
+        return {.error = "community_hd_texture_pack must be true or false"};
+    } else if (key == "cache_hires_textures") {
+      if (!ParseBoolean(value, &config.cache_hires_textures))
+        return {.error = "cache_hires_textures must be true or false"};
+    } else if (key == "dump_textures") {
+      if (!ParseBoolean(value, &config.dump_textures))
+        return {.error = "dump_textures must be true or false"};
+    } else if (key == "text_upscale") {
+      if (!ParseBoolean(value, &config.text_upscale))
+        return {.error = "text_upscale must be true or false"};
+    } else if (key == "input_overlay") {
+      if (!ParseBoolean(value, &config.input_overlay))
+        return {.error = "input_overlay must be true or false"};
+    } else if (key == "minimap_high_contrast") {
+      if (!ParseBoolean(value, &config.minimap_high_contrast))
+        return {.error = "minimap_high_contrast must be true or false"};
+    } else if (key == "accessibility_ui_scale") {
+      if (!ParseIntValue(value, &config.accessibility_ui_scale, 75, 200))
+        return {.error = "accessibility_ui_scale must be from 75 to 200"};
+    } else if (key == "sixty_fps") {
+      if (!ParseBoolean(value, &config.sixty_fps))
+        return {.error = "sixty_fps must be true or false"};
+    } else if (key == "guest_idle_skip") {
+      if (!ParseBoolean(value, &config.guest_idle_skip))
+        return {.error = "guest_idle_skip must be true or false"};
+    } else if (key == "fast_forward") {
+      if (!ParseBoolean(value, &config.fast_forward))
+        return {.error = "fast_forward must be true or false"};
+    } else if (key == "fast_forward_multiplier") {
+      if (!ParseIntValue(value, &config.fast_forward_multiplier, 2, 4))
+        return {.error = "fast_forward_multiplier must be from 2 to 4"};
+    } else if (key == "autosave") {
+      if (!ParseBoolean(value, &config.autosave))
+        return {.error = "autosave must be true or false"};
+    } else if (key == "autosave_slots") {
+      if (!ParseIntValue(value, &config.autosave_slots, 1, 10))
+        return {.error = "autosave_slots must be from 1 to 10"};
+    } else if (key == "crash_watchdog") {
+      if (!ParseBoolean(value, &config.crash_watchdog))
+        return {.error = "crash_watchdog must be true or false"};
+    } else if (key == "crash_watchdog_seconds") {
+      if (!ParseIntValue(value, &config.crash_watchdog_seconds, 10, 60))
+        return {.error = "crash_watchdog_seconds must be from 10 to 60"};
+    } else if (key == "ultrawide_efb_scale") {
+      if (!ParseIntValue(value, &config.ultrawide_efb_scale, 0, 12))
+        return {.error = "ultrawide_efb_scale must be from 3 to 6"};
+      // Migrate the retired aspect-driven Auto mode to the stable quality
+      // preset. Auto could allocate an excessive EFB at 32:9 and stall play.
+      if (config.ultrawide_efb_scale == 0)
+        config.ultrawide_efb_scale = 5;
+      else if (!ValidUltrawideEfbScale(config.ultrawide_efb_scale))
+        return {.error = "ultrawide_efb_scale must be from 3 to 6"};
     } else if (key == "fullscreen") {
       if (!ParseBoolean(value, &config.fullscreen))
         return {.error = "fullscreen must be true or false"};
@@ -211,6 +322,19 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
   const std::string graphics_backend =
       NormalizeGraphicsBackend(config.graphics_backend);
   if (config.resolution.empty() || graphics_backend.empty() ||
+      config.aspect_ratio < 0 || config.aspect_ratio > kFrontendAspectMax ||
+      config.force_texture_filtering < 0 ||
+      config.force_texture_filtering > 2 ||
+      config.max_anisotropy < -1 || config.max_anisotropy > 4 ||
+      config.osd_font_size < 8 || config.osd_font_size > 48 ||
+      config.navigation_overlay < 0 || config.navigation_overlay > 2 ||
+      config.accessibility_ui_scale < 75 ||
+      config.accessibility_ui_scale > 200 ||
+      config.fast_forward_multiplier < 2 ||
+      config.fast_forward_multiplier > 4 || config.autosave_slots < 1 ||
+      config.autosave_slots > 10 || config.crash_watchdog_seconds < 10 ||
+      config.crash_watchdog_seconds > 60 ||
+      !ValidUltrawideEfbScale(config.ultrawide_efb_scale) ||
       config.netplay_nickname.empty() ||
       config.netplay_nickname.size() > 30 ||
       config.netplay_nickname.find_first_of("\r\n") != std::string::npos ||
@@ -253,10 +377,38 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
           "[Video]\n"
           "resolution="
        << config.resolution << '\n'
-       << "backend=" << graphics_backend << '\n'
+        << "backend=" << graphics_backend << '\n'
+        << "widescreen_hack=" << (config.widescreen_hack ? "true" : "false") << '\n'
+        << "aspect_ratio=" << config.aspect_ratio << '\n'
+        << "force_texture_filtering=" << config.force_texture_filtering << '\n'
+        << "max_anisotropy=" << config.max_anisotropy << '\n'
+        << "osd_font_size=" << config.osd_font_size << '\n'
+        << "navigation_overlay=" << config.navigation_overlay << '\n'
+        << "hires_textures=" << (config.hires_textures ? "true" : "false") << '\n'
+        << "community_hd_texture_pack="
+        << (config.community_hd_texture_pack ? "true" : "false") << '\n'
+        << "cache_hires_textures="
+        << (config.cache_hires_textures ? "true" : "false") << '\n'
+        << "dump_textures=" << (config.dump_textures ? "true" : "false") << '\n'
+        << "text_upscale=" << (config.text_upscale ? "true" : "false") << '\n'
+        << "input_overlay=" << (config.input_overlay ? "true" : "false") << '\n'
+        << "minimap_high_contrast="
+        << (config.minimap_high_contrast ? "true" : "false") << '\n'
+        << "accessibility_ui_scale=" << config.accessibility_ui_scale << '\n'
+        << "ultrawide_efb_scale=" << config.ultrawide_efb_scale << '\n'
        << "fullscreen=" << (config.fullscreen ? "true" : "false") << '\n'
        << "show_fps_in_title=" << (config.show_fps_in_title ? "true" : "false")
        << '\n'
+       << "[QualityOfLife]\n"
+       << "sixty_fps=" << (config.sixty_fps ? "true" : "false") << '\n'
+       << "guest_idle_skip="
+       << (config.guest_idle_skip ? "true" : "false") << '\n'
+       << "fast_forward=" << (config.fast_forward ? "true" : "false") << '\n'
+       << "fast_forward_multiplier=" << config.fast_forward_multiplier << '\n'
+       << "autosave=" << (config.autosave ? "true" : "false") << '\n'
+       << "autosave_slots=" << config.autosave_slots << '\n'
+       << "crash_watchdog=" << (config.crash_watchdog ? "true" : "false") << '\n'
+       << "crash_watchdog_seconds=" << config.crash_watchdog_seconds << '\n'
        << "[Input]\n";
   for (std::size_t i = 0; i < config.controllers.size() && i < 4; ++i) {
     if (config.controllers[i].find_first_of("\r\n") != std::string::npos) {

@@ -71,6 +71,9 @@ public:
   bool HandlesAddress(std::uint32_t address) const;
   bool HandlesRange(std::uint32_t start, std::uint32_t end) const;
   bool Empty() const;
+  // CPU-thread mutation epoch; zero permanently disables interception caching.
+  std::uint64_t InterceptionGeneration() const;
+  static std::uint64_t HostCallGeneration(void *user_data);
 
   static bool HostCall(CPUState *state, std::uint32_t address, void *user_data);
   static bool HostCallContains(std::uint32_t address, void *user_data);

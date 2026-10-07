@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define MODERNGEKKO_CPU_ABI_VERSION 3u
+#define MODERNGEKKO_CPU_ABI_VERSION 4u
 #define GXRUNTIME_CPU_ABI_VERSION MODERNGEKKO_CPU_ABI_VERSION
 
 typedef struct CPUState CPUState;
@@ -72,6 +72,14 @@ struct CPUState
     uint32_t ram_size;
     PPCExternalPointer external_pointer;
     int64_t downcount;
+    // ABI v4 mirrors DolRecomp's `cycle_budget`, which sits between `downcount`
+    // and `exram` in its CPUState. The field is currently reserved and unread by
+    // either side, but the LLVM backend bakes offsetof() values from DolRecomp's
+    // header straight into generated code, so omitting it shifts `exram` and
+    // everything after it by 8 bytes and an LLVM module loads garbage as the
+    // MEM2 base pointer. The C backend refers to these fields by name and never
+    // noticed. Keep this struct byte-identical to DolRecomp's cpu.h.
+    int64_t cycle_budget;
     uint8_t* exram;
     uint32_t exram_size;
     PPCSPRRead spr_read;

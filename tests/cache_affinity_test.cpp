@@ -9,6 +9,7 @@
 
 namespace {
 using moderngekko::frontend::CacheDomain;
+using moderngekko::frontend::DominantSharedCache;
 using moderngekko::frontend::LargestSharedCache;
 
 // One RelationCache record, laid out exactly as GetLogicalProcessorInformationEx
@@ -191,6 +192,90 @@ int main() {
     if (none.affinity_set || applied != original_affinity)
       return 16;
   }
+  // --- DominantSharedCache: is the pin worth applying at all? ---------------
+
+  // 9950X3D-shaped: 96 MB against 32 MB is half again as large and then some,
+  // so the pin is worth it and must select the stacked die.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 96 * MB, 0xFFFF);
+    AppendCache(buffer, 3, 32 * MB, 0xFFFF0000ULL);
+    const CacheDomain domain = DominantSharedCache(buffer.data(), buffer.size());
+    if (!domain || domain.mask != 0xFFFF)
+      return 20;
+  }
+
+  // Two identical dies. LargestSharedCache still names one of them -- that is
+  // its job -- but pinning there would halve the cores for no extra cache, so
+  // the dominance rule must decline. This is the case that makes it safe to
+  // enable pinning by default.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 32 * MB, 0x0000FFFFULL);
+    AppendCache(buffer, 3, 32 * MB, 0xFFFF0000ULL);
+    if (!LargestSharedCache(buffer.data(), buffer.size()))
+      return 21;
+    if (DominantSharedCache(buffer.data(), buffer.size()))
+      return 22;
+  }
+
+  // A single L3 spanning every core: no rival, and the mask covers everything,
+  // so applying it is a no-op. Dominant by default rather than declined.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 32 * MB, 0xFFFFFFFFULL);
+    const CacheDomain domain = DominantSharedCache(buffer.data(), buffer.size());
+    if (!domain || domain.mask != 0xFFFFFFFFULL)
+      return 23;
+  }
+
+  // Just under and just over the threshold, to pin the boundary rather than
+  // assume it. 150% of 32 is 48: 47 declines, 48 accepts.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 47 * MB, 0x00FF);
+    AppendCache(buffer, 3, 32 * MB, 0xFF00);
+    if (DominantSharedCache(buffer.data(), buffer.size()))
+      return 24;
+  }
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 48 * MB, 0x00FF);
+    AppendCache(buffer, 3, 32 * MB, 0xFF00);
+    if (!DominantSharedCache(buffer.data(), buffer.size()))
+      return 25;
+  }
+
+  // The same physical cache reported twice must not count as its own rival --
+  // that would suppress every pin on hardware that reports duplicates.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 96 * MB, 0xFFFF);
+    AppendCache(buffer, 3, 96 * MB, 0xFFFF);
+    const CacheDomain domain = DominantSharedCache(buffer.data(), buffer.size());
+    if (!domain || domain.mask != 0xFFFF)
+      return 26;
+  }
+
+  // No L3 at all: nothing to pin to, and no accidental fallback to L2.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 2, 8 * MB, 0x00FF);
+    if (DominantSharedCache(buffer.data(), buffer.size()))
+      return 27;
+  }
+
+  // Sizes big enough that size * 100 overflows 32 bits, which is where a
+  // careless ratio comparison silently inverts.
+  {
+    std::vector<char> buffer;
+    AppendCache(buffer, 3, 1024 * MB, 0x00FF);
+    AppendCache(buffer, 3, 512 * MB, 0xFF00);
+    const CacheDomain domain = DominantSharedCache(buffer.data(), buffer.size());
+    if (!domain || domain.mask != 0x00FF)
+      return 28;
+  }
+
 
   return 0;
 }

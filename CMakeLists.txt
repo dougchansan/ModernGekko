@@ -44,10 +44,18 @@ set(MODERNGEKKO_DEFAULT_WINDOW_TITLE "" CACHE STRING
     "Fixed game window title for branded builds")
 option(MODERNGEKKO_PORTABLE_DEFAULT_GAME
        "Read and write default-game.txt beside branded executables" OFF)
+option(MODERNGEKKO_PORTABLE_USER_DIRECTORY
+       "Store frontend settings, saves, and logs beside branded executables" OFF)
 option(MODERNGEKKO_GAMECUBE_CONTROLLERS
        "Generate GameCube controller profiles instead of Wii Remote profiles" OFF)
 set(MODERNGEKKO_LOG_FILENAME "ModernGekko.log" CACHE STRING
     "Runner log filename")
+set(MODERNGEKKO_NATIVE_ULTRAWIDE_MOD_PACKAGE "" CACHE STRING
+    "Optional mod package loaded when native ultrawide is enabled")
+set(MODERNGEKKO_TEXT_UPSCALE_MOD_PACKAGE "" CACHE STRING
+    "Optional mod package loaded when text upscaling is enabled")
+set(MODERNGEKKO_MINIMAP_MOD_PACKAGE "" CACHE STRING
+    "Optional mod package loaded when the high-contrast minimap is enabled")
 set(MODERNGEKKO_DISC_PREPARER_OUTPUT_NAME "" CACHE STRING
     "Optional adjacent disc preparation executable")
 set(MODERNGEKKO_DOL_PATCH_MANIFEST "" CACHE FILEPATH
@@ -236,7 +244,10 @@ target_include_directories(moderngekko_legacy PRIVATE
 target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_sources(moderngekko PRIVATE
+        tools/automation_protocol.cpp
+        src/runtime/hd_texture_pack.cpp
         src/runtime/dolphin_runtime.cpp
+        src/runtime/pause_menu_runtime.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )
@@ -244,6 +255,17 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_sources(moderngekko PRIVATE
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp)
         target_link_libraries(moderngekko PRIVATE dwmapi)
+    endif()
+    # Radeon driver settings in the pause menu (AMD ADLX SDK, loaded at run
+    # time; without the SDK the rows report the settings as unavailable).
+    set(MODERNGEKKO_ADLX_SDK "" CACHE PATH "AMD ADLX SDK root (optional)")
+    target_sources(moderngekko PRIVATE src/runtime/amd_driver_settings.cpp)
+    if(WIN32 AND MODERNGEKKO_ADLX_SDK)
+        target_sources(moderngekko PRIVATE
+            "${MODERNGEKKO_ADLX_SDK}/ADLXHelper/Windows/Cpp/ADLXHelper.cpp"
+            "${MODERNGEKKO_ADLX_SDK}/Platform/Windows/WinAPIs.cpp")
+        target_include_directories(moderngekko PRIVATE "${MODERNGEKKO_ADLX_SDK}")
+        target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_HAVE_ADLX=1)
     endif()
     if(APPLE)
         # Dolphin's windowed backend for macOS
@@ -270,7 +292,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     else()
         target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
     endif()
-    target_link_libraries(moderngekko PRIVATE core uicommon)
+    target_link_libraries(moderngekko PRIVATE core uicommon imgui)
     if(TARGET PkgConfig::X11)
         target_sources(moderngekko PRIVATE
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
@@ -380,6 +402,7 @@ endif()
 target_compile_features(moderngekko PUBLIC cxx_std_23)
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_include_directories(moderngekko PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
 else()
     target_include_directories(moderngekko PRIVATE
@@ -468,9 +491,25 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_compile_definitions(moderngekko-run PRIVATE
             MODERNGEKKO_PORTABLE_DEFAULT_GAME=1)
     endif()
+    if(MODERNGEKKO_PORTABLE_USER_DIRECTORY)
+        target_compile_definitions(moderngekko-run PRIVATE
+            MODERNGEKKO_PORTABLE_USER_DIRECTORY=1)
+    endif()
     if(MODERNGEKKO_GAMECUBE_CONTROLLERS)
         target_compile_definitions(moderngekko-run PRIVATE
             MODERNGEKKO_GAMECUBE_CONTROLLERS=1)
+    endif()
+    if(MODERNGEKKO_NATIVE_ULTRAWIDE_MOD_PACKAGE)
+        target_compile_definitions(moderngekko-run PRIVATE
+            MODERNGEKKO_NATIVE_ULTRAWIDE_MOD_PACKAGE="${MODERNGEKKO_NATIVE_ULTRAWIDE_MOD_PACKAGE}")
+    endif()
+    if(MODERNGEKKO_TEXT_UPSCALE_MOD_PACKAGE)
+        target_compile_definitions(moderngekko-run PRIVATE
+            MODERNGEKKO_TEXT_UPSCALE_MOD_PACKAGE="${MODERNGEKKO_TEXT_UPSCALE_MOD_PACKAGE}")
+    endif()
+    if(MODERNGEKKO_MINIMAP_MOD_PACKAGE)
+        target_compile_definitions(moderngekko-run PRIVATE
+            MODERNGEKKO_MINIMAP_MOD_PACKAGE="${MODERNGEKKO_MINIMAP_MOD_PACKAGE}")
     endif()
     if(MODERNGEKKO_USER_DIRECTORY_IN_DOCUMENTS)
         target_compile_definitions(moderngekko-run PRIVATE
@@ -556,6 +595,10 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_compile_definitions(moderngekko-launcher PRIVATE
             MODERNGEKKO_PORTABLE_DEFAULT_GAME=1)
     endif()
+    if(MODERNGEKKO_PORTABLE_USER_DIRECTORY)
+        target_compile_definitions(moderngekko-launcher PRIVATE
+            MODERNGEKKO_PORTABLE_USER_DIRECTORY=1)
+    endif()
     if(MODERNGEKKO_GAMECUBE_CONTROLLERS)
         target_compile_definitions(moderngekko-launcher PRIVATE
             MODERNGEKKO_GAMECUBE_CONTROLLERS=1)
@@ -590,10 +633,38 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     endif()
     add_dependencies(moderngekko-launcher moderngekko-run)
 
+    find_package(Git QUIET)
+    set(_moderngekko_recompcore_revision "unknown")
+    set(_moderngekko_dolrecomp_revision "unknown")
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin" rev-parse HEAD
+            RESULT_VARIABLE _moderngekko_recompcore_result
+            OUTPUT_VARIABLE _moderngekko_recompcore_revision
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT _moderngekko_recompcore_result EQUAL 0)
+            set(_moderngekko_recompcore_revision "unknown")
+        endif()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/DolRecomp" rev-parse HEAD
+            RESULT_VARIABLE _moderngekko_dolrecomp_result
+            OUTPUT_VARIABLE _moderngekko_dolrecomp_revision
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT _moderngekko_dolrecomp_result EQUAL 0)
+            set(_moderngekko_dolrecomp_revision "unknown")
+        endif()
+    endif()
+
     add_executable(moderngekko-port tools/moderngekko_port.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
     target_compile_definitions(moderngekko-port PRIVATE
-        MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        MODERNGEKKO_RECOMPCORE_REVISION="${_moderngekko_recompcore_revision}"
+        MODERNGEKKO_DOLRECOMP_REVISION="${_moderngekko_dolrecomp_revision}")
     if(DOLRECOMP_ENABLE_LLVM)
         target_compile_definitions(moderngekko-port PRIVATE
             MODERNGEKKO_DOLRECOMP_LLVM=1)
@@ -641,6 +712,10 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(moderngekko_pause_menu_policy_test tests/pause_menu_policy_test.cpp)
+    target_include_directories(moderngekko_pause_menu_policy_test PRIVATE tools)
+    target_compile_features(moderngekko_pause_menu_policy_test PRIVATE cxx_std_17)
+    add_test(NAME moderngekko.pause_menu_policy COMMAND moderngekko_pause_menu_policy_test)
     add_executable(moderngekko_dol_patch_test
         tests/dol_patch_test.cpp
         tools/dol_patch.cpp)
@@ -657,6 +732,18 @@ if(BUILD_TESTING)
     target_compile_features(moderngekko_frontend_config_test PRIVATE cxx_std_23)
     add_test(NAME moderngekko.frontend_config COMMAND moderngekko_frontend_config_test)
 
+    # Header-only, so the test needs no companion translation unit.
+    add_executable(moderngekko_launcher_savestates_test
+        tests/launcher_savestates_test.cpp)
+    target_include_directories(moderngekko_launcher_savestates_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+        # For Core/SavestateLayout.h, which owns the listing rules. It depends on
+        # nothing but the standard library, so this pulls in no Dolphin linkage.
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+    target_compile_features(moderngekko_launcher_savestates_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.launcher_savestates
+             COMMAND moderngekko_launcher_savestates_test)
+
     add_executable(moderngekko_frontend_config_gamecube_test
         tests/frontend_config_test.cpp
         tools/frontend_config.cpp)
@@ -668,6 +755,62 @@ if(BUILD_TESTING)
     add_test(NAME moderngekko.frontend_config_gamecube
              COMMAND moderngekko_frontend_config_gamecube_test)
 
+    add_executable(moderngekko_hd_texture_pack_test
+        tests/hd_texture_pack_test.cpp)
+    # ResourcePack pulls Dolphin core objects, which require the Host_*
+    # callbacks implemented in dolphin_runtime.cpp. Linux's static linker
+    # otherwise discards that object because this test only calls pack APIs.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+        target_link_libraries(moderngekko_hd_texture_pack_test PRIVATE
+            "$<LINK_LIBRARY:WHOLE_ARCHIVE,moderngekko>" uicommon)
+    else()
+        target_link_libraries(moderngekko_hd_texture_pack_test PRIVATE
+            ModernGekko::Runtime uicommon)
+    endif()
+    target_compile_features(moderngekko_hd_texture_pack_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.hd_texture_pack
+             COMMAND moderngekko_hd_texture_pack_test)
+
+    add_executable(moderngekko_colosseum_text_upscale_test
+        tests/colosseum_text_upscale_test.cpp)
+    target_include_directories(moderngekko_colosseum_text_upscale_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+    target_compile_features(moderngekko_colosseum_text_upscale_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.colosseum_text_upscale
+             COMMAND moderngekko_colosseum_text_upscale_test)
+
+    add_executable(moderngekko_colosseum_projection_test
+        tests/colosseum_projection_test.cpp)
+    target_include_directories(moderngekko_colosseum_projection_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+    target_compile_features(moderngekko_colosseum_projection_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.colosseum_projection
+             COMMAND moderngekko_colosseum_projection_test)
+
+    if(TARGET videocommon)
+        add_executable(moderngekko_onscreen_ui_lifecycle_test
+            tests/onscreen_ui_lifecycle_test.cpp)
+        target_include_directories(moderngekko_onscreen_ui_lifecycle_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+        target_link_libraries(moderngekko_onscreen_ui_lifecycle_test PRIVATE
+            ModernGekko::Runtime uicommon imgui implot)
+        target_compile_features(moderngekko_onscreen_ui_lifecycle_test PRIVATE cxx_std_23)
+        if(MSVC)
+            target_compile_options(moderngekko_onscreen_ui_lifecycle_test PRIVATE /Zc:preprocessor)
+        endif()
+        add_test(NAME moderngekko.onscreen_ui_lifecycle
+                 COMMAND moderngekko_onscreen_ui_lifecycle_test)
+    endif()
+
+    add_executable(moderngekko_automation_protocol_test
+        tests/automation_protocol_test.cpp
+        tools/automation_protocol.cpp)
+    target_include_directories(moderngekko_automation_protocol_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+    target_compile_features(moderngekko_automation_protocol_test PRIVATE cxx_std_23)
+    add_test(NAME moderngekko.automation_protocol
+             COMMAND moderngekko_automation_protocol_test)
     if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         add_executable(moderngekko_netplay_protocol_test
             tests/netplay_protocol_test.cpp
@@ -678,6 +821,12 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
         target_compile_definitions(moderngekko_netplay_protocol_test PRIVATE
             MODERNGEKKO_NETPLAY_TEST_MOD_PATH="$<TARGET_FILE:moderngekko_test_mod>")
+        if(MSVC)
+            target_compile_options(moderngekko_netplay_protocol_test PRIVATE
+                /Zc:preprocessor)
+            target_compile_definitions(moderngekko_netplay_protocol_test PRIVATE
+                WIN32_LEAN_AND_MEAN NOMINMAX)
+        endif()
         if(CMAKE_SIZEOF_VOID_P EQUAL 8)
             target_compile_definitions(moderngekko_netplay_protocol_test PRIVATE _ARCH_64=1)
         else()
@@ -702,21 +851,6 @@ if(BUILD_TESTING)
         else()
             target_link_libraries(moderngekko_netplay_protocol_test PRIVATE
                 ModernGekko::Runtime core uicommon)
-        endif()
-        if(WIN32)
-            # The same treatment the non-test Windows targets get from the loop
-            # above, which runs before the test targets exist and so misses
-            # them. WIN32_LEAN_AND_MEAN keeps windows.h from pulling in
-            # winsock.h, which would clash with the winsock2.h this reaches
-            # through Dolphin's networking headers ('sockaddr' redefinition).
-            target_compile_definitions(moderngekko_netplay_protocol_test PRIVATE
-                WIN32_LEAN_AND_MEAN NOMINMAX)
-            if(MSVC)
-                # Dolphin's headers use __VA_OPT__, which the traditional
-                # preprocessor cannot parse.
-                target_compile_options(moderngekko_netplay_protocol_test PRIVATE
-                    /Zc:preprocessor)
-            endif()
         endif()
         add_test(NAME moderngekko.netplay_protocol COMMAND moderngekko_netplay_protocol_test)
     endif()
