@@ -576,8 +576,113 @@ void RestartWithGraphicsBackend(const std::shared_ptr<Menu> &menu, const std::st
 }
 #endif
 
-// Radeon settings rows (20..25) in amd::Feature order.
-constexpr int kFirstAmdRow = 20;
+void SetRenderScale(const std::shared_ptr<Menu> &menu, int scale) {
+  scale = std::clamp(scale, 1, 6);
+  Common::IniFile ini;
+  ini.Load(menu->config_path);
+  ini.GetOrCreateSection("Performance")->Set("ResolutionScale", scale);
+  // The ultrawide view keeps its own scale (3..6), used from the next launch.
+  ini.GetOrCreateSection("Video")->Set("ultrawide_efb_scale", std::max(scale, 3));
+  ini.GetOrCreateSection("Video")->Set("resolution",
+                                       std::to_string(640 * scale) + "x" +
+                                           std::to_string(528 * scale));
+  ini.Save(menu->config_path);
+  Core::RunOnCPUThread(Core::System::GetInstance(),
+                       [scale] { Host_SetPauseMenuResolution(scale); });
+}
+
+void SetPerformanceDisplay(bool show) {
+  Config::SetBase(Config::GFX_SHOW_FPS, show);
+  Config::SetBase(Config::GFX_SHOW_FTIMES, show);
+  Config::SetBase(Config::GFX_SHOW_SPEED, show);
+  Config::SetBase(Config::GFX_SHOW_INTERNAL_RESOLUTION, show);
+}
+
+// Refresh rate of the monitor showing the game (60 if unknown).
+int DisplayRefreshRate() {
+#ifdef _WIN32
+  MONITORINFOEXW info{};
+  info.cbSize = sizeof(info);
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  const HMONITOR monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+  if (GetMonitorInfoW(monitor, &info) &&
+      EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+      mode.dmDisplayFrequency > 1)
+    return static_cast<int>(mode.dmDisplayFrequency);
+#endif
+  return 60;
+}
+
+// Performance presets: one choice sets frame rate, render resolution, VSync
+// and the overlays together; any later change to those rows shows "Custom".
+struct Preset {
+  const char *name;
+  int frame_rate;  // 0: the display's refresh rate (up to 240)
+  int scale;
+  bool vsync;
+};
+constexpr std::array<Preset, 3> kPresets{{
+    // Lowest latency: frames paced by the game, tearing-free on FreeSync /
+    // G-Sync displays; modest resolution leaves the most headroom.
+    {"Smoothest", 0, 3, false},
+    {"Balanced", 120, 4, true},
+    {"Quality", 60, 5, true},
+}};
+
+int PresetFrameRate(const Preset &preset) {
+  if (preset.frame_rate > 0)
+    return preset.frame_rate;
+  const int refresh = DisplayRefreshRate();
+  return refresh >= 240 ? 240 : refresh >= 120 ? 120 : 60;
+}
+
+// Index of the preset the current settings match, or -1 (Custom).
+int MatchingPreset() {
+  if (Config::Get(Config::GFX_SHOW_FPS) || Config::Get(Config::GFX_SHOW_GRAPHS) ||
+      Config::Get(Config::GFX_OVERLAY_STATS))
+    return -1;
+  for (std::size_t i = 0; i < kPresets.size(); ++i) {
+    const Preset &preset = kPresets[i];
+    if (CurrentFrameRate() == PresetFrameRate(preset) &&
+        Config::Get(Config::GFX_EFB_SCALE) == preset.scale &&
+        Config::Get(Config::GFX_VSYNC) == preset.vsync)
+      return static_cast<int>(i);
+  }
+  return -1;
+}
+
+void ApplyPreset(const std::shared_ptr<Menu> &menu, int direction) {
+  const int count = static_cast<int>(kPresets.size());
+  const int current = MatchingPreset();
+  const int next = current < 0 ? (direction < 0 ? count - 1 : 0)
+                               : (current + (direction < 0 ? count - 1 : 1)) % count;
+  const Preset &preset = kPresets[static_cast<std::size_t>(next)];
+  SetFrameRate(menu, PresetFrameRate(preset));
+  if (Config::Get(Config::GFX_EFB_SCALE) != preset.scale)
+    SetRenderScale(menu, preset.scale);
+  Config::SetBase(Config::GFX_VSYNC, preset.vsync);
+  SetPerformanceDisplay(false);
+  Config::SetBase(Config::GFX_SHOW_GRAPHS, false);
+  Config::SetBase(Config::GFX_OVERLAY_STATS, false);
+  Config::Save();
+  menu->status.clear();
+}
+
+std::string PresetLabel() {
+  const int preset = MatchingPreset();
+  return std::string("Performance preset   ") +
+         (preset < 0 ? "Custom" : kPresets[static_cast<std::size_t>(preset)].name);
+}
+
+// Settings rows: 0 is the preset; the rest follow from 1 (Adjust and the
+// labels index them from 0 after the preset).
+constexpr int kPresetRows = 1;
+
+// Dual core row, then the Radeon settings rows in amd::Feature order (row
+// numbers after the preset).
+constexpr int kDualCoreRow = 20;
+constexpr int kFirstAmdRow = 21;
 
 void RefreshAmdStates(Menu &menu) {
   for (int i = 0; i < amd::kFeatureCount; ++i)
@@ -642,12 +747,16 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     CycleDevice(direction);
     return;
   }
-  if (((menu->policy.focus() >= 6 && menu->policy.focus() <= 8) || (menu->policy.focus() >= 16 && menu->policy.focus() <= 18)) &&
-      !menu->camera_available) {
+  if (menu->policy.focus() < kPresetRows) {
+    ApplyPreset(menu, direction);
+    return;
+  }
+  const int row = static_cast<int>(menu->policy.focus()) - kPresetRows;
+  if (((row >= 6 && row <= 8) || (row >= 16 && row <= 18)) && !menu->camera_available) {
     menu->status = "Camera controls require the camera mod.";
     return;
   }
-  switch (menu->policy.focus()) {
+  switch (row) {
   case 0: {
     static constexpr std::array<int, 4> kRates{30, 60, 120, 240};
     const auto it = std::find(kRates.begin(), kRates.end(), CurrentFrameRate());
@@ -708,33 +817,17 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     Config::Save();
     AudioCommon::UpdateSoundStream(Core::System::GetInstance());
     break;
-  case 11: {
-    const int scale =
-        std::clamp(Config::Get(Config::GFX_EFB_SCALE) + direction, 1, 6);
-    Common::IniFile ini;
-    ini.Load(menu->config_path);
-    ini.GetOrCreateSection("Performance")->Set("ResolutionScale", scale);
-    ini.GetOrCreateSection("Video")->Set("resolution",
-                                         std::to_string(640 * scale) + "x" +
-                                             std::to_string(528 * scale));
-    ini.Save(menu->config_path);
-    Core::RunOnCPUThread(Core::System::GetInstance(),
-                         [scale] { Host_SetPauseMenuResolution(scale); });
+  case 11:
+    SetRenderScale(menu, Config::Get(Config::GFX_EFB_SCALE) + direction);
     break;
-  }
   case 12:
     Config::SetBase(Config::GFX_VSYNC, !Config::Get(Config::GFX_VSYNC));
     Config::Save();
     break;
-  case 13: {
-    const bool show = !Config::Get(Config::GFX_SHOW_FPS);
-    Config::SetBase(Config::GFX_SHOW_FPS, show);
-    Config::SetBase(Config::GFX_SHOW_FTIMES, show);
-    Config::SetBase(Config::GFX_SHOW_SPEED, show);
-    Config::SetBase(Config::GFX_SHOW_INTERNAL_RESOLUTION, show);
+  case 13:
+    SetPerformanceDisplay(!Config::Get(Config::GFX_SHOW_FPS));
     Config::Save();
     break;
-  }
   case 14:
     Config::SetBase(Config::GFX_SHOW_GRAPHS,
                     !Config::Get(Config::GFX_SHOW_GRAPHS));
@@ -776,13 +869,27 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
 #endif
     }
     break;
+  case kDualCoreRow: {
+    // Dolphin reads it at boot: save it and restart in place like a graphics
+    // API switch (save state, relaunch, reload).
+    Common::IniFile ini;
+    ini.Load(menu->config_path);
+    bool dual_core = true;
+    ini.GetOrCreateSection("QualityOfLife")->Get("dual_core", &dual_core, true);
+    ini.GetOrCreateSection("QualityOfLife")->Set("dual_core", !dual_core);
+    ini.Save(menu->config_path);
+#ifdef _WIN32
+    RestartWithGraphicsBackend(menu, Config::Get(Config::MAIN_GFX_BACKEND));
+#endif
+    break;
+  }
   case kFirstAmdRow + 0:
   case kFirstAmdRow + 1:
   case kFirstAmdRow + 2:
   case kFirstAmdRow + 3:
   case kFirstAmdRow + 4:
   case kFirstAmdRow + 5:
-    CycleAmdSetting(menu, static_cast<int>(menu->policy.focus()) - kFirstAmdRow, direction);
+    CycleAmdSetting(menu, row - kFirstAmdRow, direction);
     break;
   default:
     break;
@@ -847,6 +954,7 @@ std::vector<std::string> Rows(const Menu &menu) {
             "Quit game"};
   case Page::Settings:
     return {
+        PresetLabel(),
         "Frame rate   " + std::to_string(CurrentFrameRate()) + " FPS" +
             (CurrentFrameRate() >= 120 && g_frame_interp_dropping.load()
                  ? "  (display can't keep up - showing 60)"
@@ -888,6 +996,7 @@ std::vector<std::string> Rows(const Menu &menu) {
                  (configured != Config::Get(Config::MAIN_GFX_BACKEND) ? "  (Enter / A to apply)"
                                                                        : "");
         }(),
+        enabled("Dual core (CPU + GPU threads)", Config::Get(Config::MAIN_CPU_THREAD)),
         AmdLabel(menu, amd::Feature::AntiLag),
         AmdLabel(menu, amd::Feature::Chill),
         AmdLabel(menu, amd::Feature::Boost),
@@ -1123,7 +1232,7 @@ void Draw() {
     ImGui::PushID(static_cast<int>(row));
     const bool focused = row == menu->policy.focus();
     const bool unavailable = menu->policy.page() == Page::Settings &&
-                             ((row >= 6 && row <= 8) || (row >= 16 && row <= 18)) && !menu->camera_available;
+                             ((row >= 7 && row <= 9) || (row >= 17 && row <= 19)) && !menu->camera_available;  // + preset row
     ImGui::BeginDisabled(unavailable);
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.20f, 0.32f, 0.52f, 1));
     const std::string label = (focused ? ">  " : "   ") + rows[row];
@@ -1269,7 +1378,7 @@ void Host_PauseMenuTick() {
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count();
   const auto page = menu->policy.page();
-  const std::size_t rows = page == Page::Settings   ? 27
+  const std::size_t rows = page == Page::Settings   ? 29
                            : page == Page::Controls ? 2
                                                     : 0;
   ActionHost(menu, menu->policy.update(input, now, rows));

@@ -60,6 +60,8 @@ struct ConfigResult {
   int accessibility_ui_scale = 100;
   bool sixty_fps = false;
   bool guest_idle_skip = true;
+  // Emulate on one thread and render on another (Dolphin's dual core).
+  bool dual_core = true;
   bool fast_forward = false;
   int fast_forward_multiplier = 2;
   bool autosave = true;

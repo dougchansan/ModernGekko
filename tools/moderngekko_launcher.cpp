@@ -1352,6 +1352,7 @@ int main(int argc, char** argv)
           "work, so a slower machine will run below full speed.");
 
       save_toggle(&config.guest_idle_skip, "Guest idle skip");
+      save_toggle(&config.dual_core, "Dual core (render on a second thread)");
       ImGui::TextDisabled(
           "Lets the emulated console sleep through the game's idle loop\n"
           "instead of spinning in it. This is what lets heavy battle scenes\n"

@@ -345,6 +345,7 @@ int RunMain(int argc, char **argv) {
       frontend_config.accessibility_ui_scale;
   config.qol.sixty_fps = frontend_config.sixty_fps;
   config.qol.guest_idle_skip = frontend_config.guest_idle_skip;
+  config.qol.dual_core = frontend_config.dual_core;
   config.qol.fast_forward = frontend_config.fast_forward;
   config.qol.fast_forward_multiplier =
       frontend_config.fast_forward_multiplier;

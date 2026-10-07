@@ -59,6 +59,9 @@ struct QualityOfLifeSettings
   // walk and then declines to idle, measured at about 8% there -- so a
   // machine short of headroom in the field may want it off.
   bool guest_idle_skip = true;
+  // Dolphin dual core: the GPU thread renders and presents while the CPU
+  // thread emulates, leaving the emulation thread headroom at 120/240 FPS.
+  bool dual_core = true;
   bool fast_forward = false;
   int fast_forward_multiplier = 2;
   bool autosave = true;

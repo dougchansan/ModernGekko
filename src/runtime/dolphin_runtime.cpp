@@ -3227,6 +3227,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   impl->platform->SetTitle(impl->title);
 
   Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
+  Config::SetBase(Config::MAIN_CPU_THREAD, impl->config.qol.dual_core);
+  std::fprintf(stderr, "[core] dual core %s\n", impl->config.qol.dual_core ? "on" : "off");
   if (!impl->config.graphics.backend.empty())
     Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
   else if (impl->config.headless)

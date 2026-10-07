@@ -221,6 +221,9 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     } else if (key == "guest_idle_skip") {
       if (!ParseBoolean(value, &config.guest_idle_skip))
         return {.error = "guest_idle_skip must be true or false"};
+    } else if (key == "dual_core") {
+      if (!ParseBoolean(value, &config.dual_core))
+        return {.error = "dual_core must be true or false"};
     } else if (key == "fast_forward") {
       if (!ParseBoolean(value, &config.fast_forward))
         return {.error = "fast_forward must be true or false"};
@@ -403,6 +406,7 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
        << "sixty_fps=" << (config.sixty_fps ? "true" : "false") << '\n'
        << "guest_idle_skip="
        << (config.guest_idle_skip ? "true" : "false") << '\n'
+       << "dual_core=" << (config.dual_core ? "true" : "false") << '\n'
        << "fast_forward=" << (config.fast_forward ? "true" : "false") << '\n'
        << "fast_forward_multiplier=" << config.fast_forward_multiplier << '\n'
        << "autosave=" << (config.autosave ? "true" : "false") << '\n'
