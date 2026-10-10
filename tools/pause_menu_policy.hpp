@@ -11,6 +11,7 @@ enum class Action {
   Resume,
   Settings,
   Controls,
+  PhotoMode,
   SaveCheckpoint,
   Restart,
   Quit,
@@ -59,7 +60,7 @@ public:
       return custom_rows_;
     switch (page_) {
     case Page::Home:
-      return 6;
+      return 7;
     case Page::Settings:
       return 4;
     case Page::Controls:
@@ -116,12 +117,15 @@ public:
         focus_ = 0;
         return Action::Controls;
       case 3:
-        return Action::SaveCheckpoint;
+        close();
+        return Action::PhotoMode;
       case 4:
+        return Action::SaveCheckpoint;
+      case 5:
         page_ = Page::RestartConfirm;
         focus_ = 0;
         return Action::None;
-      case 5:
+      case 6:
         page_ = Page::QuitConfirm;
         focus_ = 0;
         return Action::None;

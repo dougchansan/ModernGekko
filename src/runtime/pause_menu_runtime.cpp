@@ -18,6 +18,7 @@
 #include "InputCommon/InputConfig.h"
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/CameraWarp.h"
+#include "VideoCommon/FrameDumper.h"
 #include "VideoCommon/Present.h"
 #include "VideoCommon/VideoConfig.h"
 #include "moderngekko/cpu_state.h"
@@ -28,6 +29,7 @@
 #include "pause_menu_policy.hpp"
 #include "colosseum_menu_style.hpp"
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <cstdlib>
 #include <algorithm>
@@ -80,6 +82,14 @@ struct Menu {
   std::atomic<bool> active{true}, open{false}, blocked{false}, toggle{false};
   bool select_was_down = false;  // controller Back / Select / Minus edge
   bool run_click_was_down = false;  // left stick click edge
+  // Photo mode: world frozen, free camera, A captures, B leaves; D-pad
+  // Left / Right field of view, Up / Down depth of field.
+  std::atomic<bool> photo_mode{false};
+  int photo_fov = 70;
+  int photo_dof = 0;
+  u16 photo_buttons = 0;
+  std::chrono::steady_clock::time_point photo_flash{};
+  std::string photo_saved;
   bool running = false;
   // Start pressed without Z: polls it has been held back from the game, so a
   // Z arriving a poll later still makes the menu chord instead of opening the
@@ -306,6 +316,11 @@ void SaveCameraSetting(const Menu &menu, const char *key, int value) {
 void UpdateDepthOfField(const std::shared_ptr<Menu> &menu) {
   int level = 0;
   bool first_person = false;
+  if (menu->photo_mode) {
+    menu->first_person_active = false;
+    g_depth_of_field_level.store(menu->photo_dof, std::memory_order_relaxed);
+    return;
+  }
   if (menu->depth_of_field > 0 || menu->first_person_dot) {
     const std::string state = ReadCameraState(menu);
     const unsigned long flags = state.empty() ? 0 : std::strtoul(state.c_str(), nullptr, 16);
@@ -439,6 +454,88 @@ bool LeftStickClickDown() {
       return true;
   }
   return false;
+}
+
+// Photo mode controls, polled with the menu (the camera mod gives the game an
+// idle controller meanwhile). Photos are the frame at its internal resolution,
+// without the overlay, in User/ScreenShots.
+void HandlePhotoMode(const std::shared_ptr<Menu> &menu, const GCPadStatus &pad);
+
+// Photo mode in the camera mod (moderngekko.camera.set_photo).
+void SetPhoto(const std::shared_ptr<Menu> &menu, bool on) {
+  const int fov = menu->photo_fov;
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), on, fov] {
+    const auto state = weak.lock();
+    if (!state)
+      return;
+    std::lock_guard lock(state->mods_mutex);
+    if (!state->active || !state->mods)
+      return;
+    for (const auto &mod : state->mods->GetLoadedMods()) {
+      if (auto function = state->mods->FindExport(mod.id, "moderngekko.camera.set_photo")) {
+        CPUState cpu{};
+        cpu.gpr[3] = on ? 1 : 0;
+        cpu.gpr[4] = static_cast<u32>(fov);
+        function(&cpu);
+        break;
+      }
+    }
+  });
+}
+
+void LeavePhotoMode(const std::shared_ptr<Menu> &menu);
+
+void HandlePhotoMode(const std::shared_ptr<Menu> &menu, const GCPadStatus &pad) {
+  // The menu's input block (held until buttons are released after it closes)
+  // would blank the controller the free camera flies with; the camera mod
+  // keeps the game itself from seeing it.
+  menu->blocked = false;
+  u16 buttons = pad.button;
+  if (menu->keys[27])
+    buttons |= PAD_BUTTON_B;  // Esc leaves too
+  if (menu->keys[13])
+    buttons |= PAD_BUTTON_A;  // Enter takes a photo
+  const u16 pressed = buttons & ~menu->photo_buttons;
+  menu->photo_buttons = buttons;
+  if (pressed & (PAD_BUTTON_B | PAD_BUTTON_START)) {
+    LeavePhotoMode(menu);
+    return;
+  }
+  if (pressed & (PAD_BUTTON_LEFT | PAD_BUTTON_RIGHT)) {
+    menu->photo_fov = std::clamp(menu->photo_fov + ((pressed & PAD_BUTTON_RIGHT) ? 10 : -10), 20, 150);
+    SetPhoto(menu, true);
+  }
+  if (pressed & (PAD_BUTTON_UP | PAD_BUTTON_DOWN))
+    menu->photo_dof = std::clamp(menu->photo_dof + ((pressed & PAD_BUTTON_UP) ? 1 : -1), 0, 5);
+  if (pressed & PAD_BUTTON_A) {
+    const std::string directory = File::GetUserPath(D_SCREENSHOTS_IDX);
+    File::CreateFullPath(directory);
+    const std::time_t now = std::time(nullptr);
+    char name[64];
+    std::strftime(name, sizeof(name), "Colosseum-photo-%Y%m%d-%H%M%S.png", std::localtime(&now));
+    const std::string path = directory + name;
+    Core::RunOnCPUThread(Core::System::GetInstance(), [path] {
+      if (g_frame_dumper)
+        g_frame_dumper->SaveScreenshot(path);
+    });
+    menu->photo_flash = std::chrono::steady_clock::now();
+    menu->photo_saved = name;
+    std::fprintf(stderr, "[photo] %s\n", path.c_str());
+  }
+}
+
+FrameDumpResolutionType s_saved_dump_resolution = FrameDumpResolutionType::WindowResolution;
+
+void EnterPhotoResolution() {
+  s_saved_dump_resolution = Config::Get(Config::GFX_FRAME_DUMPS_RESOLUTION_TYPE);
+  Config::SetCurrent(Config::GFX_FRAME_DUMPS_RESOLUTION_TYPE,
+                     FrameDumpResolutionType::XFBRawResolution);
+}
+
+void LeavePhotoMode(const std::shared_ptr<Menu> &menu) {
+  menu->photo_mode = false;
+  Config::SetCurrent(Config::GFX_FRAME_DUMPS_RESOLUTION_TYPE, s_saved_dump_resolution);
+  SetPhoto(menu, false);
 }
 
 // Run (left stick click toggles): Wes and Rui move and animate twice as fast.
@@ -1143,6 +1240,17 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
 void ActionHost(const std::shared_ptr<Menu> &menu, Action action,
                 [[maybe_unused]] int direction = 1) {
   switch (action) {
+  case Action::PhotoMode:
+    if (!menu->camera_available) {
+      menu->status = "Photo mode requires the camera mod.";
+      break;
+    }
+    menu->photo_mode = true;
+    menu->photo_buttons = 0xFFFF;  // ignore the A that chose it
+    EnterPhotoResolution();
+    menu->photo_saved.clear();
+    SetPhoto(menu, true);
+    break;
   case Action::SaveCheckpoint: {
     const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -1201,8 +1309,8 @@ std::vector<std::string> Rows(const Menu &menu) {
   };
   switch (menu.policy.page()) {
   case Page::Home:
-    return {"Resume adventure", "Settings", "Controls", "Save checkpoint",
-            "Restart game", "Quit game"};
+    return {"Resume adventure", "Settings", "Controls", "Photo mode",
+            "Save checkpoint", "Restart game", "Quit game"};
   case Page::Settings:
     return {
         PresetLabel(),
@@ -1433,7 +1541,9 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       else if (target == "controls")
         menu->policy.activate(2);
       else if (target == "quit")
-        menu->policy.activate(5);
+        menu->policy.activate(6);
+      else if (target == "photo")
+        ActionHost(menu, menu->policy.activate(3));
       SyncPause(menu, was_open);
     }).detach();
   }
@@ -1613,10 +1723,51 @@ std::string Upper(std::string text) {
   return text;
 }
 
+// Photo mode: a hint bar at the bottom, a flash and the saved file name after a
+// photo. None of it is in the photo (it is taken from the game's frame).
+void DrawPhotoMode(Menu &menu) {
+  namespace st = style;
+  namespace col = style::color;
+  const auto &io = ImGui::GetIO();
+  ImFont *font = MenuFont();
+  const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.6f);
+  ImDrawList *draw = ImGui::GetForegroundDrawList();
+  const auto now = std::chrono::steady_clock::now();
+  const float since = std::chrono::duration<float>(now - menu.photo_flash).count();
+  if (since < 0.25f)
+    draw->AddRectFilled(ImVec2(0, 0), io.DisplaySize,
+                        st::Rgb(255, 255, 255, static_cast<int>(200 * (1 - since / 0.25f))));
+  const float width = std::min(1100 * s, io.DisplaySize.x - 32 * s), height = 104 * s;
+  const ImVec2 a((io.DisplaySize.x - width) * 0.5f, io.DisplaySize.y - height - 24 * s);
+  const ImVec2 b(a.x + width, a.y + height);
+  st::ChromePlate(draw, a, b, 16 * s, 7 * s, st::Rgb(20, 70, 64, 235), st::Rgb(10, 40, 38, 235));
+  const float size = 24 * s;
+  st::FillChamfer(draw, ImVec2(a.x + 18 * s, a.y + 18 * s), ImVec2(a.x + 26 * s, b.y - 18 * s), 3 * s,
+                  st::Rgb(240, 70, 60), st::Rgb(150, 20, 20));
+  st::OutlinedText(draw, font, size * 1.2f, ImVec2(a.x + 40 * s, a.y + 16 * s), col::kFocusGreen,
+                   "PHOTO MODE", 1.8f * s);
+  static const char *const kDof[] = {"Off", "Very low", "Low", "Medium", "High", "Very high"};
+  char status[160];
+  std::snprintf(status, sizeof(status), "Field of view %d    Depth of field %s", menu.photo_fov,
+                kDof[std::clamp(menu.photo_dof, 0, 5)]);
+  st::OutlinedText(draw, font, size, ImVec2(a.x + 260 * s, a.y + 20 * s), col::kYellow, status, 1.5f * s);
+  const std::string hints = since < 3.0f && !menu.photo_saved.empty()
+                                ? "Saved " + menu.photo_saved
+                                : "A: take photo   B: back   Sticks: fly / look   R / L: up / down   "
+                                  "D-pad: view / focus";
+  st::SpacedText(draw, font, size * 0.82f, ImVec2(a.x + 40 * s, a.y + 58 * s),
+                 since < 3.0f && !menu.photo_saved.empty() ? col::kFocusGreen : col::kWhite, hints,
+                 1.5f * s, 1.4f * s);
+}
+
 void Draw() {
   namespace st = style;
   namespace col = style::color;
   const auto menu = current.load();
+  if (menu && menu->photo_mode) {
+    DrawPhotoMode(*menu);
+    return;
+  }
   if (menu && menu->motion_test)
     DrawMotionTest();
   if (menu)
@@ -1970,6 +2121,10 @@ void Host_PauseMenuTick() {
     polling_menu = false;
   }
   std::lock_guard lock(menu->mutex);
+  if (menu->photo_mode) {
+    HandlePhotoMode(menu, pad);
+    return;
+  }
   Input input;
   Input pressed;
   pressed.escape = menu->pressed_keys[27].exchange(false);
