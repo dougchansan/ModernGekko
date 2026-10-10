@@ -29,6 +29,7 @@
 #include "pause_menu_policy.hpp"
 #include "colosseum_menu_style.hpp"
 #include "shadow_tracker.hpp"
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
@@ -125,6 +126,11 @@ struct Menu {
   // once a second while it is shown.
   shadow::Summary shadow;
   std::chrono::steady_clock::time_point shadow_read{};
+  // Time of day (config.ini [World] TimeOfDay): 0 off, 1 real clock, 2 fast
+  // cycle (an in-game hour per minute), 3 dawn, 4 day, 5 evening, 6 night.
+  int time_of_day = 0;
+  std::array<int, 9> applied_tint{};
+  std::chrono::steady_clock::time_point tint_sent{};
   int text_speed = 0;
   int battle_speed = 1;
   bool skip_intro = false;
@@ -470,6 +476,92 @@ bool LeftStickClickDown() {
 // idle controller meanwhile). Photos are the frame at its internal resolution,
 // without the overlay, in User/ScreenShots.
 void HandlePhotoMode(const std::shared_ptr<Menu> &menu, const GCPadStatus &pad);
+
+// Time of day: light / ambient / fog gains for an hour of the day, blended
+// between key looks (night, dawn, day, evening).
+std::array<float, 9> TimeOfDayGains(float hour) {
+  struct Key {
+    float hour;
+    std::array<float, 9> gains;  // ambient RGB, light RGB, fog RGB
+  };
+  static constexpr std::array<Key, 8> kKeys{{
+      {0.0f, {0.42f, 0.48f, 0.72f, 0.32f, 0.40f, 0.66f, 0.22f, 0.28f, 0.48f}},   // night
+      {4.5f, {0.42f, 0.48f, 0.72f, 0.32f, 0.40f, 0.66f, 0.22f, 0.28f, 0.48f}},   // night
+      {6.5f, {0.86f, 0.78f, 0.82f, 1.00f, 0.80f, 0.70f, 0.95f, 0.74f, 0.70f}},   // dawn
+      {9.0f, {1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f}},   // day
+      {16.5f, {1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f}},  // day
+      {18.5f, {0.92f, 0.76f, 0.70f, 1.18f, 0.78f, 0.52f, 1.05f, 0.68f, 0.48f}},  // evening
+      {20.5f, {0.50f, 0.52f, 0.74f, 0.40f, 0.44f, 0.68f, 0.30f, 0.32f, 0.52f}},  // dusk
+      {24.0f, {0.42f, 0.48f, 0.72f, 0.32f, 0.40f, 0.66f, 0.22f, 0.28f, 0.48f}},  // night
+  }};
+  hour = std::fmod(std::fmod(hour, 24.0f) + 24.0f, 24.0f);
+  std::size_t k = 0;
+  while (k + 2 < kKeys.size() && hour > kKeys[k + 1].hour)
+    ++k;
+  const auto &a = kKeys[k], &b = kKeys[k + 1];
+  const float t = std::clamp((hour - a.hour) / std::max(b.hour - a.hour, 0.001f), 0.0f, 1.0f);
+  const float smooth = t * t * (3 - 2 * t);
+  std::array<float, 9> out;
+  for (std::size_t i = 0; i < 9; ++i)
+    out[i] = a.gains[i] + (b.gains[i] - a.gains[i]) * smooth;
+  return out;
+}
+
+float TimeOfDayHour(int mode) {
+  switch (mode) {
+  case 1: {
+    const std::time_t now = std::time(nullptr);
+    const std::tm *local = std::localtime(&now);
+    return local ? local->tm_hour + local->tm_min / 60.0f + local->tm_sec / 3600.0f : 12.0f;
+  }
+  case 2: {
+    // An in-game hour per real minute, starting at noon.
+    const double seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    return static_cast<float>(std::fmod(12.0 + seconds / 60.0, 24.0));
+  }
+  case 3: return 6.8f;
+  case 4: return 12.0f;
+  case 5: return 18.6f;
+  default: return 1.0f;  // night
+  }
+}
+
+// Sends the current tint to the camera mod (moderngekko.world.set_tint) when
+// it changes; all zeros turn it off.
+void UpdateTimeOfDay(const std::shared_ptr<Menu> &menu, bool force = false) {
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && now - menu->tint_sent < std::chrono::milliseconds(500))
+    return;
+  menu->tint_sent = now;
+  std::array<int, 9> gains{};
+  if (menu->time_of_day > 0) {
+    const auto g = TimeOfDayGains(TimeOfDayHour(menu->time_of_day));
+    for (std::size_t i = 0; i < 9; ++i)
+      gains[i] = static_cast<int>(std::lround(g[i] * 1000.0f));
+  }
+  if (!force && gains == menu->applied_tint)
+    return;
+  menu->applied_tint = gains;
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), gains] {
+    const auto state = weak.lock();
+    if (!state)
+      return;
+    std::lock_guard lock(state->mods_mutex);
+    if (!state->active || !state->mods)
+      return;
+    for (const auto &mod : state->mods->GetLoadedMods()) {
+      if (auto function = state->mods->FindExport(mod.id, "moderngekko.world.set_tint")) {
+        CPUState cpu{};
+        for (std::size_t i = 0; i < 9; ++i)
+          cpu.gpr[3 + i] = static_cast<u32>(gains[i]);
+        function(&cpu);
+        break;
+      }
+    }
+  });
+}
 
 // Game speed in the camera mod (moderngekko.game.configure).
 void ConfigureGame(const std::shared_ptr<Menu> &menu) {
@@ -1013,7 +1105,8 @@ std::string AdapterLabel(const Menu &menu) {
 constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
 constexpr int kBattleSpeedRow = kFirstPersonSensitivityRow + 1;
 constexpr int kTextSpeedRow = kBattleSpeedRow + 1;
-constexpr int kMotionTestRow = kTextSpeedRow + 1;
+constexpr int kTimeOfDayRow = kTextSpeedRow + 1;
+constexpr int kMotionTestRow = kTimeOfDayRow + 1;
 constexpr int kSpinTestRow = kMotionTestRow + 1;
 constexpr int kSettingsRows = kPresetRows + kSpinTestRow + 2;  // + Back
 constexpr double kSpinTestSeconds = 6.0;
@@ -1275,6 +1368,15 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     SaveGameSpeed(*menu);
     ConfigureGame(menu);
     break;
+  case kTimeOfDayRow: {
+    menu->time_of_day = (menu->time_of_day + (direction < 0 ? 6 : 1)) % 7;
+    Common::IniFile ini;
+    ini.Load(menu->config_path);
+    ini.GetOrCreateSection("World")->Set("TimeOfDay", menu->time_of_day);
+    ini.Save(menu->config_path);
+    UpdateTimeOfDay(menu, true);
+    break;
+  }
   case kMotionTestRow:
     // Closes the menu so the lanes animate at the game's present rate.
     menu->motion_test = !menu->motion_test;
@@ -1445,6 +1547,9 @@ std::vector<std::string> Rows(const Menu &menu) {
         std::string("Text speed   ") +
             std::array<const char *, 4>{"Normal", "Fast", "Faster", "Instant"}[static_cast<std::size_t>(
                 std::clamp(menu.text_speed, 0, 3))],
+        std::string("Time of day   ") +
+            std::array<const char *, 7>{"Off", "Real clock", "Fast cycle", "Dawn", "Day", "Evening",
+                                        "Night"}[static_cast<std::size_t>(std::clamp(menu.time_of_day, 0, 6))],
         enabled("Motion test (60 / 120 / 240 Hz lanes)", menu.motion_test),
         "Camera spin test (6 s, C-stick held right)",
         "Back"};
@@ -1494,6 +1599,8 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
   section->Get("FirstPersonSensitivity", &menu->first_person_sensitivity, 0);
   {
     auto *gameplay = ini.GetOrCreateSection("Gameplay");
+    ini.GetOrCreateSection("World")->Get("TimeOfDay", &menu->time_of_day, 0);
+    menu->time_of_day = std::clamp(menu->time_of_day, 0, 6);
     gameplay->Get("TextSpeed", &menu->text_speed, 0);
     gameplay->Get("BattleSpeed", &menu->battle_speed, 1);
     gameplay->Get("SkipIntro", &menu->skip_intro, false);
@@ -1762,6 +1869,8 @@ void DrawSpinTest(const Menu &menu) {
 
 // The menu font: Colosseum's own (MenuFont() in colosseum_font) or ImGui's.
 ImFont *MenuFont();
+// Colosseum's face icon for an internal species id (pokemon_icons.cpp).
+bool PokemonIcon(int species, ImTextureRef *texture, ImVec2 *uv0, ImVec2 *uv1);
 
 // Settings rows grouped like the game's own option screens.
 const char *SettingsSection(std::size_t row) {
@@ -1775,6 +1884,7 @@ const char *SettingsSection(std::size_t row) {
   case static_cast<std::size_t>(kPresetRows + kFirstAmdRow): return "AMD RADEON";
   case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
   case static_cast<std::size_t>(kPresetRows + kBattleSpeedRow): return "BATTLE SPEED";
+  case static_cast<std::size_t>(kPresetRows + kTimeOfDayRow): return "WORLD";
   case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
   default: return nullptr;
   }
@@ -1902,7 +2012,7 @@ void Draw() {
 
   // Row geometry: Start-menu buttons on the short pages, panels in the lists.
   const float button_h = 68 * s, button_gap = 12 * s;
-  const float panel_h = 50 * s, panel_gap = 8 * s, section_h = 38 * s;
+  const float panel_h = (page == Page::Shadow ? 64.0f : 50.0f) * s, panel_gap = 8 * s, section_h = 38 * s;
   float list_content_h = 0;
   if (list_page) {
     for (std::size_t row = 0; row < rows.size(); ++row)
@@ -1999,7 +2109,24 @@ void Draw() {
         rows_draw->AddTriangleFilled(ImVec2(cx - 6 * s, cy - 8 * s), ImVec2(cx - 6 * s, cy + 8 * s),
                                      ImVec2(cx + 6 * s, cy), col::kFocusGreen);
       }
-      st::OutlinedText(rows_draw, font, row_size, ImVec2(a.x + 36 * s, ty), dim, label, 1.5f * s);
+      float label_x = a.x + 36 * s;
+      // Shadow Pokemon: the game's face icon in a small framed box.
+      if (page == Page::Shadow && row < menu->shadow.entries.size()) {
+        ImTextureRef icon;
+        ImVec2 uv0, uv1;
+        if (PokemonIcon(menu->shadow.entries[row].species, &icon, &uv0, &uv1)) {
+          const float box = panel_h - 10 * s;
+          const ImVec2 i0(a.x + 34 * s, a.y + 5 * s), i1(i0.x + box, i0.y + box);
+          rows_draw->AddRectFilled(ImVec2(i0.x - 2 * s, i0.y - 2 * s), ImVec2(i1.x + 2 * s, i1.y + 2 * s),
+                                   col::kPanelFrameLight, 4 * s);
+          rows_draw->AddRectFilled(i0, i1, st::Rgb(6, 20, 16), 3 * s);
+          const bool dark = menu->shadow.entries[row].status == shadow::Status::Unseen;
+          rows_draw->AddImage(icon, i0, i1, uv0, uv1,
+                              dark ? st::Rgb(0, 0, 0, 255) : IM_COL32_WHITE);  // silhouette if unseen
+          label_x = i1.x + 14 * s;
+        }
+      }
+      st::OutlinedText(rows_draw, font, row_size, ImVec2(label_x, ty), dim, label, 1.5f * s);
       if (!value.empty()) {
         ImU32 value_color = col::kYellow;
         std::string shown = value;
@@ -2222,6 +2349,7 @@ void Host_PauseMenuTick() {
     return;
   menu->last_poll = poll_time;
   UpdateDepthOfField(menu);
+  UpdateTimeOfDay(menu);
   // Auto first-person turn speed follows the frame rate, the field of view and
   // the window's aspect ratio (fullscreen / ultrawide changes).
   if (menu->first_person_sensitivity == 0) {
