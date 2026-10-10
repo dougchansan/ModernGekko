@@ -78,6 +78,8 @@ struct Menu {
   std::array<std::atomic<bool>, 256> pressed_keys{};
   std::atomic<bool> active{true}, open{false}, blocked{false}, toggle{false};
   bool select_was_down = false;  // controller Back / Select / Minus edge
+  bool run_click_was_down = false;  // left stick click edge
+  bool running = false;
   // Start pressed without Z: polls it has been held back from the game, so a
   // Z arriving a poll later still makes the menu chord instead of opening the
   // game's own pause screen (-1: Start released to the game until let go).
@@ -412,6 +414,50 @@ bool SelectButtonDown() {
       return true;
   }
   return false;
+}
+
+// Left stick click (L3), which the GameCube pad does not have: read from the
+// controller device directly, like the Back button above.
+bool LeftStickClickDown() {
+  if (!Pad::IsInitialized() || !Pad::GetConfig() || !Pad::GetConfig()->GetControllerCount())
+    return false;
+  ciface::Core::DeviceQualifier qualifier;
+  {
+    auto lock = ControllerEmu::EmulatedController::GetStateLock();
+    qualifier = Pad::GetConfig()->GetController(0)->GetDefaultDevice();
+  }
+  const auto device = g_controller_interface.FindDevice(qualifier);
+  if (!device)
+    return false;
+  for (const auto *input : device->Inputs()) {
+    const std::string name = input->GetName();
+    if ((name == "Thumb L" || name == "Left Thumb" || name == "Left Stick" ||
+         name == "Left Stick Button" || name == "L3" || name == "Button L3" ||
+         name == "Button Thumb L") &&
+        input->GetState() > 0.5)
+      return true;
+  }
+  return false;
+}
+
+// Run (left stick click toggles): Wes and Rui move and animate twice as fast.
+void SetRun(const std::shared_ptr<Menu> &menu, bool running) {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), running] {
+    const auto state = weak.lock();
+    if (!state)
+      return;
+    std::lock_guard lock(state->mods_mutex);
+    if (!state->active || !state->mods)
+      return;
+    for (const auto &mod : state->mods->GetLoadedMods()) {
+      if (auto function = state->mods->FindExport(mod.id, "moderngekko.player.set_run")) {
+        CPUState cpu{};
+        cpu.gpr[3] = running ? 1 : 0;
+        function(&cpu);
+        break;
+      }
+    }
+  });
 }
 
 std::string Device() {
@@ -1367,6 +1413,11 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     menu->spin_start_ns = start;
     menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
   }
+  // MODERNGEKKO_TEST_RUN=1: start with running on (as a left stick click).
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_RUN"); test && *test == '1') {
+    menu->running = true;
+    SetRun(menu, true);
+  }
   // MODERNGEKKO_TEST_RESTART=<seconds>: test hook choosing Restart game.
   if (const char *test = std::getenv("MODERNGEKKO_TEST_RESTART"); test && *test) {
     const int delay = std::atoi(test);
@@ -1732,6 +1783,17 @@ void Host_PauseMenuTick() {
       }
     }
     menu->select_was_down = select;
+  }
+  // Left stick click toggles running while playing.
+  {
+    const bool click = input.game_running && !menu->policy.is_open() && LeftStickClickDown();
+    if (click && !menu->run_click_was_down) {
+      menu->running = !menu->running;
+      menu->status = menu->running ? "Running" : "Walking";
+      std::fprintf(stderr, "[player] run %s\n", menu->running ? "on" : "off");
+      SetRun(menu, menu->running);
+    }
+    menu->run_click_was_down = click;
   }
   const bool requested_toggle = menu->toggle.exchange(false);
   const double now = std::chrono::duration<double>(
