@@ -1670,7 +1670,7 @@ void Draw() {
   } else {
     list_content_h = rows.size() * (button_h + button_gap);
   }
-  const float controls_h = page == Page::Controls ? 210 * s : 0;
+  const float controls_h = page == Page::Controls ? 300 * s : 0;
   const float list_h = std::min(list_content_h + 8 * s,
                                 max_h - header_h - footer_h - controls_h - gap * 4);
   const float total_h = header_h + gap + list_h + gap + controls_h + footer_h;
@@ -1849,13 +1849,16 @@ void Draw() {
         {"A / Enter", "Select"},                    {"B / Backspace", "Back"},
         {"C-stick", "Orbit the camera"},            {"Z + Y", "Free camera"},
         {"Z + X", "First person"},                  {"Left stick click", "Run"},
+        {"Left stick", "Free cam: fly"},          {"C-stick", "Free cam: look"},
+        {"R / L", "Free cam: rise / sink"},          {"Z + D-pad Down", "Reset camera"},
     };
     // One entry per line: the button in yellow, what it does in white.
     const float guide_size = row_size * 0.82f;
     const float column = (b.x - a.x) * 0.5f;
-    for (int i = 0; i < 8; ++i) {
+    constexpr int kEntries = static_cast<int>(std::size(kGuide));
+    for (int i = 0; i < kEntries; ++i) {
       const float cx = a.x + 26 * s + (i % 2) * column;
-      const float cy = a.y + 16 * s + (i / 2) * ((b.y - a.y - 32 * s) / 4.0f);
+      const float cy = a.y + 16 * s + (i / 2) * ((b.y - a.y - 32 * s) / (kEntries / 2));
       st::OutlinedText(draw, font, guide_size, ImVec2(cx, cy), col::kYellow, kGuide[i][0], 1.3f * s);
       st::OutlinedText(draw, font, guide_size, ImVec2(cx + column * 0.48f, cy), col::kWhite,
                        kGuide[i][1], 1.3f * s);
