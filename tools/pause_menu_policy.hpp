@@ -5,13 +5,14 @@
 
 namespace moderngekko::pause_menu {
 
-enum class Page { Closed, Home, Settings, Controls, QuitConfirm };
+enum class Page { Closed, Home, Settings, Controls, QuitConfirm, RestartConfirm };
 enum class Action {
   None,
   Resume,
   Settings,
   Controls,
   SaveCheckpoint,
+  Restart,
   Quit,
   AdjustSetting,
   ToggleFullscreen,
@@ -58,12 +59,13 @@ public:
       return custom_rows_;
     switch (page_) {
     case Page::Home:
-      return 5;
+      return 6;
     case Page::Settings:
       return 4;
     case Page::Controls:
       return 1;
     case Page::QuitConfirm:
+    case Page::RestartConfirm:
       return 2;
     default:
       return 0;
@@ -116,6 +118,10 @@ public:
       case 3:
         return Action::SaveCheckpoint;
       case 4:
+        page_ = Page::RestartConfirm;
+        focus_ = 0;
+        return Action::None;
+      case 5:
         page_ = Page::QuitConfirm;
         focus_ = 0;
         return Action::None;
@@ -130,6 +136,11 @@ public:
         return back();
       close();
       return Action::Quit;
+    case Page::RestartConfirm:
+      if (row == 0)
+        return back();
+      close();
+      return Action::Restart;
     default:
       break;
     }

@@ -1883,6 +1883,9 @@ void Host_SetUltrawideEfbScale(int scale)
     state->ui_status += " (session only)";
 }
 
+void Host_SaveCameraForState(const std::string& state_path);
+void Host_RestoreCameraForState(const std::string& state_path);
+
 bool Host_IsHighResolutionTexturesEnabled()
 {
   NavigationOverlayState* const state =
@@ -1890,6 +1893,8 @@ bool Host_IsHighResolutionTexturesEnabled()
   return state &&
          state->hires_textures_enabled.load(std::memory_order_relaxed);
 }
+
+void Host_ToggleCommunityHdTexturePack();
 
 void Host_ToggleHighResolutionTextures()
 {
@@ -1900,8 +1905,20 @@ void Host_ToggleHighResolutionTextures()
 
   const bool enabled =
       !state->hires_textures_enabled.load(std::memory_order_relaxed);
+  // The HD textures are the community pack in User/ResourcePacks: turning HD
+  // textures on installs it (once) when it is there and not yet enabled.
+  if (enabled && !state->community_hd_texture_pack_enabled.load(std::memory_order_relaxed) &&
+      moderngekko::GetCommunityHdTexturePackStatus(state->frontend_config_path.parent_path())
+          .available)
+  {
+    Host_ToggleCommunityHdTexturePack();
+    return;
+  }
   Config::SetCurrent(Config::GFX_HIRES_TEXTURES, enabled);
   state->hires_textures_enabled.store(enabled, std::memory_order_relaxed);
+  // Rebuild the list of replacement files (a toggle alone left it empty).
+  if (enabled)
+    HiresTexture::Update();
 
   AsyncRequests::GetInstance()->PushEvent([] {
     if (g_texture_cache)
@@ -2602,9 +2619,11 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
   case automation::CommandType::SaveState:
     std::filesystem::create_directories(command.path.parent_path());
     State::SaveAs(system, command.path.string());
+    Host_SaveCameraForState(command.path.string());
     break;
   case automation::CommandType::LoadState:
     State::LoadAs(system, command.path.string());
+    Host_RestoreCameraForState(command.path.string());
     break;
   case automation::CommandType::Screenshot:
     SaveAutomationScreenshot(NormalizeScreenshotPath(command.path));
@@ -2881,6 +2900,9 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
     EnsureAutomationDirectories(root);
   auto next_status_write = std::chrono::steady_clock::now();
   auto watchdog_last_frame_time = std::chrono::steady_clock::now();
+  // Emulated time when the last frame appeared: a guest hang keeps emulating
+  // (time advances), a host/driver stall blocks emulation (it does not).
+  s64 watchdog_last_frame_ticks = 0;
   std::uint64_t watchdog_last_frame =
       impl.automation_state.frame_count.load(std::memory_order_relaxed);
   while (!stop_token.stop_requested())
@@ -2935,6 +2957,7 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
       if (!save_path.empty())
       {
         State::SaveAs(Core::System::GetInstance(), save_path.string());
+        Host_SaveCameraForState(save_path.string());
         if (save_is_recovery)
         {
           std::ofstream recovery_pointer(
@@ -2954,6 +2977,7 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
               true, std::memory_order_relaxed);
         }
         State::LoadAs(Core::System::GetInstance(), load_path.string());
+        Host_RestoreCameraForState(load_path.string());
       }
       if (reset_requested)
       {
@@ -2971,16 +2995,38 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
     const auto watchdog_now = std::chrono::steady_clock::now();
     const std::uint64_t watchdog_current_frame =
         impl.automation_state.frame_count.load(std::memory_order_relaxed);
+    const s64 watchdog_ticks =
+        Core::System::GetInstance().GetCoreTiming().GetTicks();
     if (watchdog_current_frame != watchdog_last_frame)
     {
       watchdog_last_frame = watchdog_current_frame;
       watchdog_last_frame_time = watchdog_now;
+      watchdog_last_frame_ticks = watchdog_ticks;
     }
     else if (impl.config.qol.crash_watchdog && impl.booted &&
              Core::GetState(Core::System::GetInstance()) == Core::State::Running &&
              watchdog_now - watchdog_last_frame_time >=
                  std::chrono::seconds(impl.config.qol.crash_watchdog_seconds))
     {
+      // Only a stalled guest is a crash. When emulation itself was blocked for
+      // most of the stall (the GPU thread or the driver holding frames, e.g.
+      // AMD Fluid Motion Frames engaging), loading a recovery state would only
+      // throw away progress.
+      const s64 ticks_per_second =
+          Core::System::GetInstance().GetSystemTimers().GetTicksPerSecond();
+      const s64 emulated = watchdog_ticks - watchdog_last_frame_ticks;
+      if (emulated < ticks_per_second * impl.config.qol.crash_watchdog_seconds / 2)
+      {
+        std::fprintf(stderr,
+                     "[watchdog] %d-second frame stall with emulation blocked (%.1f s emulated): "
+                     "not restoring a state\n",
+                     impl.config.qol.crash_watchdog_seconds,
+                     static_cast<double>(emulated) / static_cast<double>(ticks_per_second));
+        watchdog_last_frame_time = watchdog_now;
+        watchdog_last_frame_ticks = watchdog_ticks;
+      }
+      else
+      {
       const auto recovery = moderngekko::frontend::LatestAutomatic(
           impl.navigation_overlay.savestate_directory, "recovery-room");
       if (recovery)
@@ -3010,6 +3056,7 @@ void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
                 impl.config.qol.crash_watchdog_seconds));
       }
       watchdog_last_frame_time = watchdog_now;
+      }
     }
 
     if (external_commands)

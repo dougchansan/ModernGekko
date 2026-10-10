@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -121,9 +122,14 @@ int Query(Feature feature) {
 }
 
 bool Apply(Feature feature, bool enabled) {
-  return WithFeature(feature, false, [enabled](auto &p) {
+  const auto start = std::chrono::steady_clock::now();
+  const bool ok = WithFeature(feature, false, [enabled](auto &p) {
     return ADLX_SUCCEEDED(p->SetEnabled(enabled));
   });
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  std::fprintf(stderr, "[amd] %s -> %s %s (%.0f ms)\n", kNames[static_cast<int>(feature)],
+               enabled ? "on" : "off", ok ? "ok" : "refused", ms);
+  return ok;
 }
 
 bool Load() {

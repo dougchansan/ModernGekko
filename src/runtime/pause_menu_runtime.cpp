@@ -7,6 +7,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/HW/GCPad.h"
+#include "Core/HW/ProcessorInterface.h"
 #include "Core/Host.h"
 #include "Core/SavestateLayout.h"
 #include "Core/State.h"
@@ -16,6 +17,7 @@
 #include "InputCommon/GCPadStatus.h"
 #include "InputCommon/InputConfig.h"
 #include "VideoCommon/AsyncRequests.h"
+#include "VideoCommon/CameraWarp.h"
 #include "VideoCommon/Present.h"
 #include "VideoCommon/VideoConfig.h"
 #include "moderngekko/cpu_state.h"
@@ -25,6 +27,7 @@
 #include "pause_menu_host.hpp"
 #include "pause_menu_policy.hpp"
 #include <cstdio>
+#include <fstream>
 #include <cstdlib>
 #include <algorithm>
 #include <array>
@@ -63,6 +66,7 @@ void Host_SetExclusiveFullscreen(bool exclusive);
 bool Host_IsExclusiveFullscreen();
 void Host_SetFastForwardActive(bool active);
 void Host_SetPauseMenuResolution(int scale);
+void Host_SaveCameraForState(const std::string &state_path);
 
 namespace moderngekko::pause_menu {
 namespace {
@@ -74,11 +78,18 @@ struct Menu {
   std::array<std::atomic<bool>, 256> pressed_keys{};
   std::atomic<bool> active{true}, open{false}, blocked{false}, toggle{false};
   bool select_was_down = false;  // controller Back / Select / Minus edge
+  // Start pressed without Z: polls it has been held back from the game, so a
+  // Z arriving a poll later still makes the menu chord instead of opening the
+  // game's own pause screen (-1: Start released to the game until let go).
+  int start_held_polls = 0;
   std::atomic<bool> repaint_pending{false};
   ModManager *mods = nullptr;
   std::string config_path;
   // config.ini [Video] backend (the Graphics API used from the next launch).
   std::string graphics_backend = "Vulkan";
+  // GPU (GFX.ini [Hardware] Adapter) chosen on the menu row; applied with
+  // Enter / A by restarting in place like a graphics API switch.
+  int adapter = -1;
   // Graphics API switch in progress: the menu shows a reloading prompt, the
   // game stays paused and input is ignored until the new session takes over.
   std::atomic<bool> switching{false};
@@ -87,8 +98,13 @@ struct Menu {
   int depth_of_field = 0;
   // First-person horizontal FOV at 16:9 in degrees (0 = game default) and the
   // centre dot (config.ini [Camera] FirstPersonFov / FirstPersonDot).
-  int first_person_fov = 0;
+  int first_person_fov = 100;  // wide enough to play comfortably from the start
   bool first_person_dot = true;
+  // First-person turn speed in percent; 0 = Auto (from the frame rate and the
+  // field of view, see AutoFirstPersonSensitivity). config.ini [Camera]
+  // FirstPersonSensitivity.
+  int first_person_sensitivity = 0;
+  int applied_auto_sensitivity = -1;  // last Auto value sent to the mod
   std::atomic<bool> first_person_active{false};
   // Radeon settings (config.ini [AMD]): -1 leave the driver's value, 0 off,
   // 1 on; and the driver's reported state (-1 unsupported), refreshed when the
@@ -106,9 +122,25 @@ struct Menu {
   bool camera_available = false;
   std::chrono::steady_clock::time_point last_repaint{};
   std::chrono::steady_clock::time_point last_poll{};
+  std::chrono::steady_clock::time_point last_look_poll{};
+  // Motion test overlay (60 / 120 / 240 Hz lanes) and the camera spin test:
+  // a full-right look stick between these steady_clock times (ns).
+  std::atomic<bool> motion_test{false};
+  std::atomic<long long> spin_start_ns{0}, spin_end_ns{0};
 };
 std::atomic<std::shared_ptr<Menu>> current;
 thread_local bool polling_menu = false;
+
+long long SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+bool SpinTestActive(const Menu &menu) {
+  const long long now = SteadyNs();
+  return now >= menu.spin_start_ns.load() && now < menu.spin_end_ns.load();
+}
 
 void Filter(int port, GCPadStatus &pad) {
   if (port != 0 || polling_menu)
@@ -116,8 +148,24 @@ void Filter(int port, GCPadStatus &pad) {
   const auto menu = current.load();
   if (!menu || !menu->active)
     return;
+  // Camera spin test: the C-stick held fully right.
+  if (SpinTestActive(*menu) && !menu->blocked)
+    pad.substickX = 255;
   const bool chord = (pad.button & (PAD_BUTTON_START | PAD_TRIGGER_Z)) ==
                      (PAD_BUTTON_START | PAD_TRIGGER_Z);
+  // Hold a fresh Start back for a few polls (~50 ms at 60 Hz); if Z does not
+  // follow, the game gets Start for as long as it stays held.
+  constexpr int kStartGracePolls = 3;
+  if (!(pad.button & PAD_BUTTON_START)) {
+    menu->start_held_polls = 0;
+  } else if (!chord && menu->start_held_polls >= 0) {
+    if (++menu->start_held_polls <= kStartGracePolls)
+      pad.button &= ~PAD_BUTTON_START;
+    else
+      menu->start_held_polls = -1;
+  } else if (chord) {
+    menu->start_held_polls = -1;  // the chord owns this press
+  }
   if (menu->blocked || menu->toggle || menu->switching || chord) {
     const bool connected = pad.isConnected;
     pad = GCPadStatus{};
@@ -125,12 +173,18 @@ void Filter(int port, GCPadStatus &pad) {
   }
 }
 
+int CurrentFrameRate();
+int AutoFirstPersonSensitivity(const Menu &menu);
+
 void Camera(const std::shared_ptr<Menu> &menu, bool recenter = false) {
   const int sensitivity = menu->sensitivity;
   const bool invert = menu->invert_y;
+  const int first_person = menu->first_person_sensitivity > 0
+                               ? menu->first_person_sensitivity
+                               : AutoFirstPersonSensitivity(*menu);
   Core::RunOnCPUThread(
       Core::System::GetInstance(),
-      [weak = std::weak_ptr(menu), sensitivity, invert, recenter] {
+      [weak = std::weak_ptr(menu), sensitivity, invert, first_person, recenter] {
         const auto state = weak.lock();
         if (!state)
           return;
@@ -144,6 +198,7 @@ void Camera(const std::shared_ptr<Menu> &menu, bool recenter = false) {
             CPUState cpu{};
             cpu.gpr[3] = sensitivity;
             cpu.gpr[4] = invert;
+            cpu.gpr[5] = static_cast<u32>(first_person);
             function(&cpu);
             break;
           }
@@ -200,6 +255,26 @@ void RestoreCameraState(const std::shared_ptr<Menu> &menu, const std::string &en
 }
 
 constexpr std::array<int, 10> kFirstPersonFovs{0, 70, 80, 90, 100, 110, 120, 130, 140, 150};
+
+// Auto first-person turn speed: at full stick each displayed frame turns the
+// view by a fixed share of the screen width (0.6%), so motion steps look the
+// same size at any frame rate - faster turning at 240 FPS, gentler at 60. The
+// width is the real horizontal field of view at the window's aspect ratio
+// (ultrawide sees more degrees across the same pixels).
+int AutoFirstPersonSensitivity(const Menu &menu) {
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double kStepOfWidth = 0.006;
+  constexpr double kGameFovAt169 = 80.0;  // degrees, the game's first-person default
+  double aspect = 16.0 / 9.0;
+  if (g_presenter && g_presenter->GetBackbufferHeight() > 0)
+    aspect = static_cast<double>(g_presenter->GetBackbufferWidth()) /
+             g_presenter->GetBackbufferHeight();
+  const double fov169 = (menu.first_person_fov > 0 ? menu.first_person_fov : kGameFovAt169) * kPi / 180.0;
+  const double hfov = 2.0 * std::atan(std::tan(fov169 * 0.5) * aspect / (16.0 / 9.0));
+  const double rad_per_second = kStepOfWidth * CurrentFrameRate() * hfov;
+  // The mod turns 2 rad/s at 100%.
+  return std::clamp(static_cast<int>(std::lround(rad_per_second / 2.0 * 100.0)), 40, 250);
+}
 
 void ApplyFirstPersonFov(const std::shared_ptr<Menu> &menu) {
   std::lock_guard lock(menu->mods_mutex);
@@ -397,7 +472,22 @@ int CurrentFrameRate() {
   return s_frame_rate_240.load() ? 240 : 120;
 }
 
+int DisplayRefreshRate();
+
 void SetFrameRate(const std::shared_ptr<Menu> &menu, int rate) {
+  // AMD Fluid Motion Frames doubles every presented frame. Above half the
+  // display's refresh rate its pacing collapses (multi-second stalls at 240 on
+  // a 240 Hz display), so keep frame generation at half the refresh rate and
+  // let the driver double it.
+  if (rate > 60 && amd::State(amd::Feature::FluidMotionFrames) == 1) {
+    const int half = DisplayRefreshRate() / 2;
+    const int cap = half >= 240 ? 240 : half >= 120 ? 120 : 60;
+    if (rate > cap) {
+      rate = cap;
+      menu->status = "Fluid Motion Frames is on: game set to " + std::to_string(cap) +
+                     " FPS (the driver doubles it to " + std::to_string(cap * 2) + ")";
+    }
+  }
   if ((rate >= 60) != Host_IsSixtyFpsEnabled())
     Host_ToggleSixtyFps();
   const bool interp = rate >= 120;
@@ -679,10 +769,64 @@ std::string PresetLabel() {
 // labels index them from 0 after the preset).
 constexpr int kPresetRows = 1;
 
+// 240 Hz camera: the look stick for CameraWarp, read every ~2 ms (the menu's
+// own poll runs at 60 Hz). Same dead zone and scale as the camera mod's axis():
+// the game's PADStatus C-stick is the raw value less its 128 origin.
+float LookAxis(u8 raw) {
+  const int v = static_cast<int>(raw) - 128;
+  int magnitude = std::min(std::abs(v), 80);
+  if (magnitude <= 12)
+    return 0.0f;
+  return static_cast<float>(magnitude - 12) / 68.0f * (v < 0 ? -1.0f : 1.0f);
+}
+
+void PublishLookInput(Menu &menu, std::chrono::steady_clock::time_point now) {
+  if (!CameraWarp::IsEnabled() || !Pad::IsInitialized() || menu.policy.is_open() ||
+      Core::GetState(Core::System::GetInstance()) != Core::State::Running) {
+    CameraWarp::SetLookInput(0, 0);
+    return;
+  }
+  if (now - menu.last_look_poll < std::chrono::milliseconds(2))
+    return;
+  menu.last_look_poll = now;
+  g_controller_interface.UpdateInput();
+  polling_menu = true;
+  const GCPadStatus pad = Pad::GetStatus(0);
+  polling_menu = false;
+  if (SpinTestActive(menu))
+    CameraWarp::SetLookInput(1.0f, 0.0f);
+  else
+    CameraWarp::SetLookInput(LookAxis(pad.substickX), LookAxis(pad.substickY));
+}
+
 // Dual core row, then the Radeon settings rows in amd::Feature order (row
 // numbers after the preset).
-constexpr int kDualCoreRow = 20;
-constexpr int kFirstAmdRow = 21;
+constexpr int kAdapterRow = 20;
+constexpr int kDualCoreRow = 21;
+constexpr int kCamera240Row = 22;
+constexpr int kFirstAmdRow = 23;
+
+// The current graphics API's GPUs (index = GFX.ini [Hardware] Adapter).
+const std::vector<std::string> &Adapters() { return g_backend_info.Adapters; }
+
+std::string AdapterLabel(const Menu &menu) {
+  const auto &adapters = Adapters();
+  const int active = Config::Get(Config::GFX_ADAPTER);
+  const int chosen = menu.adapter < 0 ? active : menu.adapter;
+  std::string name = chosen >= 0 && chosen < static_cast<int>(adapters.size())
+                         ? adapters[static_cast<std::size_t>(chosen)]
+                         : "GPU " + std::to_string(chosen);
+  if (adapters.size() < 2)
+    name += "  (only GPU)";
+  else if (chosen != active)
+    name += "  (Enter / A to apply)";
+  return "GPU   " + name;
+}
+constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
+constexpr int kMotionTestRow = kFirstPersonSensitivityRow + 1;
+constexpr int kSpinTestRow = kMotionTestRow + 1;
+constexpr int kSettingsRows = kPresetRows + kSpinTestRow + 2;  // + Back
+constexpr double kSpinTestSeconds = 6.0;
 
 void RefreshAmdStates(Menu &menu) {
   for (int i = 0; i < amd::kFeatureCount; ++i)
@@ -724,6 +868,8 @@ void CycleAmdSetting(const std::shared_ptr<Menu> &menu, int index, int direction
   const int choice = kOrder[(at + (direction < 0 ? 2 : 1)) % 3];
   if (ApplyAmdChoice(feature, choice)) {
     menu->amd_choice[index] = choice;
+    if (feature == amd::Feature::FluidMotionFrames)
+      SetFrameRate(menu, CurrentFrameRate());  // cap while it doubles frames
     Common::IniFile ini;
     ini.Load(menu->config_path);
     ini.GetOrCreateSection("AMD")->Set(amd::Key(feature), choice);
@@ -869,6 +1015,24 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
 #endif
     }
     break;
+  case kAdapterRow: {
+    const int count = static_cast<int>(Adapters().size());
+    if (count < 2)
+      break;
+    const int active = Config::Get(Config::GFX_ADAPTER);
+    if (!accept) {
+      const int chosen = menu->adapter < 0 ? active : menu->adapter;
+      menu->adapter = ((chosen + (direction < 0 ? -1 : 1)) % count + count) % count;
+    } else if (menu->adapter >= 0 && menu->adapter != active) {
+      // Read at video backend start: save it and restart in place.
+      Config::SetBase(Config::GFX_ADAPTER, menu->adapter);
+      Config::Save();
+#ifdef _WIN32
+      RestartWithGraphicsBackend(menu, Config::Get(Config::MAIN_GFX_BACKEND));
+#endif
+    }
+    break;
+  }
   case kDualCoreRow: {
     // Dolphin reads it at boot: save it and restart in place like a graphics
     // API switch (save state, relaunch, reload).
@@ -883,6 +1047,14 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
 #endif
     break;
   }
+  case kCamera240Row: {
+    // 240 Hz camera (CameraWarp): first-person / free camera turns follow the
+    // look stick at the display rate instead of the 60 Hz game frames.
+    const bool on = !CameraWarp::IsEnabled();
+    CameraWarp::SetEnabled(on);
+    SaveCameraSetting(*menu, "Camera240", on ? 1 : 0);
+    break;
+  }
   case kFirstAmdRow + 0:
   case kFirstAmdRow + 1:
   case kFirstAmdRow + 2:
@@ -891,6 +1063,31 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
   case kFirstAmdRow + 5:
     CycleAmdSetting(menu, row - kFirstAmdRow, direction);
     break;
+  case kFirstPersonSensitivityRow: {
+    // Auto, then 40% .. 250% in steps of 10.
+    int value = menu->first_person_sensitivity;
+    if (value <= 0)
+      value = direction > 0 ? 40 : 250;
+    else
+      value += direction * 10;
+    menu->first_person_sensitivity = value < 40 || value > 250 ? 0 : value;
+    SaveCameraSetting(*menu, "FirstPersonSensitivity", menu->first_person_sensitivity);
+    Camera(menu);
+    break;
+  }
+  case kMotionTestRow:
+    // Closes the menu so the lanes animate at the game's present rate.
+    menu->motion_test = !menu->motion_test;
+    if (menu->motion_test)
+      menu->policy.close();
+    break;
+  case kSpinTestRow: {
+    const long long start = SteadyNs() + 500'000'000;  // after the menu closes
+    menu->spin_start_ns = start;
+    menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
+    menu->policy.close();
+    break;
+  }
   default:
     break;
   }
@@ -910,11 +1107,18 @@ void ActionHost(const std::shared_ptr<Menu> &menu, Action action,
                                        State::Layout::MANUAL_PREFIX);
     if (File::CreateFullPath(path.string())) {
       State::SaveAs(Core::System::GetInstance(), path.string());
+      Host_SaveCameraForState(path.string());
       menu->status = "Checkpoint save requested";
     } else
       menu->status = "Unable to create checkpoint folder";
     break;
   }
+  case Action::Restart:
+    // What the console's RESET button does: back to the title sequence.
+    Core::RunOnCPUThread(Core::System::GetInstance(), [] {
+      Core::System::GetInstance().GetProcessorInterface().ResetButton_Tap();
+    });
+    break;
   case Action::Quit:
     Host_Message(HostMessageID::WMUserStop);
     break;
@@ -951,7 +1155,7 @@ std::vector<std::string> Rows(const Menu &menu) {
   switch (menu.policy.page()) {
   case Page::Home:
     return {"Resume adventure", "Settings", "Controls", "Save checkpoint",
-            "Quit game"};
+            "Restart game", "Quit game"};
   case Page::Settings:
     return {
         PresetLabel(),
@@ -996,13 +1200,22 @@ std::vector<std::string> Rows(const Menu &menu) {
                  (configured != Config::Get(Config::MAIN_GFX_BACKEND) ? "  (Enter / A to apply)"
                                                                        : "");
         }(),
+        AdapterLabel(menu),
         enabled("Dual core (CPU + GPU threads)", Config::Get(Config::MAIN_CPU_THREAD)),
+        enabled("240 Hz camera", CameraWarp::IsEnabled()),
         AmdLabel(menu, amd::Feature::AntiLag),
         AmdLabel(menu, amd::Feature::Chill),
         AmdLabel(menu, amd::Feature::Boost),
         AmdLabel(menu, amd::Feature::ImageSharpening),
         AmdLabel(menu, amd::Feature::EnhancedSync),
         AmdLabel(menu, amd::Feature::FluidMotionFrames),
+        "First-person turn speed   " +
+            (menu.first_person_sensitivity > 0
+                 ? std::to_string(menu.first_person_sensitivity) + "%"
+                 : "Auto (" + std::to_string(AutoFirstPersonSensitivity(menu)) +
+                       "% at " + std::to_string(CurrentFrameRate()) + " FPS)"),
+        enabled("Motion test (60 / 120 / 240 Hz lanes)", menu.motion_test),
+        "Camera spin test (6 s, C-stick held right)",
         "Back"};
   case Page::Controls: {
     std::string name = Device();
@@ -1015,6 +1228,8 @@ std::vector<std::string> Rows(const Menu &menu) {
   }
   case Page::QuitConfirm:
     return {"Keep playing", "Quit game"};
+  case Page::RestartConfirm:
+    return {"Keep playing", "Restart game"};
   default:
     return {};
   }
@@ -1043,8 +1258,17 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
   section->Get("InvertY", &menu->invert_y, false);
   section->Get("DepthOfField", &menu->depth_of_field, 0);
   menu->depth_of_field = std::clamp(menu->depth_of_field, 0, 5);
-  section->Get("FirstPersonFov", &menu->first_person_fov, 0);
+  section->Get("FirstPersonFov", &menu->first_person_fov, 100);
   section->Get("FirstPersonDot", &menu->first_person_dot, true);
+  section->Get("FirstPersonSensitivity", &menu->first_person_sensitivity, 0);
+  if (menu->first_person_sensitivity != 0)
+    menu->first_person_sensitivity = std::clamp(menu->first_person_sensitivity, 40, 250);
+  {
+    bool camera240 = true;
+    section->Get("Camera240", &camera240, true);
+    const char *env = std::getenv("MODERNGEKKO_CAMERA_WARP");
+    CameraWarp::SetEnabled(camera240 && !(env && env[0] == '0'));
+  }
   {
     // Radeon settings: restore values a crashed session left changed (or take
     // over from the previous session during a graphics API switch), then
@@ -1062,6 +1286,8 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
                      amd::Name(static_cast<amd::Feature>(i)));
     }
     RefreshAmdStates(*menu);
+    if (menu->amd_state[static_cast<int>(amd::Feature::FluidMotionFrames)] == 1)
+      SetFrameRate(menu, CurrentFrameRate());
     for (int i = 0; i < amd::kFeatureCount; ++i)
       std::fprintf(stderr, "[amd] %s: %s\n", amd::Name(static_cast<amd::Feature>(i)),
                    menu->amd_state[i] < 0 ? "unsupported" : menu->amd_state[i] ? "on" : "off");
@@ -1085,6 +1311,12 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
 #ifdef _WIN32
     SetEnvironmentVariableA("MODERNGEKKO_CAMERA_STATE", nullptr);
 #endif
+  } else if (config.load_state_path) {
+    // Started from a save state: its camera, if one was saved with it.
+    std::ifstream in(config.load_state_path->string() + ".camera");
+    std::string encoded;
+    if (in && std::getline(in, encoded) && !encoded.empty())
+      RestoreCameraState(menu, encoded);
   }
 #ifdef _WIN32
   // MODERNGEKKO_TEST_GRAPHICS_SWITCH=<Vulkan|D3D12>: test hook that performs
@@ -1114,6 +1346,34 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       std::this_thread::sleep_for(std::chrono::seconds(8));
       std::lock_guard lock(menu->mutex);
       SetFrameRate(menu, rate);
+    }).detach();
+  }
+  // MODERNGEKKO_TEST_AMD_ROW=<0-5>: test hook cycling that Radeon setting (as
+  // Right on its menu row) 12 s after start.
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_AMD_ROW"); test && *test) {
+    const int index = std::clamp(std::atoi(test), 0, amd::kFeatureCount - 1);
+    std::thread([menu, index] {
+      std::this_thread::sleep_for(std::chrono::seconds(12));
+      std::lock_guard lock(menu->mutex);
+      CycleAmdSetting(menu, index, 1);
+    }).detach();
+  }
+  // MODERNGEKKO_TEST_MOTION=1: motion test overlay on from the start;
+  // MODERNGEKKO_TEST_SPIN=<seconds>: start the camera spin test after a delay.
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_MOTION"); test && *test == '1')
+    menu->motion_test = true;
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_SPIN"); test && *test) {
+    const long long start = SteadyNs() + static_cast<long long>(std::atoi(test)) * 1'000'000'000;
+    menu->spin_start_ns = start;
+    menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
+  }
+  // MODERNGEKKO_TEST_RESTART=<seconds>: test hook choosing Restart game.
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_RESTART"); test && *test) {
+    const int delay = std::atoi(test);
+    std::thread([menu, delay] {
+      std::this_thread::sleep_for(std::chrono::seconds(delay));
+      std::lock_guard lock(menu->mutex);
+      ActionHost(menu, Action::Restart);
     }).detach();
   }
   int resolution = 0;
@@ -1171,8 +1431,69 @@ void DrawCentreDot() {
   draw->AddCircleFilled(centre, radius, IM_COL32(255, 255, 255, 220), 16);
 }
 
+// Motion test: three boxes crossing the screen at the same speed, each moved
+// only 60, 120 or 240 times a second. On a display (and frame rate) that fast,
+// the lower lanes visibly step and smear; the measured present rate says what
+// the screen is actually getting.
+void DrawMotionTest() {
+  const auto &io = ImGui::GetIO();
+  static double last = 0, rate = 0;
+  const double t = SteadyNs() * 1e-9;
+  if (last > 0 && t > last && t - last < 0.25)
+    rate = rate <= 0 ? 1.0 / (t - last) : rate * 0.95 + 0.05 / (t - last);
+  last = t;
+  auto *draw = ImGui::GetForegroundDrawList();
+  const float scale = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.5f);
+  const float lane = 70 * scale, box = 46 * scale, margin = 24 * scale;
+  const float top = io.DisplaySize.y * 0.5f - lane * 1.5f - 20 * scale;
+  const float width = io.DisplaySize.x - 2 * margin;
+  draw->AddRectFilled(ImVec2(0, top - 44 * scale), ImVec2(io.DisplaySize.x, top + lane * 3 + 8 * scale),
+                      IM_COL32(0, 0, 0, 215));
+  char text[160];
+  std::snprintf(text, sizeof(text),
+                "MOTION TEST   display %d Hz   presenting %.0f fps   frame rate setting %d   "
+                "(Settings > Motion test to close)",
+                DisplayRefreshRate(), rate, CurrentFrameRate());
+  draw->AddText(nullptr, 22 * scale, ImVec2(margin, top - 38 * scale), IM_COL32(255, 214, 64, 255), text);
+  static constexpr std::array<int, 3> kRates{60, 120, 240};
+  const double speed = width / 1.5;  // one crossing every 1.5 s
+  for (std::size_t i = 0; i < kRates.size(); ++i) {
+    const double step = std::floor(t * kRates[i]) / kRates[i];
+    const float x = margin + static_cast<float>(std::fmod(step * speed, width - box));
+    const float y = top + lane * static_cast<float>(i);
+    draw->AddRectFilled(ImVec2(margin, y + lane - 3 * scale), ImVec2(margin + width, y + lane - 2 * scale),
+                        IM_COL32(255, 255, 255, 60));
+    draw->AddRectFilled(ImVec2(x, y + (lane - box) * 0.5f), ImVec2(x + box, y + (lane + box) * 0.5f),
+                        IM_COL32(240, 240, 255, 255));
+    std::snprintf(text, sizeof(text), "%d Hz%s", kRates[i],
+                  rate + 5 < kRates[i] ? "  (above the present rate: looks like the lanes below)" : "");
+    draw->AddText(nullptr, 20 * scale, ImVec2(margin + 6 * scale, y + 4 * scale), IM_COL32(120, 220, 255, 255),
+                  text);
+  }
+}
+
+void DrawSpinTest(const Menu &menu) {
+  const long long now = SteadyNs();
+  const long long end = menu.spin_end_ns.load();
+  if (now >= end || now < menu.spin_start_ns.load() - 1'000'000'000)
+    return;
+  const auto &io = ImGui::GetIO();
+  const float scale = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.5f);
+  char text[128];
+  std::snprintf(text, sizeof(text), "CAMERA SPIN TEST   %.1f s left   frame rate %d   240 Hz camera %s",
+                (end - now) * 1e-9, CurrentFrameRate(), CameraWarp::IsEnabled() ? "on" : "off");
+  ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2(io.DisplaySize.x, 40 * scale),
+                                                IM_COL32(0, 0, 0, 190));
+  ImGui::GetForegroundDrawList()->AddText(nullptr, 24 * scale, ImVec2(16 * scale, 8 * scale),
+                                          IM_COL32(255, 214, 64, 255), text);
+}
+
 void Draw() {
   const auto menu = current.load();
+  if (menu && menu->motion_test)
+    DrawMotionTest();
+  if (menu)
+    DrawSpinTest(*menu);
   if (menu && !menu->open && !menu->switching && menu->first_person_dot &&
       menu->first_person_active)
     DrawCentreDot();
@@ -1214,7 +1535,8 @@ void Draw() {
   ImGui::SetWindowFontScale(scale * 1.5f);
   ImGui::TextColored(ImVec4(1, 0.83f, 0.25f, 1), "POKEMON COLOSSEUM");
   ImGui::TextUnformatted(
-      menu->policy.page() == Page::QuitConfirm ? "Leave your adventure?"
+      menu->policy.page() == Page::QuitConfirm      ? "Leave your adventure?"
+      : menu->policy.page() == Page::RestartConfirm ? "Restart from the title screen? Unsaved progress is lost."
       : menu->policy.page() == Page::Settings  ? "Settings"
       : menu->policy.page() == Page::Controls  ? "Controls"
                                                : "Adventure paused");
@@ -1283,6 +1605,29 @@ void Draw() {
 }
 } // namespace moderngekko::pause_menu
 
+// Save states hold guest memory only; the camera mod's angle (orbit yaw,
+// pitch, zoom, free camera) lives in the mod, so a state reloaded with
+// another view. Keep it next to the state as <state>.camera.
+void Host_SaveCameraForState(const std::string &state_path) {
+  const auto menu = moderngekko::pause_menu::current.load();
+  if (!menu || state_path.empty())
+    return;
+  const std::string encoded = moderngekko::pause_menu::ReadCameraState(menu);
+  if (encoded.empty())
+    return;
+  std::ofstream out(state_path + ".camera", std::ios::trunc);
+  out << encoded << '\n';
+}
+void Host_RestoreCameraForState(const std::string &state_path) {
+  const auto menu = moderngekko::pause_menu::current.load();
+  if (!menu || state_path.empty())
+    return;
+  std::ifstream in(state_path + ".camera");
+  std::string encoded;
+  if (in && std::getline(in, encoded) && !encoded.empty())
+    moderngekko::pause_menu::RestoreCameraState(menu, encoded);
+}
+
 void Host_PauseMenuKey(int key, bool down) {
   const auto menu = moderngekko::pause_menu::current.load();
   if (menu && key >= 0 && key < 256) {
@@ -1320,10 +1665,21 @@ void Host_PauseMenuTick() {
   if (!menu || !menu->active || menu->switching)
     return;
   const auto poll_time = std::chrono::steady_clock::now();
+  PublishLookInput(*menu, poll_time);
   if (poll_time - menu->last_poll < std::chrono::milliseconds(16))
     return;
   menu->last_poll = poll_time;
   UpdateDepthOfField(menu);
+  // Auto first-person turn speed follows the frame rate, the field of view and
+  // the window's aspect ratio (fullscreen / ultrawide changes).
+  if (menu->first_person_sensitivity == 0) {
+    const int automatic = AutoFirstPersonSensitivity(*menu);
+    if (automatic != menu->applied_auto_sensitivity) {
+      menu->applied_auto_sensitivity = automatic;
+      std::fprintf(stderr, "[camera] first-person turn speed auto %d%%\n", automatic);
+      Camera(menu);
+    }
+  }
   GCPadStatus pad{};
   if (Pad::IsInitialized()) {
     g_controller_interface.UpdateInput();
@@ -1363,7 +1719,11 @@ void Host_PauseMenuTick() {
   // Back / Select / Minus: open straight to Settings, or close the menu.
   {
     const bool select = input.game_running && SelectButtonDown();
-    if (select && !menu->select_was_down) {
+    // A controller whose Back button is also mapped to Z reports Start + Z
+    // as both; let the chord (policy.update below) do the one toggle, or the
+    // menu opens and closes in the same tick (game paused, menu not shown).
+    const bool chord = input.start && input.select;
+    if (select && !menu->select_was_down && !chord) {
       if (menu->policy.is_open()) {
         menu->policy.close();
       } else {
@@ -1378,7 +1738,7 @@ void Host_PauseMenuTick() {
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count();
   const auto page = menu->policy.page();
-  const std::size_t rows = page == Page::Settings   ? 29
+  const std::size_t rows = page == Page::Settings   ? kSettingsRows
                            : page == Page::Controls ? 2
                                                     : 0;
   ActionHost(menu, menu->policy.update(input, now, rows));
