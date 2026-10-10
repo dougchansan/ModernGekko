@@ -5,12 +5,13 @@
 
 namespace moderngekko::pause_menu {
 
-enum class Page { Closed, Home, Settings, Controls, QuitConfirm, RestartConfirm };
+enum class Page { Closed, Home, Settings, Controls, Shadow, QuitConfirm, RestartConfirm };
 enum class Action {
   None,
   Resume,
   Settings,
   Controls,
+  Shadow,
   PhotoMode,
   SaveCheckpoint,
   Restart,
@@ -41,7 +42,7 @@ public:
   bool is_open() const { return page_ != Page::Closed; }
   bool blocks_game_input() const { return is_open() || release_gate_; }
   void set_rows(std::size_t rows) {
-    if (page_ == Page::Settings || page_ == Page::Controls)
+    if (page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow)
       custom_rows_ = rows;
   }
   void reset_edges(const Input &pressed) {
@@ -56,14 +57,15 @@ public:
   }
 
   std::size_t row_count() const {
-    if (custom_rows_ && (page_ == Page::Settings || page_ == Page::Controls))
+    if (custom_rows_ && (page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow))
       return custom_rows_;
     switch (page_) {
     case Page::Home:
-      return 7;
+      return 8;
     case Page::Settings:
       return 4;
     case Page::Controls:
+    case Page::Shadow:
       return 1;
     case Page::QuitConfirm:
     case Page::RestartConfirm:
@@ -117,15 +119,19 @@ public:
         focus_ = 0;
         return Action::Controls;
       case 3:
+        page_ = Page::Shadow;
+        focus_ = 0;
+        return Action::Shadow;
+      case 4:
         close();
         return Action::PhotoMode;
-      case 4:
-        return Action::SaveCheckpoint;
       case 5:
+        return Action::SaveCheckpoint;
+      case 6:
         page_ = Page::RestartConfirm;
         focus_ = 0;
         return Action::None;
-      case 6:
+      case 7:
         page_ = Page::QuitConfirm;
         focus_ = 0;
         return Action::None;
@@ -135,6 +141,8 @@ public:
       return row + 1 == row_count() ? back() : Action::AdjustSetting;
     case Page::Controls:
       return row + 1 == row_count() ? back() : Action::AdjustSetting;
+    case Page::Shadow:
+      return row + 1 == row_count() ? back() : Action::None;
     case Page::QuitConfirm:
       if (row == 0)
         return back();
@@ -189,7 +197,7 @@ public:
     }
     if (back_edge)
       return back();
-    if (rows && (page_ == Page::Settings || page_ == Page::Controls))
+    if (rows && (page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow))
       custom_rows_ = rows;
     const auto count = rows ? rows : row_count();
     if (count == 0)

@@ -249,6 +249,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         src/runtime/dolphin_runtime.cpp
         src/runtime/pause_menu_runtime.cpp
   src/runtime/colosseum_font.cpp
+  src/runtime/shadow_tracker.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )

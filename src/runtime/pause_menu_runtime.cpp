@@ -28,6 +28,7 @@
 #include "pause_menu_host.hpp"
 #include "pause_menu_policy.hpp"
 #include "colosseum_menu_style.hpp"
+#include "shadow_tracker.hpp"
 #include <cstdio>
 #include <ctime>
 #include <fstream>
@@ -118,6 +119,15 @@ struct Menu {
   // FirstPersonSensitivity.
   int first_person_sensitivity = 0;
   int applied_auto_sensitivity = -1;  // last Auto value sent to the mod
+  // Game speed (config.ini [Gameplay]): text 0 normal .. 3 instant, battle
+  // pacing 1..4x, skip the boot logos and movies.
+  // Shadow Pokemon page: read from guest memory when the page opens and about
+  // once a second while it is shown.
+  shadow::Summary shadow;
+  std::chrono::steady_clock::time_point shadow_read{};
+  int text_speed = 0;
+  int battle_speed = 1;
+  bool skip_intro = false;
   std::atomic<bool> first_person_active{false};
   // Radeon settings (config.ini [AMD]): -1 leave the driver's value, 0 off,
   // 1 on; and the driver's reported state (-1 unsupported), refreshed when the
@@ -460,6 +470,40 @@ bool LeftStickClickDown() {
 // idle controller meanwhile). Photos are the frame at its internal resolution,
 // without the overlay, in User/ScreenShots.
 void HandlePhotoMode(const std::shared_ptr<Menu> &menu, const GCPadStatus &pad);
+
+// Game speed in the camera mod (moderngekko.game.configure).
+void ConfigureGame(const std::shared_ptr<Menu> &menu) {
+  const int text = menu->text_speed, battle = menu->battle_speed;
+  const bool skip = menu->skip_intro;
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), text, battle, skip] {
+    const auto state = weak.lock();
+    if (!state)
+      return;
+    std::lock_guard lock(state->mods_mutex);
+    if (!state->active || !state->mods)
+      return;
+    for (const auto &mod : state->mods->GetLoadedMods()) {
+      if (auto function = state->mods->FindExport(mod.id, "moderngekko.game.configure")) {
+        CPUState cpu{};
+        cpu.gpr[3] = static_cast<u32>(text);
+        cpu.gpr[4] = static_cast<u32>(battle);
+        cpu.gpr[5] = skip ? 1 : 0;
+        function(&cpu);
+        break;
+      }
+    }
+  });
+}
+
+void SaveGameSpeed(const Menu &menu) {
+  Common::IniFile ini;
+  ini.Load(menu.config_path);
+  auto *section = ini.GetOrCreateSection("Gameplay");
+  section->Set("TextSpeed", menu.text_speed);
+  section->Set("BattleSpeed", menu.battle_speed);
+  section->Set("SkipIntro", menu.skip_intro);
+  ini.Save(menu.config_path);
+}
 
 // Photo mode in the camera mod (moderngekko.camera.set_photo).
 void SetPhoto(const std::shared_ptr<Menu> &menu, bool on) {
@@ -967,7 +1011,9 @@ std::string AdapterLabel(const Menu &menu) {
   return "GPU   " + name;
 }
 constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
-constexpr int kMotionTestRow = kFirstPersonSensitivityRow + 1;
+constexpr int kTextSpeedRow = kFirstPersonSensitivityRow + 1;
+constexpr int kBattleSpeedRow = kTextSpeedRow + 1;
+constexpr int kMotionTestRow = kBattleSpeedRow + 1;
 constexpr int kSpinTestRow = kMotionTestRow + 1;
 constexpr int kSettingsRows = kPresetRows + kSpinTestRow + 2;  // + Back
 constexpr double kSpinTestSeconds = 6.0;
@@ -1219,6 +1265,16 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     Camera(menu);
     break;
   }
+  case kTextSpeedRow:
+    menu->text_speed = (menu->text_speed + (direction < 0 ? 3 : 1)) % 4;
+    SaveGameSpeed(*menu);
+    ConfigureGame(menu);
+    break;
+  case kBattleSpeedRow:
+    menu->battle_speed = (menu->battle_speed - 1 + (direction < 0 ? 3 : 1)) % 4 + 1;
+    SaveGameSpeed(*menu);
+    ConfigureGame(menu);
+    break;
   case kMotionTestRow:
     // Closes the menu so the lanes animate at the game's present rate.
     menu->motion_test = !menu->motion_test;
@@ -1240,6 +1296,10 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
 void ActionHost(const std::shared_ptr<Menu> &menu, Action action,
                 [[maybe_unused]] int direction = 1) {
   switch (action) {
+  case Action::Shadow:
+    menu->shadow = shadow::Read();
+    menu->shadow_read = std::chrono::steady_clock::now();
+    break;
   case Action::PhotoMode:
     if (!menu->camera_available) {
       menu->status = "Photo mode requires the camera mod.";
@@ -1309,8 +1369,20 @@ std::vector<std::string> Rows(const Menu &menu) {
   };
   switch (menu.policy.page()) {
   case Page::Home:
-    return {"Resume adventure", "Settings", "Controls", "Photo mode",
-            "Save checkpoint", "Restart game", "Quit game"};
+    return {"Resume adventure", "Settings", "Controls", "Shadow Pok\xC3\xA9mon",
+            "Photo mode", "Save checkpoint", "Restart game", "Quit game"};
+  case Page::Shadow: {
+    std::vector<std::string> rows;
+    for (const auto &entry : menu.shadow.entries) {
+      const char *status = entry.status == shadow::Status::Purified ? "PURIFIED"
+                           : entry.status == shadow::Status::Snagged ? "SNAGGED"
+                           : entry.status == shadow::Status::Seen    ? "SEEN"
+                                                                     : "NOT SEEN";
+      rows.push_back(entry.name + "   " + status);
+    }
+    rows.push_back("Back");
+    return rows;
+  }
   case Page::Settings:
     return {
         PresetLabel(),
@@ -1369,6 +1441,10 @@ std::vector<std::string> Rows(const Menu &menu) {
                  ? std::to_string(menu.first_person_sensitivity) + "%"
                  : "Auto (" + std::to_string(AutoFirstPersonSensitivity(menu)) +
                        "% at " + std::to_string(CurrentFrameRate()) + " FPS)"),
+        std::string("Text speed   ") +
+            std::array<const char *, 4>{"Normal", "Fast", "Faster", "Instant"}[static_cast<std::size_t>(
+                std::clamp(menu.text_speed, 0, 3))],
+        "Battle speed   " + std::to_string(menu.battle_speed) + "x",
         enabled("Motion test (60 / 120 / 240 Hz lanes)", menu.motion_test),
         "Camera spin test (6 s, C-stick held right)",
         "Back"};
@@ -1416,6 +1492,14 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
   section->Get("FirstPersonFov", &menu->first_person_fov, 100);
   section->Get("FirstPersonDot", &menu->first_person_dot, true);
   section->Get("FirstPersonSensitivity", &menu->first_person_sensitivity, 0);
+  {
+    auto *gameplay = ini.GetOrCreateSection("Gameplay");
+    gameplay->Get("TextSpeed", &menu->text_speed, 0);
+    gameplay->Get("BattleSpeed", &menu->battle_speed, 1);
+    gameplay->Get("SkipIntro", &menu->skip_intro, false);
+    menu->text_speed = std::clamp(menu->text_speed, 0, 3);
+    menu->battle_speed = std::clamp(menu->battle_speed, 1, 4);
+  }
   if (menu->first_person_sensitivity != 0)
     menu->first_person_sensitivity = std::clamp(menu->first_person_sensitivity, 40, 250);
   {
@@ -1457,6 +1541,7 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     Pad::SetStatusFilter(&Filter);
 #endif
   Camera(menu);
+  ConfigureGame(menu);
   ApplyFirstPersonFov(menu);
   // MODERNGEKKO_CAMERA_STATE: camera angle handed over by the Graphics API
   // switch; restored before the first field update.
@@ -1541,8 +1626,10 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       else if (target == "controls")
         menu->policy.activate(2);
       else if (target == "quit")
-        menu->policy.activate(6);
+        menu->policy.activate(7);
       else if (target == "photo")
+        ActionHost(menu, menu->policy.activate(4));
+      else if (target == "shadow")
         ActionHost(menu, menu->policy.activate(3));
       SyncPause(menu, was_open);
     }).detach();
@@ -1687,6 +1774,7 @@ const char *SettingsSection(std::size_t row) {
   case 20: return "GRAPHICS";
   case static_cast<std::size_t>(kPresetRows + kFirstAmdRow): return "AMD RADEON";
   case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
+  case static_cast<std::size_t>(kPresetRows + kTextSpeedRow): return "GAME SPEED";
   case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
   default: return nullptr;
   }
@@ -1789,7 +1877,8 @@ void Draw() {
   const auto rows = Rows(*menu);
   menu->policy.set_rows(rows.size());
   const Page page = menu->policy.page();
-  const bool list_page = page == Page::Settings || page == Page::Controls;
+  const bool list_page =
+      page == Page::Settings || page == Page::Controls || page == Page::Shadow;
 
   const auto &io = ImGui::GetIO();
   ImFont *font = MenuFont();
@@ -1849,6 +1938,7 @@ void Draw() {
                         : page == Page::RestartConfirm ? "RESTART THE GAME?"
                         : page == Page::Settings       ? "SETTINGS"
                         : page == Page::Controls       ? "CONTROLS"
+                        : page == Page::Shadow         ? "SHADOW POK\xC3\xA9MON"
                                                        : "PAUSE";
     const ImVec2 ts = st::TextSize(font, title_size, title);
     st::OutlinedText(draw, font, title_size, ImVec2(a.x + 40 * s, a.y + (header_h - ts.y) * 0.5f),
@@ -1917,10 +2007,32 @@ void Draw() {
           value_color = col::kFocusGreen;
         } else if (value == "OFF") {
           value_color = col::kRed;
+        } else if (page == Page::Shadow) {
+          value_color = value == "PURIFIED"  ? st::Rgb(150, 220, 255)
+                        : value == "SNAGGED" ? col::kYellow
+                        : value == "SEEN"    ? col::kRed
+                                             : st::Rgb(120, 140, 132);
+        }
+        // Shadow Pokemon you own: the heart gauge left of the status.
+        if (page == Page::Shadow && row < menu->shadow.entries.size() &&
+            menu->shadow.entries[row].heart >= 0) {
+          const float fraction = menu->shadow.entries[row].heart;
+          const float bw = 150 * s, bh = 12 * s;
+          const float bx = b.x - st::TextSize(font, row_size, value).x - 52 * s - bw;
+          const float by = a.y + (panel_h - bh) * 0.5f;
+          rows_draw->AddRectFilled(ImVec2(bx - 2 * s, by - 2 * s), ImVec2(bx + bw + 2 * s, by + bh + 2 * s),
+                                   col::kChromeEdge, 3 * s);
+          rows_draw->AddRectFilledMultiColor(ImVec2(bx, by), ImVec2(bx + bw * fraction, by + bh),
+                                             st::Rgb(170, 70, 230), st::Rgb(110, 30, 170),
+                                             st::Rgb(110, 30, 170), st::Rgb(170, 70, 230));
+          st::OutlinedText(rows_draw, font, small_size * 0.85f,
+                           ImVec2(bx - 70 * s, by - 3 * s),
+                           menu->shadow.entries[row].in_party ? col::kWhite : st::Rgb(170, 186, 178),
+                           menu->shadow.entries[row].in_party ? "PARTY" : "PC", 1.2f * s);
         }
         const ImVec2 vs = st::TextSize(font, row_size, shown);
         const float vx = b.x - vs.x - 28 * s;
-        if (focused) {
+        if (focused && page != Page::Shadow) {
           // Arrows hint that Left / Right change it.
           const float cy = a.y + panel_h * 0.5f;
           rows_draw->AddTriangleFilled(ImVec2(vx - 22 * s, cy), ImVec2(vx - 12 * s, cy - 7 * s),
@@ -2022,6 +2134,13 @@ void Draw() {
     const ImVec2 a(origin.x, footer_y), b(origin.x + width, footer_y + footer_h - 6 * s);
     st::ChromePlate(draw, a, b, 16 * s, 7 * s, st::Rgb(20, 70, 64), st::Rgb(10, 40, 38));
     std::string message = menu->status;
+    if (page == Page::Shadow && message.empty()) {
+      const auto &sh = menu->shadow;
+      message = sh.valid ? "Snagged " + std::to_string(sh.snagged) + " / " + std::to_string(sh.total) +
+                               "    Purified " + std::to_string(sh.purified) + "    Seen " +
+                               std::to_string(sh.seen)
+                         : "Load your adventure to see your Shadow Pok\xC3\xA9mon.";
+    }
     if (message.empty())
       message = list_page ? "Left / Right: change    A: select    B: back"
                           : "A: select    B: back    Start: resume";
@@ -2186,8 +2305,13 @@ void Host_PauseMenuTick() {
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count();
   const auto page = menu->policy.page();
+  if (page == Page::Shadow && poll_time - menu->shadow_read > std::chrono::seconds(1)) {
+    menu->shadow = moderngekko::shadow::Read();
+    menu->shadow_read = poll_time;
+  }
   const std::size_t rows = page == Page::Settings   ? kSettingsRows
                            : page == Page::Controls ? 2
+                           : page == Page::Shadow   ? menu->shadow.entries.size() + 1
                                                     : 0;
   ActionHost(menu, menu->policy.update(input, now, rows));
   // A host command and an input edge in the same tick describe one toggle.
