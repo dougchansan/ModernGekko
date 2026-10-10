@@ -248,6 +248,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         src/runtime/hd_texture_pack.cpp
         src/runtime/dolphin_runtime.cpp
         src/runtime/pause_menu_runtime.cpp
+  src/runtime/colosseum_font.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
     )
@@ -279,7 +280,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_HAVE_COCOA=1)
     endif()
     target_include_directories(moderngekko PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Externals/picojson")
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         target_compile_definitions(moderngekko PRIVATE _ARCH_64=1)
     else()

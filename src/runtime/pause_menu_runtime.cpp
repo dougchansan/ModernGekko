@@ -26,6 +26,7 @@
 #include "amd_driver_settings.h"
 #include "pause_menu_host.hpp"
 #include "pause_menu_policy.hpp"
+#include "colosseum_menu_style.hpp"
 #include <cstdio>
 #include <fstream>
 #include <cstdlib>
@@ -1413,6 +1414,29 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     menu->spin_start_ns = start;
     menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
   }
+  // MODERNGEKKO_TEST_MENU=<home|settings|controls|quit>[:seconds]: opens the
+  // menu on that page after a delay (default 10 s) for UI screenshots.
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_MENU"); test && *test) {
+    std::string target = test;
+    int delay = 10;
+    if (const auto colon = target.find(':'); colon != std::string::npos) {
+      delay = std::atoi(target.c_str() + colon + 1);
+      target.resize(colon);
+    }
+    std::thread([menu, target, delay] {
+      std::this_thread::sleep_for(std::chrono::seconds(delay));
+      std::lock_guard lock(menu->mutex);
+      const bool was_open = menu->policy.is_open();
+      menu->policy.open();
+      if (target == "settings")
+        menu->policy.activate(1);
+      else if (target == "controls")
+        menu->policy.activate(2);
+      else if (target == "quit")
+        menu->policy.activate(5);
+      SyncPause(menu, was_open);
+    }).detach();
+  }
   // MODERNGEKKO_TEST_RUN=1: start with running on (as a left stick click).
   if (const char *test = std::getenv("MODERNGEKKO_TEST_RUN"); test && *test == '1') {
     menu->running = true;
@@ -1539,7 +1563,59 @@ void DrawSpinTest(const Menu &menu) {
                                           IM_COL32(255, 214, 64, 255), text);
 }
 
+// The menu font: Colosseum's own (MenuFont() in colosseum_font) or ImGui's.
+ImFont *MenuFont();
+
+// Settings rows grouped like the game's own option screens.
+const char *SettingsSection(std::size_t row) {
+  switch (row) {
+  case 0: return "PERFORMANCE";
+  case 1: return "GAME";
+  case 7: return "CAMERA";
+  case 10: return "DISPLAY & SOUND";
+  case 17: return "FIRST PERSON";
+  case 20: return "GRAPHICS";
+  case static_cast<std::size_t>(kPresetRows + kFirstAmdRow): return "AMD RADEON";
+  case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
+  case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
+  default: return nullptr;
+  }
+}
+
+// "Label   value" rows (three spaces) split into the label and its value.
+std::pair<std::string, std::string> SplitRow(const std::string &row) {
+  const auto at = row.find("   ");
+  if (at == std::string::npos)
+    return {row, {}};
+  std::string value = row.substr(at);
+  value.erase(0, value.find_first_not_of(' '));
+  return {row.substr(0, at), value};
+}
+
+void QueueActivate(const std::shared_ptr<Menu> &menu, std::size_t row) {
+  Core::QueueHostJob([weak = std::weak_ptr(menu), row](Core::System &) {
+    auto state = weak.lock();
+    if (!state)
+      return;
+    std::lock_guard guard(state->mutex);
+    if (!state->active)
+      return;
+    const bool open = state->policy.is_open();
+    ActionHost(state, state->policy.activate(row));
+    SyncPause(state, open);
+  });
+}
+
+std::string Upper(std::string text) {
+  for (char &ch : text)
+    if (ch >= 'a' && ch <= 'z')
+      ch = static_cast<char>(ch - 'a' + 'A');
+  return text;
+}
+
 void Draw() {
+  namespace st = style;
+  namespace col = style::color;
   const auto menu = current.load();
   if (menu && menu->motion_test)
     DrawMotionTest();
@@ -1561,98 +1637,250 @@ void Draw() {
   }
   const auto rows = Rows(*menu);
   menu->policy.set_rows(rows.size());
+  const Page page = menu->policy.page();
+  const bool list_page = page == Page::Settings || page == Page::Controls;
+
   const auto &io = ImGui::GetIO();
-  ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize,
-                                                IM_COL32(3, 10, 27, 170));
-  const float scale = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.5f);
-  ImGui::SetNextWindowPos(
-      ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-      ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-  ImGui::SetNextWindowSize(
-      ImVec2(std::min(820.0f * scale, io.DisplaySize.x - 24), 0),
-      ImGuiCond_Always);
-  ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                        ImVec4(0.025f, 0.065f, 0.17f, 0.98f));
-  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.80f, 0.18f, 1));
-  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.96f, 1, 1));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                      ImVec2(24 * scale, 20 * scale));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12 * scale);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2);
+  ImFont *font = MenuFont();
+  const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.6f);
+  // Darken the game behind, more towards the edges.
+  {
+    ImDrawList *bg = ImGui::GetBackgroundDrawList();
+    bg->AddRectFilled(ImVec2(0, 0), io.DisplaySize, st::Rgb(0, 6, 10, 150));
+    bg->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y),
+                                st::Rgb(0, 0, 0, 90), st::Rgb(0, 0, 0, 0), st::Rgb(0, 0, 0, 0),
+                                st::Rgb(0, 0, 0, 90));
+    bg->AddRectFilledMultiColor(ImVec2(io.DisplaySize.x * 0.5f, 0), io.DisplaySize,
+                                st::Rgb(0, 0, 0, 0), st::Rgb(0, 0, 0, 90), st::Rgb(0, 0, 0, 90),
+                                st::Rgb(0, 0, 0, 0));
+  }
+
+  const float width = std::min((list_page ? 900.0f : 760.0f) * s, io.DisplaySize.x - 32 * s);
+  const float title_size = 38 * s, row_size = 26 * s, small_size = 20 * s;
+  const float header_h = 74 * s, footer_h = 92 * s, gap = 14 * s;
+  const float max_h = io.DisplaySize.y * 0.92f;
+
+  // Row geometry: Start-menu buttons on the short pages, panels in the lists.
+  const float button_h = 68 * s, button_gap = 12 * s;
+  const float panel_h = 50 * s, panel_gap = 8 * s, section_h = 38 * s;
+  float list_content_h = 0;
+  if (list_page) {
+    for (std::size_t row = 0; row < rows.size(); ++row)
+      list_content_h += panel_h + panel_gap + (page == Page::Settings && SettingsSection(row) ? section_h : 0);
+  } else {
+    list_content_h = rows.size() * (button_h + button_gap);
+  }
+  const float controls_h = page == Page::Controls ? 210 * s : 0;
+  const float list_h = std::min(list_content_h + 8 * s,
+                                max_h - header_h - footer_h - controls_h - gap * 4);
+  const float total_h = header_h + gap + list_h + gap + controls_h + footer_h;
+
+  const ImVec2 origin((io.DisplaySize.x - width) * 0.5f, (io.DisplaySize.y - total_h) * 0.5f);
+  ImGui::SetNextWindowPos(origin, ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(width, total_h), ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
   ImGui::Begin("Colosseum pause", nullptr,
-               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
-                   ImGuiWindowFlags_NoSavedSettings);
-  ImGui::SetWindowFontScale(scale * 1.5f);
-  ImGui::TextColored(ImVec4(1, 0.83f, 0.25f, 1), "POKEMON COLOSSEUM");
-  ImGui::TextUnformatted(
-      menu->policy.page() == Page::QuitConfirm      ? "Leave your adventure?"
-      : menu->policy.page() == Page::RestartConfirm ? "Restart from the title screen? Unsaved progress is lost."
-      : menu->policy.page() == Page::Settings  ? "Settings"
-      : menu->policy.page() == Page::Controls  ? "Controls"
-                                               : "Adventure paused");
-  ImGui::Separator();
-  // The row list scrolls inside a frame that always fits on screen (Settings
-  // has more rows than fit at 1440p with this font scale); the focused row is
-  // kept in view.
-  const float row_height = 28 * scale + ImGui::GetStyle().ItemSpacing.y;
-  const float max_list_height = io.DisplaySize.y * 0.86f - ImGui::GetCursorPosY() -
-                                6.0f * ImGui::GetTextLineHeightWithSpacing();
-  const float list_height =
-      std::min(row_height * static_cast<float>(rows.size()), std::max(max_list_height, row_height * 4));
-  ImGui::BeginChild("rows", ImVec2(0, list_height), false);
+               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground |
+                   ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  ImDrawList *draw = ImGui::GetWindowDrawList();
+
+  // Header plate: page title, game name on the right.
+  {
+    const ImVec2 a = origin, b(origin.x + width, origin.y + header_h);
+    st::ChromePlate(draw, a, b, 18 * s, 8 * s, col::kTealTop, col::kTealBottom);
+    // Accent bar on the left, like the game's red title tabs.
+    st::FillChamfer(draw, ImVec2(a.x + 14 * s, a.y + 16 * s), ImVec2(a.x + 24 * s, b.y - 16 * s),
+                    3 * s, st::Rgb(240, 70, 60), st::Rgb(150, 20, 20));
+    const char *title = page == Page::QuitConfirm      ? "LEAVE YOUR ADVENTURE?"
+                        : page == Page::RestartConfirm ? "RESTART THE GAME?"
+                        : page == Page::Settings       ? "SETTINGS"
+                        : page == Page::Controls       ? "CONTROLS"
+                                                       : "PAUSE";
+    const ImVec2 ts = st::TextSize(font, title_size, title);
+    st::OutlinedText(draw, font, title_size, ImVec2(a.x + 40 * s, a.y + (header_h - ts.y) * 0.5f),
+                     col::kWhite, title, 2.0f * s);
+    const char *game = "POK\xC3\xA9MON COLOSSEUM";
+    const ImVec2 gs = st::TextSize(font, small_size, game);
+    st::OutlinedText(draw, font, small_size,
+                     ImVec2(b.x - gs.x - 30 * s, a.y + (header_h - gs.y) * 0.5f), col::kFocusGreen,
+                     game, 1.5f * s);
+  }
+
+  // Rows.
+  const ImVec2 list_a(origin.x, origin.y + header_h + gap);
+  ImGui::SetCursorScreenPos(list_a);
+  ImGui::BeginChild("rows", ImVec2(width, list_h), false,
+                    ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+  ImDrawList *rows_draw = ImGui::GetWindowDrawList();
+  const float scroll = ImGui::GetScrollY();
+  const ImVec2 child_origin = ImGui::GetCursorScreenPos();
+  float y = 4 * s;
   for (std::size_t row = 0; row < rows.size(); ++row) {
     ImGui::PushID(static_cast<int>(row));
     const bool focused = row == menu->policy.focus();
-    const bool unavailable = menu->policy.page() == Page::Settings &&
-                             ((row >= 7 && row <= 9) || (row >= 17 && row <= 19)) && !menu->camera_available;  // + preset row
-    ImGui::BeginDisabled(unavailable);
-    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.20f, 0.32f, 0.52f, 1));
-    const std::string label = (focused ? ">  " : "   ") + rows[row];
-    if (ImGui::Selectable(label.c_str(), focused, 0, ImVec2(0, 28 * scale))) {
-      Core::QueueHostJob([weak = std::weak_ptr(menu), row](Core::System &) {
-        auto state = weak.lock();
-        if (!state)
-          return;
-        std::lock_guard guard(state->mutex);
-        if (!state->active)
-          return;
-        const bool open = state->policy.is_open();
-        ActionHost(state, state->policy.activate(row));
-        SyncPause(state, open);
-      });
+    const bool unavailable = page == Page::Settings &&
+                             ((row >= 7 && row <= 9) || (row >= 17 && row <= 19)) &&
+                             !menu->camera_available;
+    float row_top, row_bottom;
+    if (list_page) {
+      if (page == Page::Settings) {
+        if (const char *section = SettingsSection(row)) {
+          const float sy = child_origin.y + y + section_h * 0.30f;
+          st::OutlinedText(rows_draw, font, small_size, ImVec2(child_origin.x + 22 * s, sy),
+                           col::kHeaderGreen, section, 1.2f * s);
+          const float tx = child_origin.x + 34 * s + st::TextSize(font, small_size, section).x;
+          const float ly = sy + small_size * 0.55f;
+          rows_draw->AddRectFilledMultiColor(ImVec2(tx, ly), ImVec2(child_origin.x + width - 22 * s, ly + 2 * s),
+                                             col::kChromeLight, st::Rgb(232, 236, 240, 0),
+                                             st::Rgb(232, 236, 240, 0), col::kChromeLight);
+          y += section_h;
+        }
+      }
+      row_top = y;
+      row_bottom = y + panel_h;
+      const float inset = focused ? 0 : 10 * s;
+      const ImVec2 a(child_origin.x + 8 * s + inset, child_origin.y + row_top);
+      const ImVec2 b(child_origin.x + width - 8 * s, child_origin.y + row_bottom);
+      const bool back = row + 1 == rows.size();
+      st::Panel(rows_draw, a, b, 12 * s, (focused ? 4.0f : 3.0f) * s, focused,
+                back ? col::kTealTop : (focused ? st::Rgb(30, 96, 66) : col::kGreenTop),
+                back ? col::kTealBottom : (focused ? st::Rgb(14, 56, 40) : col::kGreenBottom));
+      auto [label, value] = SplitRow(rows[row]);
+      const ImU32 dim = unavailable ? st::Rgb(140, 150, 146) : col::kWhite;
+      const ImVec2 ls = st::TextSize(font, row_size, label);
+      const float ty = a.y + (panel_h - ls.y) * 0.5f;
+      if (focused) {
+        // Pointer like the game's cursor.
+        const float cx = a.x + 20 * s, cy = a.y + panel_h * 0.5f;
+        rows_draw->AddTriangleFilled(ImVec2(cx - 6 * s, cy - 8 * s), ImVec2(cx - 6 * s, cy + 8 * s),
+                                     ImVec2(cx + 6 * s, cy), col::kFocusGreen);
+      }
+      st::OutlinedText(rows_draw, font, row_size, ImVec2(a.x + 36 * s, ty), dim, label, 1.5f * s);
+      if (!value.empty()) {
+        ImU32 value_color = col::kYellow;
+        std::string shown = value;
+        if (value == "ON") {
+          value_color = col::kFocusGreen;
+        } else if (value == "OFF") {
+          value_color = col::kRed;
+        }
+        const ImVec2 vs = st::TextSize(font, row_size, shown);
+        const float vx = b.x - vs.x - 28 * s;
+        if (focused) {
+          // Arrows hint that Left / Right change it.
+          const float cy = a.y + panel_h * 0.5f;
+          rows_draw->AddTriangleFilled(ImVec2(vx - 22 * s, cy), ImVec2(vx - 12 * s, cy - 7 * s),
+                                       ImVec2(vx - 12 * s, cy + 7 * s), col::kChromeLight);
+          rows_draw->AddTriangleFilled(ImVec2(b.x - 10 * s, cy), ImVec2(b.x - 20 * s, cy - 7 * s),
+                                       ImVec2(b.x - 20 * s, cy + 7 * s), col::kChromeLight);
+        }
+        st::OutlinedText(rows_draw, font, row_size, ImVec2(vx, ty), unavailable ? dim : value_color,
+                         shown, 1.5f * s);
+      }
+      y = row_bottom + panel_gap;
+    } else {
+      // Start menu buttons: the focused one pops out to the left in green.
+      row_top = y;
+      row_bottom = y + button_h;
+      const float rail_x = child_origin.x + width - 70 * s;
+      const float bw = width * 0.68f;
+      const float shift = focused ? 34 * s : 0;
+      const ImVec2 a(rail_x - bw - shift, child_origin.y + row_top);
+      const ImVec2 b(rail_x - shift, child_origin.y + row_bottom);
+      st::ChromePlate(rows_draw, a, b, 18 * s, 8 * s, col::kTealTop, col::kTealBottom);
+      const std::string label = Upper(rows[row]);
+      const ImVec2 ls = st::TextSize(font, row_size * 1.3f, label);
+      const ImVec2 tp(a.x + (bw - ls.x) * 0.5f, a.y + (button_h - ls.y) * 0.5f);
+      if (focused)
+        st::OutlinedText(rows_draw, font, row_size * 1.3f, tp, col::kFocusGreen, label, 2.0f * s,
+                         st::Rgb(4, 30, 10, 240));
+      else
+        st::EngravedText(rows_draw, font, row_size * 1.3f, tp, col::kDimTeal, label, 1.5f * s);
+      y = row_bottom + button_gap;
     }
+    // Mouse: the whole row is a button.
+    ImGui::SetCursorPos(ImVec2(0, row_top));
+    if (ImGui::InvisibleButton("row", ImVec2(width, row_bottom - row_top)) && !unavailable)
+      QueueActivate(menu, row);
     if (focused && menu->scrolled_focus != row) {
-      ImGui::SetScrollHereY(0.5f);
+      ImGui::SetScrollY(std::clamp((row_top + row_bottom) * 0.5f - list_h * 0.5f, 0.0f,
+                                   std::max(0.0f, list_content_h - list_h)));
       menu->scrolled_focus = row;
     }
-    ImGui::PopStyleColor();
     ImGui::PopID();
-    ImGui::EndDisabled();
   }
+  ImGui::SetCursorPos(ImVec2(0, y));
+  ImGui::Dummy(ImVec2(1, 4 * s));
+  // The chrome rail behind the Start menu buttons.
+  if (!list_page && !rows.empty()) {
+    const float rx = child_origin.x + width - 70 * s;
+    const ImVec2 a(rx, child_origin.y + 4 * s - 10 * s), b(rx + 40 * s, child_origin.y + y + 10 * s - button_gap);
+    // Chrome rail with a notch facing each button and a slot that lights up.
+    st::FillChamfer(rows_draw, ImVec2(a.x - 1, a.y - 1), ImVec2(b.x + 1, b.y + 1), 9 * s,
+                    col::kChromeEdge, col::kChromeEdge);
+    st::FillChamfer(rows_draw, a, b, 8 * s, col::kChromeLight, col::kChromeDark);
+    rows_draw->AddRectFilledMultiColor(ImVec2(a.x + 4 * s, a.y + 6 * s), ImVec2(a.x + 9 * s, b.y - 6 * s),
+                                       st::Rgb(255, 255, 255, 120), st::Rgb(255, 255, 255, 0),
+                                       st::Rgb(255, 255, 255, 0), st::Rgb(255, 255, 255, 120));
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+      const float cy = child_origin.y + 4 * s + row * (button_h + button_gap) + button_h * 0.5f;
+      const bool lit = row == menu->policy.focus();
+      rows_draw->AddTriangleFilled(ImVec2(a.x + 2 * s, cy), ImVec2(a.x + 12 * s, cy - 9 * s),
+                                   ImVec2(a.x + 12 * s, cy + 9 * s), col::kChromeEdge);
+      rows_draw->AddRectFilled(ImVec2(rx + 16 * s, cy - 6 * s), ImVec2(rx + 36 * s, cy + 6 * s),
+                               col::kChromeEdge, 2 * s);
+      rows_draw->AddRectFilled(ImVec2(rx + 18 * s, cy - 4 * s), ImVec2(rx + 34 * s, cy + 4 * s),
+                               lit ? col::kFocusGreen : st::Rgb(16, 26, 30), 1 * s);
+    }
+  }
+  (void)scroll;
   ImGui::EndChild();
-  if (menu->policy.page() == Page::Controls) {
-    ImGui::Separator();
-    ImGui::TextWrapped(
-        "Start + Z / Esc: pause menu\nD-pad / arrows: navigate    A / Enter: "
-        "select\nB / Backspace: back    Left / Right: change device\nCamera: "
-        "C-stick orbit    Z + Y: free camera\nZ + D-pad Down: recenter    "
-        "D-pad Up / Down: zoom\nExisting controller button bindings are "
-        "preserved.");
+
+  // Controls page: the button guide on a panel.
+  float footer_y = list_a.y + list_h + gap;
+  if (page == Page::Controls) {
+    const ImVec2 a(origin.x + 8 * s, footer_y), b(origin.x + width - 8 * s, footer_y + controls_h - gap);
+    st::Panel(draw, a, b, 12 * s, 3 * s, false);
+    static const char *const kGuide[][2] = {
+        {"Start + Z / Esc", "Pause menu"},          {"D-pad / Arrows", "Move"},
+        {"A / Enter", "Select"},                    {"B / Backspace", "Back"},
+        {"C-stick", "Orbit the camera"},            {"Z + Y", "Free camera"},
+        {"Z + X", "First person"},                  {"Left stick click", "Run"},
+    };
+    // One entry per line: the button in yellow, what it does in white.
+    const float guide_size = row_size * 0.82f;
+    const float column = (b.x - a.x) * 0.5f;
+    for (int i = 0; i < 8; ++i) {
+      const float cx = a.x + 26 * s + (i % 2) * column;
+      const float cy = a.y + 16 * s + (i / 2) * ((b.y - a.y - 32 * s) / 4.0f);
+      st::OutlinedText(draw, font, guide_size, ImVec2(cx, cy), col::kYellow, kGuide[i][0], 1.3f * s);
+      st::OutlinedText(draw, font, guide_size, ImVec2(cx + column * 0.48f, cy), col::kWhite,
+                       kGuide[i][1], 1.3f * s);
+    }
+    footer_y += controls_h;
   }
-  ImGui::Separator();
-  if (!menu->status.empty())
-    ImGui::TextWrapped("%s", menu->status.c_str());
-  if (menu->policy.page() == Page::Settings ||
-      menu->policy.page() == Page::Controls)
-    ImGui::TextWrapped("Up / Down: move    Left / Right: adjust\nEnter / A: "
-                       "select    Esc: resume    B: back");
-  else
-    ImGui::TextWrapped("Arrows / D-pad: move    Enter / A: select\nEsc: resume "
-                       "   Backspace / B: back");
+
+  // Message box: status, or what the buttons do.
+  {
+    const ImVec2 a(origin.x, footer_y), b(origin.x + width, footer_y + footer_h - 6 * s);
+    st::ChromePlate(draw, a, b, 16 * s, 7 * s, st::Rgb(20, 70, 64), st::Rgb(10, 40, 38));
+    std::string message = menu->status;
+    if (message.empty())
+      message = list_page ? "Left / Right: change    A: select    B: back"
+                          : "A: select    B: back    Start: resume";
+    const float spacing = 2.0f * s;
+    float msize = row_size * 0.9f;
+    const float avail = width - 60 * s;
+    while (msize > small_size * 0.8f && st::SpacedWidth(font, msize, message, spacing) > avail)
+      msize -= 1.0f;
+    st::SpacedText(draw, font, msize, ImVec2(a.x + 30 * s, a.y + (b.y - a.y - msize) * 0.5f),
+                   col::kWhite, message, spacing, 1.5f * s);
+  }
   ImGui::End();
   ImGui::PopStyleVar(3);
-  ImGui::PopStyleColor(3);
 }
 } // namespace moderngekko::pause_menu
 
