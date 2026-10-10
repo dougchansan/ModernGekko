@@ -1011,9 +1011,9 @@ std::string AdapterLabel(const Menu &menu) {
   return "GPU   " + name;
 }
 constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
-constexpr int kTextSpeedRow = kFirstPersonSensitivityRow + 1;
-constexpr int kBattleSpeedRow = kTextSpeedRow + 1;
-constexpr int kMotionTestRow = kBattleSpeedRow + 1;
+constexpr int kBattleSpeedRow = kFirstPersonSensitivityRow + 1;
+constexpr int kTextSpeedRow = kBattleSpeedRow + 1;
+constexpr int kMotionTestRow = kTextSpeedRow + 1;
 constexpr int kSpinTestRow = kMotionTestRow + 1;
 constexpr int kSettingsRows = kPresetRows + kSpinTestRow + 2;  // + Back
 constexpr double kSpinTestSeconds = 6.0;
@@ -1441,10 +1441,10 @@ std::vector<std::string> Rows(const Menu &menu) {
                  ? std::to_string(menu.first_person_sensitivity) + "%"
                  : "Auto (" + std::to_string(AutoFirstPersonSensitivity(menu)) +
                        "% at " + std::to_string(CurrentFrameRate()) + " FPS)"),
+        "Battle speed   " + std::to_string(menu.battle_speed) + "x",
         std::string("Text speed   ") +
             std::array<const char *, 4>{"Normal", "Fast", "Faster", "Instant"}[static_cast<std::size_t>(
                 std::clamp(menu.text_speed, 0, 3))],
-        "Battle speed   " + std::to_string(menu.battle_speed) + "x",
         enabled("Motion test (60 / 120 / 240 Hz lanes)", menu.motion_test),
         "Camera spin test (6 s, C-stick held right)",
         "Back"};
@@ -1774,7 +1774,7 @@ const char *SettingsSection(std::size_t row) {
   case 20: return "GRAPHICS";
   case static_cast<std::size_t>(kPresetRows + kFirstAmdRow): return "AMD RADEON";
   case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
-  case static_cast<std::size_t>(kPresetRows + kTextSpeedRow): return "GAME SPEED";
+  case static_cast<std::size_t>(kPresetRows + kBattleSpeedRow): return "BATTLE SPEED";
   case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
   default: return nullptr;
   }
