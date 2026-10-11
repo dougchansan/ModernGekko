@@ -375,6 +375,7 @@ enum class CommandType
   Screenshot,
   ReadMemory,
   WriteMemory,
+  DumpFrames,
   Stop,
 };
 

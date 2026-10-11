@@ -156,6 +156,8 @@ std::optional<CommandType> ParseCommandType(std::string_view value)
     return CommandType::ReadMemory;
   if (text == "write_memory")
     return CommandType::WriteMemory;
+  if (text == "dump_frames")
+    return CommandType::DumpFrames;
   if (text == "stop")
     return CommandType::Stop;
   return std::nullopt;
@@ -484,6 +486,13 @@ bool ParseCommandFile(const std::filesystem::path& path, Command* command, std::
     if (!ParseWriteMemoryCommand(values, &parsed, error))
       return false;
     break;
+  case CommandType::DumpFrames:
+  {
+    // enable=1 starts frame dumping (Dolphin's frame dumper), enable=0 stops it.
+    const auto enable_it = values.find("enable");
+    parsed.frames = enable_it != values.end() && Trim(enable_it->second) == "1" ? 1u : 0u;
+    break;
+  }
   case CommandType::Pause:
   case CommandType::Resume:
   case CommandType::Stop:

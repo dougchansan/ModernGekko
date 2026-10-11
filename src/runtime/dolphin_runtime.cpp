@@ -2647,6 +2647,10 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
   case automation::CommandType::Screenshot:
     SaveAutomationScreenshot(NormalizeScreenshotPath(command.path));
     break;
+  case automation::CommandType::DumpFrames:
+    Config::SetCurrent(Config::MAIN_MOVIE_DUMP_FRAMES, command.frames != 0);
+    std::fprintf(stderr, "[automation] frame dumping %s\n", command.frames ? "on" : "off");
+    break;
   case automation::CommandType::ReadMemory:
     if (auto error = ReadAutomationMemory(command.path, command.address, command.size))
       return error;
@@ -2672,6 +2676,7 @@ bool AutomationCommandNeedsReadyCore(automation::CommandType type)
   case automation::CommandType::SaveState:
   case automation::CommandType::LoadState:
   case automation::CommandType::Screenshot:
+  case automation::CommandType::DumpFrames:
   case automation::CommandType::ReadMemory:
   case automation::CommandType::WriteMemory:
   case automation::CommandType::PadFrames:
