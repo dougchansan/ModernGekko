@@ -1118,7 +1118,8 @@ constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
 constexpr int kBattleSpeedRow = kFirstPersonSensitivityRow + 1;
 constexpr int kTextSpeedRow = kBattleSpeedRow + 1;
 constexpr int kEnemyLevelRow = kTextSpeedRow + 1;
-constexpr int kTimeOfDayRow = kEnemyLevelRow + 1;
+constexpr int kSkipIntroRow = kEnemyLevelRow + 1;
+constexpr int kTimeOfDayRow = kSkipIntroRow + 1;
 constexpr int kSoftShadowsRow = kTimeOfDayRow + 1;
 constexpr int kMotionTestRow = kSoftShadowsRow + 1;
 constexpr int kSpinTestRow = kMotionTestRow + 1;
@@ -1392,6 +1393,11 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     ConfigureGame(menu);
     break;
   }
+  case kSkipIntroRow:
+    menu->skip_intro = !menu->skip_intro;
+    SaveGameSpeed(*menu);
+    ConfigureGame(menu);
+    break;
   case kTimeOfDayRow: {
     menu->time_of_day = (menu->time_of_day + (direction < 0 ? 6 : 1)) % 7;
     Common::IniFile ini;
@@ -1582,6 +1588,7 @@ std::vector<std::string> Rows(const Menu &menu) {
                 std::clamp(menu.text_speed, 0, 3))],
         "Enemy levels   " + (menu.enemy_levels ? "+" + std::to_string(menu.enemy_levels) + "%"
                                                 : std::string("Normal")),
+        enabled("Skip intro movies", menu.skip_intro),
         std::string("Time of day   ") +
             std::array<const char *, 7>{"Off", "Real clock", "Fast cycle", "Dawn", "Day", "Evening",
                                         "Night"}[static_cast<std::size_t>(std::clamp(menu.time_of_day, 0, 6))],
@@ -1928,6 +1935,7 @@ const char *SettingsSection(std::size_t row) {
   case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
   case static_cast<std::size_t>(kPresetRows + kBattleSpeedRow): return "BATTLE SPEED";
   case static_cast<std::size_t>(kPresetRows + kEnemyLevelRow): return "DIFFICULTY";
+  case static_cast<std::size_t>(kPresetRows + kSkipIntroRow): return "STARTUP";
   case static_cast<std::size_t>(kPresetRows + kTimeOfDayRow): return "WORLD";
   case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
   default: return nullptr;
