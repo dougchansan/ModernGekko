@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "quick_boot.hpp"
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
@@ -1673,7 +1674,8 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     {
       bool skip = false;
       gameplay->Get("SkipIntro", &skip, false);
-      if (skip) {
+      // Booted from the title snapshot (quick_boot.hpp): nothing to cover.
+      if (skip && !quick_boot::Loaded()) {
         menu->boot_cover = true;
         menu->boot_cover_start = std::chrono::steady_clock::now();
         // Uncapped while covered: the logo hold, fades and movie-floor waits
@@ -2039,6 +2041,8 @@ void UpdateBootCover(Menu &menu) {
       std::chrono::steady_clock::now() - menu.boot_cover_start <= std::chrono::seconds(30))
     return;
   menu.boot_cover = false;
+  if (!boot_floor)
+    quick_boot::TitleReached();
   if (menu.boot_uncapped) {
     Config::SetCurrent(Config::MAIN_EMULATION_SPEED, menu.boot_saved_speed);
     menu.boot_uncapped = false;
@@ -2471,6 +2475,7 @@ void Host_PauseMenuTick() {
     return;
   const auto poll_time = std::chrono::steady_clock::now();
   UpdateBootCover(*menu);
+  moderngekko::quick_boot::Tick();
   PublishLookInput(*menu, poll_time);
   if (poll_time - menu->last_poll < std::chrono::milliseconds(16))
     return;

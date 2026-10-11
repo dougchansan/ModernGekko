@@ -4,6 +4,7 @@
 #include "automation_protocol.hpp"
 #include "pause_menu_host.hpp"
 #include "launcher_savestates.hpp"
+#include "quick_boot.hpp"
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
@@ -1061,6 +1062,23 @@ constexpr std::array<std::pair<u32, u32>, 4> kColosseumWidescreenGuestHook = {{
     {0x80005308, 0x4809E62C},
     {0x800A3930, 0x4BF619D0},
 }};
+
+// Colosseum with Skip intro: the title-screen snapshot to boot from, if valid
+// (quick_boot.hpp). Keyed on the runner, module, mods, card and patch ini.
+std::optional<std::filesystem::path> QuickBootSnapshot(const moderngekko::RuntimeConfig &config,
+                                                       const std::string &disc_id)
+{
+  if (disc_id != "GC6E01")
+    return std::nullopt;
+  Common::IniFile ini;
+  ini.Load((config.user_directory / "config.ini").string());
+  bool skip_intro = false;
+  ini.GetOrCreateSection("Gameplay")->Get("SkipIntro", &skip_intro, false);
+  std::vector<std::filesystem::path> inputs = config.mod_directories;
+  if (config.module.kind == moderngekko::ModuleSource::Kind::DynamicPath)
+    inputs.push_back(config.module.path);
+  return moderngekko::quick_boot::Prepare(config.user_directory, inputs, skip_intro);
+}
 
 // Set after every savestate load. States carry the game's L1 frame period, so a
 // state saved in 60 FPS mode would keep running at 60 with the setting off; the
@@ -3170,7 +3188,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
       inspected.metadata->disc_id.c_str()};
   ModuleLibrary validation_library;
   ModuleLoadResult module_result{};
-  if (config.module.kind == ModuleSource::Kind::DynamicPath)
+  if (config.module.kind == moderngekko::ModuleSource::Kind::DynamicPath)
     module_result =
         validation_library.Open(config.module.path.string(), requirements);
   else if (config.module.kind == ModuleSource::Kind::AttachedDescriptor)
@@ -3352,7 +3370,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
 
   auto &jit = Core::System::GetInstance().GetJitInterface();
   StaticRecompModuleSource recomp_source;
-  if (impl->config.module.kind == ModuleSource::Kind::DynamicPath)
+  if (impl->config.module.kind == moderngekko::ModuleSource::Kind::DynamicPath)
     recomp_source =
         StaticRecompModuleSource::Dynamic(impl->config.module.path.string());
   else if (impl->config.module.kind == ModuleSource::Kind::AttachedDescriptor)
@@ -3414,30 +3432,6 @@ RuntimeRunResult Runtime::Run() {
             RuntimeError{RuntimeErrorCode::InvalidState,
                          "runtime is already running"}};
 
-  std::unique_ptr<BootParameters> boot;
-  {
-    std::lock_guard lock(s_runtime_mutex);
-    if (s_boot_session_data)
-      boot = BootParameters::GenerateFromFile(
-          m_impl->metadata.main_dol.string(), std::move(*s_boot_session_data));
-    else if (m_impl->config.load_state_path)
-      // DeleteSavestateAfterBoot::No: the state is the player's, not a
-      // scratch file this run owns.
-      boot = BootParameters::GenerateFromFile(
-          m_impl->metadata.main_dol.string(),
-          BootSessionData(m_impl->config.load_state_path->string(),
-                          DeleteSavestateAfterBoot::No));
-    else
-      boot =
-          BootParameters::GenerateFromFile(m_impl->metadata.main_dol.string());
-    s_boot_session_data.reset();
-  }
-  if (!boot) {
-    m_impl->running = false;
-    return {RuntimeExitReason::BootFailed,
-            RuntimeError{RuntimeErrorCode::BootFailed,
-                         "Dolphin rejected the extracted disc"}};
-  }
   if (m_impl->metadata.disc_id == "GC6E01")
   {
     std::string sixty_fps_status;
@@ -3461,6 +3455,35 @@ RuntimeRunResult Runtime::Run() {
               RuntimeError{RuntimeErrorCode::BootFailed,
                            std::move(idle_skip_status)}};
     }
+  }
+  std::unique_ptr<BootParameters> boot;
+  {
+    std::lock_guard lock(s_runtime_mutex);
+    if (s_boot_session_data)
+      boot = BootParameters::GenerateFromFile(
+          m_impl->metadata.main_dol.string(), std::move(*s_boot_session_data));
+    else if (m_impl->config.load_state_path)
+      // DeleteSavestateAfterBoot::No: the state is the player's, not a
+      // scratch file this run owns.
+      boot = BootParameters::GenerateFromFile(
+          m_impl->metadata.main_dol.string(),
+          BootSessionData(m_impl->config.load_state_path->string(),
+                          DeleteSavestateAfterBoot::No));
+    else if (const auto snapshot = QuickBootSnapshot(m_impl->config, m_impl->metadata.disc_id))
+      // The title-screen snapshot this runtime saved (quick_boot.hpp).
+      boot = BootParameters::GenerateFromFile(
+          m_impl->metadata.main_dol.string(),
+          BootSessionData(snapshot->string(), DeleteSavestateAfterBoot::No));
+    else
+      boot =
+          BootParameters::GenerateFromFile(m_impl->metadata.main_dol.string());
+    s_boot_session_data.reset();
+  }
+  if (!boot) {
+    m_impl->running = false;
+    return {RuntimeExitReason::BootFailed,
+            RuntimeError{RuntimeErrorCode::BootFailed,
+                         "Dolphin rejected the extracted disc"}};
   }
   m_impl->state_hook =
       Core::AddOnStateChangedCallback([this](Core::State state) {
