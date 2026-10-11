@@ -133,7 +133,10 @@ struct Menu {
   std::array<int, 9> applied_tint{};
   std::chrono::steady_clock::time_point tint_sent{};
   int text_speed = 0;
-  int enemy_levels = 0;  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
+  int enemy_levels = 0;
+  // config.ini [Gameplay] FastLoading: disc reads without the console drive's
+  // timing (Dolphin's fast disc speed); shorter loads and boot.
+  bool fast_loading = true;  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
   int battle_speed = 1;
   bool skip_intro = false;
   std::atomic<bool> first_person_active{false};
@@ -606,6 +609,7 @@ void SaveGameSpeed(const Menu &menu) {
   section->Set("BattleSpeed", menu.battle_speed);
   section->Set("SkipIntro", menu.skip_intro);
   section->Set("EnemyLevels", menu.enemy_levels);
+  section->Set("FastLoading", menu.fast_loading);
   ini.Save(menu.config_path);
 }
 
@@ -1119,7 +1123,8 @@ constexpr int kBattleSpeedRow = kFirstPersonSensitivityRow + 1;
 constexpr int kTextSpeedRow = kBattleSpeedRow + 1;
 constexpr int kEnemyLevelRow = kTextSpeedRow + 1;
 constexpr int kSkipIntroRow = kEnemyLevelRow + 1;
-constexpr int kTimeOfDayRow = kSkipIntroRow + 1;
+constexpr int kFastLoadingRow = kSkipIntroRow + 1;
+constexpr int kTimeOfDayRow = kFastLoadingRow + 1;
 constexpr int kSoftShadowsRow = kTimeOfDayRow + 1;
 constexpr int kMotionTestRow = kSoftShadowsRow + 1;
 constexpr int kSpinTestRow = kMotionTestRow + 1;
@@ -1398,6 +1403,11 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     SaveGameSpeed(*menu);
     ConfigureGame(menu);
     break;
+  case kFastLoadingRow:
+    menu->fast_loading = !menu->fast_loading;
+    Config::SetCurrent(Config::MAIN_FAST_DISC_SPEED, menu->fast_loading);
+    SaveGameSpeed(*menu);
+    break;
   case kTimeOfDayRow: {
     menu->time_of_day = (menu->time_of_day + (direction < 0 ? 6 : 1)) % 7;
     Common::IniFile ini;
@@ -1589,6 +1599,7 @@ std::vector<std::string> Rows(const Menu &menu) {
         "Enemy levels   " + (menu.enemy_levels ? "+" + std::to_string(menu.enemy_levels) + "%"
                                                 : std::string("Normal")),
         enabled("Skip intro movies", menu.skip_intro),
+        enabled("Fast loading", menu.fast_loading),
         std::string("Time of day   ") +
             std::array<const char *, 7>{"Off", "Real clock", "Fast cycle", "Dawn", "Day", "Evening",
                                         "Night"}[static_cast<std::size_t>(std::clamp(menu.time_of_day, 0, 6))],
@@ -1651,6 +1662,8 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     menu->time_of_day = std::clamp(menu->time_of_day, 0, 6);
     gameplay->Get("TextSpeed", &menu->text_speed, 0);
     gameplay->Get("EnemyLevels", &menu->enemy_levels, 0);
+    gameplay->Get("FastLoading", &menu->fast_loading, true);
+    Config::SetCurrent(Config::MAIN_FAST_DISC_SPEED, menu->fast_loading);
     menu->enemy_levels = std::clamp(menu->enemy_levels, 0, 100);
     gameplay->Get("BattleSpeed", &menu->battle_speed, 1);
     gameplay->Get("SkipIntro", &menu->skip_intro, false);
@@ -1935,7 +1948,7 @@ const char *SettingsSection(std::size_t row) {
   case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
   case static_cast<std::size_t>(kPresetRows + kBattleSpeedRow): return "BATTLE SPEED";
   case static_cast<std::size_t>(kPresetRows + kEnemyLevelRow): return "DIFFICULTY";
-  case static_cast<std::size_t>(kPresetRows + kSkipIntroRow): return "STARTUP";
+  case static_cast<std::size_t>(kPresetRows + kSkipIntroRow): return "STARTUP & LOADING";
   case static_cast<std::size_t>(kPresetRows + kTimeOfDayRow): return "WORLD";
   case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
   default: return nullptr;
