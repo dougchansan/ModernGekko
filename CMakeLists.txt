@@ -251,6 +251,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
   src/runtime/colosseum_font.cpp
   src/runtime/shadow_tracker.cpp
   src/runtime/quick_boot.cpp
+  src/runtime/attract_video.cpp
   src/runtime/pokemon_icons.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
@@ -258,7 +259,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     if(WIN32)
         target_sources(moderngekko PRIVATE
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp)
-        target_link_libraries(moderngekko PRIVATE dwmapi)
+        target_link_libraries(moderngekko PRIVATE dwmapi mfplat mfreadwrite mfuuid)
     endif()
     # Radeon driver settings in the pause menu (AMD ADLX SDK, loaded at run
     # time; without the SDK the rows report the settings as unavailable).

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "attract_video.hpp"
 #include "quick_boot.hpp"
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
@@ -2090,6 +2091,7 @@ void Draw() {
   namespace st = style;
   namespace col = style::color;
   const auto menu = current.load();
+  attract::Draw();  // under everything else this overlay draws
   if (menu && DrawBootCover(*menu))
     return;
   if (menu && menu->photo_mode) {
