@@ -103,42 +103,78 @@ std::optional<std::string> HashDirectorySha256(const std::filesystem::path& root
   std::error_code ec;
   if (!std::filesystem::is_directory(root, ec) || ec)
     return std::nullopt;
-  std::vector<std::filesystem::path> files;
+  // One directory walk: the listing already carries each file's size and
+  // modification time, and relative paths are computed once (not per sort
+  // comparison).
+  struct Entry
+  {
+    std::string relative;
+    std::filesystem::path path;
+    std::uintmax_t size;
+    std::int64_t time;
+  };
+  std::vector<Entry> files;
   std::filesystem::recursive_directory_iterator iterator(
       root, std::filesystem::directory_options::skip_permission_denied, ec);
   const std::filesystem::recursive_directory_iterator end;
   while (!ec && iterator != end)
   {
-    if (iterator->is_regular_file(ec) && !ec)
-      files.push_back(iterator->path());
+    const auto& entry = *iterator;
+    if (entry.is_regular_file(ec) && !ec)
+    {
+      const auto size = entry.file_size(ec);
+      const auto time = entry.last_write_time(ec);
+      if (ec)
+        return std::nullopt;
+      files.push_back({entry.path().lexically_relative(root).generic_string(), entry.path(), size,
+                       static_cast<std::int64_t>(time.time_since_epoch().count())});
+    }
     iterator.increment(ec);
   }
   if (ec)
     return std::nullopt;
-  std::ranges::sort(files, [&](const auto& left, const auto& right) {
-    return std::filesystem::relative(left, root).generic_string() <
-           std::filesystem::relative(right, root).generic_string();
-  });
-  std::vector<std::uint8_t> manifest;
-  for (const auto& path : files)
+  std::ranges::sort(files, {}, &Entry::relative);
+
+  // Hashing every file (a whole disc's assets) takes many seconds at each
+  // start. Keep the result next to a listing of each file's size and
+  // modification time; when nothing changed, the stored hash is the same one
+  // this function would compute.
+  std::string listing;
+  for (const auto& file : files)
+    listing += file.relative + '|' + std::to_string(file.size) + '|' + std::to_string(file.time) + '\n';
+  const std::string listing_hash =
+      Sha256(std::vector<std::uint8_t>(listing.begin(), listing.end()));
+  const std::string root_text = std::filesystem::absolute(root, ec).generic_string();
+  const auto cache_dir = std::filesystem::temp_directory_path(ec) / "moderngekko-asset-hash";
+  const auto cache_file =
+      cache_dir / (Sha256(std::vector<std::uint8_t>(root_text.begin(), root_text.end())) + ".txt");
   {
-    const std::string relative = std::filesystem::relative(path, root, ec).generic_string();
-    if (ec)
-      return std::nullopt;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto hash = HashFileSha256(path);
-    if (ec || !hash)
+    std::ifstream cached(cache_file);
+    std::string stored_listing, stored_hash;
+    if (cached && std::getline(cached, stored_listing) && std::getline(cached, stored_hash) &&
+        stored_listing == listing_hash && stored_hash.size() == 64)
+      return stored_hash;
+  }
+
+  std::vector<std::uint8_t> manifest;
+  for (const auto& file : files)
+  {
+    const auto hash = HashFileSha256(file.path);
+    if (!hash)
       return std::nullopt;
     const auto append_u64 = [&](std::uint64_t value) {
       for (int shift = 56; shift >= 0; shift -= 8)
         manifest.push_back(static_cast<std::uint8_t>(value >> shift));
     };
-    append_u64(relative.size());
-    manifest.insert(manifest.end(), relative.begin(), relative.end());
-    append_u64(size);
+    append_u64(file.relative.size());
+    manifest.insert(manifest.end(), file.relative.begin(), file.relative.end());
+    append_u64(file.size);
     manifest.insert(manifest.end(), hash->begin(), hash->end());
   }
-  return Sha256(std::move(manifest));
+  const std::string result = Sha256(std::move(manifest));
+  std::filesystem::create_directories(cache_dir, ec);
+  std::ofstream(cache_file, std::ios::trunc) << listing_hash << '\n' << result << '\n';
+  return result;
 }
 
 GameInspectResult InspectGame(const std::filesystem::path& input_root)

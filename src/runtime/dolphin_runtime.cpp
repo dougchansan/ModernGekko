@@ -3152,7 +3152,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
         RuntimeError{RuntimeErrorCode::AlreadyActive,
                      "only one ModernGekko runtime may be active per process"}};
 
+  const auto startup_begin = std::chrono::steady_clock::now();
+  auto startup_mark = [startup_begin](const char *stage) {
+    std::fprintf(stderr, "[startup] %6.0f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           startup_begin)
+                     .count(),
+                 stage);
+  };
   GameInspectResult inspected = InspectGame(config.game_root);
+  startup_mark("game inspected");
   if (!inspected)
     return {{}, RuntimeError{RuntimeErrorCode::InvalidGame, inspected.error}};
 
@@ -3188,6 +3197,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     config.module = {};
   }
   validation_library.Close();
+  startup_mark("module validated");
 
   auto impl = std::make_unique<Impl>();
   impl->config = std::move(config);
@@ -3225,6 +3235,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     UICommon::Init();
     impl->ui_initialized = true;
   }
+  startup_mark("mods loaded, UI initialized");
   std::string community_pack_error;
   if (!moderngekko::SetCommunityHdTexturePackEnabled(
           impl->config.user_directory,
@@ -3239,6 +3250,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     impl->config.graphics.hires_textures = true;
   // MODERNGEKKO_START_FULLSCREEN=1: set by the pause menu's Graphics API switch
   // so the relaunched session keeps fullscreen.
+  startup_mark("HD texture pack checked");
   const char* start_fullscreen = std::getenv("MODERNGEKKO_START_FULLSCREEN");
   Config::SetBase(Config::MAIN_FULLSCREEN,
                   impl->config.fullscreen || (start_fullscreen && start_fullscreen[0] == '1'));
@@ -3269,8 +3281,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   }
 
   const WindowSystemInfo wsi = impl->platform->GetWindowSystemInfo();
+  startup_mark("window created");
   UICommon::InitControllers(wsi);
   impl->controllers_initialized = true;
+  startup_mark("controllers initialized");
   impl->platform->SetTitle(impl->title);
 
   Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
@@ -3306,7 +3320,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   Config::SetBase(Config::GFX_SHADER_CACHE, true);
   Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                   ShaderCompilationMode::AsynchronousUberShaders);
-  Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
+  // Asynchronous ubershaders draw everything while specialized shaders compile
+  // in the background, so start right away instead of compiling the whole
+  // shader cache first (seconds of black screen at every launch).
+  Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, false);
   const std::vector<std::string> audio_backends =
       AudioCommon::GetSoundBackends();
   if (impl->config.headless) {
