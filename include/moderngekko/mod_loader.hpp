@@ -56,6 +56,12 @@ public:
   ModManager(ModManager &&) = delete;
   ModManager &operator=(ModManager &&) = delete;
 
+  // Lets mods call guest functions (ModernGekkoModHostApi::call_guest). The
+  // CPU core that can run guest code registers this; without it the host API
+  // reports the call as failed.
+  using GuestCaller = bool (*)(CPUState *state, std::uint32_t address);
+  static void SetGuestCaller(GuestCaller caller);
+
   ModLoadReport Load(const std::vector<ModSource> &sources,
                      const std::string &game_id);
   ModLoadReport

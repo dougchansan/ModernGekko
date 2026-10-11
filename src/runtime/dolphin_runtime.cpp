@@ -28,6 +28,7 @@
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 #include "Common/Swap.h"
 #include "Core/System.h"
 #include "DolphinNoGUI/Platform.h"
@@ -3383,6 +3384,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     recomp_source.host_call_range_contains =
         &ModManager::HostCallRangeContains;
     recomp_source.host_call_user = impl->mods.get();
+    ModManager::SetGuestCaller(&StaticRecompCore::CallGuest);
   }
   jit.SetStaticRecompModuleSource(std::move(recomp_source));
 

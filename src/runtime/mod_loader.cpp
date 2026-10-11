@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <limits>
@@ -166,6 +167,7 @@ struct ModManager::Impl {
                : 0;
   }
 
+  static int CallGuestThunk(void *, CPUState *state, std::uint32_t address);
   static ModernGekkoModFunction FindExportThunk(void *user_data,
                                                 const char *provider_id,
                                                 const char *export_name) {
@@ -197,6 +199,7 @@ ModManager::ModManager() : m_impl(std::make_unique<Impl>()) {
   m_impl->host_api.user_data = this;
   m_impl->host_api.trigger_event = Impl::TriggerEventThunk;
   m_impl->host_api.find_export = Impl::FindExportThunk;
+  m_impl->host_api.call_guest = Impl::CallGuestThunk;
 }
 
 ModManager::~ModManager() { Unload(); }
@@ -575,6 +578,17 @@ void ModManager::Unload() {
   m_impl->import_slots.clear();
   m_impl->mods.clear();
   m_impl->runtime_started = false;
+}
+
+namespace {
+std::atomic<ModManager::GuestCaller> s_guest_caller{nullptr};
+}
+
+void ModManager::SetGuestCaller(GuestCaller caller) { s_guest_caller.store(caller); }
+
+int ModManager::Impl::CallGuestThunk(void *, CPUState *state, std::uint32_t address) {
+  const GuestCaller caller = s_guest_caller.load();
+  return caller && state && caller(state, address) ? 1 : 0;
 }
 
 bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {

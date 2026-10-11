@@ -96,6 +96,11 @@ typedef struct ModernGekkoModHostApi
     ModernGekkoModFunction (*find_export)(void* user_data,
                                           const char* provider_id,
                                           const char* export_name);
+    /* Runs the guest function at `address` on a copy of `state` (arguments in
+       r3..r10) and stores its result in state->gpr[3]; nonzero on success.
+       Plain, non-yielding guest functions only, from a hook. May be null
+       (older hosts, or a runtime that cannot call guest code). */
+    int (*call_guest)(void* user_data, CPUState* state, uint32_t address);
 } ModernGekkoModHostApi;
 
 typedef struct ModernGekkoModDesc
