@@ -535,12 +535,20 @@ void UpdateTimeOfDay(const std::shared_ptr<Menu> &menu, bool force = false) {
   if (!force && now - menu->tint_sent < std::chrono::milliseconds(500))
     return;
   menu->tint_sent = now;
+  // The renderer grades the whole 3D world (baked map lighting does not use
+  // the game's lights); the game's lights and fog take half the tint on top,
+  // so characters and fog get the shading change without being darkened twice.
   std::array<int, 9> gains{};
+  std::array<int, 3> world{1000, 1000, 1000};
   if (menu->time_of_day > 0) {
     const auto g = TimeOfDayGains(TimeOfDayHour(menu->time_of_day));
     for (std::size_t i = 0; i < 9; ++i)
-      gains[i] = static_cast<int>(std::lround(g[i] * 1000.0f));
+      gains[i] = static_cast<int>(std::lround((1.0f + (g[i] - 1.0f) * 0.5f) * 1000.0f));
+    for (std::size_t i = 0; i < 3; ++i)
+      world[i] = static_cast<int>(std::lround((1.0f + (g[3 + i] - 1.0f) * 0.8f) * 1000.0f));
   }
+  for (std::size_t i = 0; i < 3; ++i)
+    g_world_tint_milli[i].store(world[i], std::memory_order_relaxed);
   if (!force && gains == menu->applied_tint)
     return;
   menu->applied_tint = gains;
