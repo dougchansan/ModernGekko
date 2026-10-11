@@ -7,6 +7,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/HW/GCPad.h"
+#include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/Host.h"
 #include "Core/SavestateLayout.h"
@@ -136,7 +137,12 @@ struct Menu {
   int enemy_levels = 0;
   // config.ini [Gameplay] FastLoading: disc reads without the console drive's
   // timing (Dolphin's fast disc speed); shorter loads and boot.
-  bool fast_loading = true;  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
+  bool fast_loading = true;
+  // Skip intro: the screen stays black from boot until the game leaves the
+  // boot floors (Nintendo logo, movie floors), hiding the logo and the first
+  // frame each movie draws before the camera mod ends it.
+  std::atomic<bool> boot_cover{false};
+  std::chrono::steady_clock::time_point boot_cover_start{};  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
   int battle_speed = 1;
   bool skip_intro = false;
   std::atomic<bool> first_person_active{false};
@@ -1661,6 +1667,14 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     g_soft_shadows.store(menu->soft_shadows, std::memory_order_relaxed);
     menu->time_of_day = std::clamp(menu->time_of_day, 0, 6);
     gameplay->Get("TextSpeed", &menu->text_speed, 0);
+    {
+      bool skip = false;
+      gameplay->Get("SkipIntro", &skip, false);
+      if (skip) {
+        menu->boot_cover = true;
+        menu->boot_cover_start = std::chrono::steady_clock::now();
+      }
+    }
     gameplay->Get("EnemyLevels", &menu->enemy_levels, 0);
     gameplay->Get("FastLoading", &menu->fast_loading, true);
     Config::SetCurrent(Config::MAIN_FAST_DISC_SPEED, menu->fast_loading);
@@ -1986,6 +2000,34 @@ std::string Upper(std::string text) {
   return text;
 }
 
+// Current field floor id: *(*(*(0x8047ACC8)) + 0xC) (0 before the first floor).
+u32 CurrentFloor() {
+  auto &memory = Core::System::GetInstance().GetMemory();
+  auto read = [&memory](u32 address) -> u32 {
+    const u8 *p = address >= 0x80000000u ? memory.GetPointerForRange(address, 4) : nullptr;
+    return p ? (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3] : 0;
+  };
+  const u32 context = read(0x8047ACC8);
+  const u32 entry = context ? read(context) : 0;
+  return entry ? read(entry + 0xC) : 0;
+}
+
+// Skip intro cover: black until the game is past its boot floors.
+bool DrawBootCover(Menu &menu) {
+  if (!menu.boot_cover)
+    return false;
+  const u32 floor = CurrentFloor();
+  const bool boot_floor = floor == 0 || floor == 0x398 || floor == 0x399 || floor == 0x39A;
+  if (!boot_floor ||
+      std::chrono::steady_clock::now() - menu.boot_cover_start > std::chrono::seconds(30)) {
+    menu.boot_cover = false;
+    return false;
+  }
+  const auto &io = ImGui::GetIO();
+  ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 255));
+  return true;
+}
+
 // Photo mode: a hint bar at the bottom, a flash and the saved file name after a
 // photo. None of it is in the photo (it is taken from the game's frame).
 void DrawPhotoMode(Menu &menu) {
@@ -2027,6 +2069,8 @@ void Draw() {
   namespace st = style;
   namespace col = style::color;
   const auto menu = current.load();
+  if (menu && DrawBootCover(*menu))
+    return;
   if (menu && menu->photo_mode) {
     DrawPhotoMode(*menu);
     return;
