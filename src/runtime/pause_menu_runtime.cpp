@@ -133,6 +133,7 @@ struct Menu {
   // cycle (an in-game hour per minute), 3 dawn, 4 day, 5 evening, 6 night.
   int time_of_day = 0;
   int soft_shadows = 1;  // config.ini [World] SoftShadows: 0 off, 1 soft, 2 softer
+  int ambient_occlusion = 0;  // [World] AmbientOcclusion: 0 off, 1 low, 2 medium, 3 high
   std::array<int, 9> applied_tint{};
   std::chrono::steady_clock::time_point tint_sent{};
   int text_speed = 0;
@@ -1137,7 +1138,8 @@ constexpr int kSkipIntroRow = kEnemyLevelRow + 1;
 constexpr int kFastLoadingRow = kSkipIntroRow + 1;
 constexpr int kTimeOfDayRow = kFastLoadingRow + 1;
 constexpr int kSoftShadowsRow = kTimeOfDayRow + 1;
-constexpr int kMotionTestRow = kSoftShadowsRow + 1;
+constexpr int kAmbientOcclusionRow = kSoftShadowsRow + 1;
+constexpr int kMotionTestRow = kAmbientOcclusionRow + 1;
 constexpr int kSpinTestRow = kMotionTestRow + 1;
 constexpr int kSettingsRows = kPresetRows + kSpinTestRow + 2;  // + Back
 constexpr double kSpinTestSeconds = 6.0;
@@ -1437,6 +1439,15 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     ini.Save(menu->config_path);
     break;
   }
+  case kAmbientOcclusionRow: {
+    menu->ambient_occlusion = (menu->ambient_occlusion + (direction < 0 ? 3 : 1)) % 4;
+    g_ambient_occlusion.store(menu->ambient_occlusion, std::memory_order_relaxed);
+    Common::IniFile ini;
+    ini.Load(menu->config_path);
+    ini.GetOrCreateSection("World")->Set("AmbientOcclusion", menu->ambient_occlusion);
+    ini.Save(menu->config_path);
+    break;
+  }
   case kMotionTestRow:
     // Closes the menu so the lanes animate at the game's present rate.
     menu->motion_test = !menu->motion_test;
@@ -1617,6 +1628,9 @@ std::vector<std::string> Rows(const Menu &menu) {
         std::string("Soft shadows   ") +
             std::array<const char *, 3>{"Off", "Soft", "Softer"}[static_cast<std::size_t>(
                 std::clamp(menu.soft_shadows, 0, 2))],
+        std::string("Ambient occlusion   ") +
+            std::array<const char *, 4>{"Off", "Low", "Medium", "High"}[static_cast<std::size_t>(
+                std::clamp(menu.ambient_occlusion, 0, 3))],
         enabled("Motion test (60 / 120 / 240 Hz lanes)", menu.motion_test),
         "Camera spin test (6 s, C-stick held right)",
         "Back"};
@@ -1670,6 +1684,9 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     ini.GetOrCreateSection("World")->Get("SoftShadows", &menu->soft_shadows, 1);
     menu->soft_shadows = std::clamp(menu->soft_shadows, 0, 2);
     g_soft_shadows.store(menu->soft_shadows, std::memory_order_relaxed);
+    ini.GetOrCreateSection("World")->Get("AmbientOcclusion", &menu->ambient_occlusion, 0);
+    menu->ambient_occlusion = std::clamp(menu->ambient_occlusion, 0, 3);
+    g_ambient_occlusion.store(menu->ambient_occlusion, std::memory_order_relaxed);
     menu->time_of_day = std::clamp(menu->time_of_day, 0, 6);
     gameplay->Get("TextSpeed", &menu->text_speed, 0);
     {
