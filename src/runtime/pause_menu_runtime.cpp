@@ -142,7 +142,10 @@ struct Menu {
   // boot floors (Nintendo logo, movie floors), hiding the logo and the first
   // frame each movie draws before the camera mod ends it.
   std::atomic<bool> boot_cover{false};
-  std::chrono::steady_clock::time_point boot_cover_start{};  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
+  std::chrono::steady_clock::time_point boot_cover_start{};
+  // While covered, the boot runs uncapped (its waits and fades are game time).
+  float boot_saved_speed = 1.0f;
+  bool boot_uncapped = false;  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
   int battle_speed = 1;
   bool skip_intro = false;
   std::atomic<bool> first_person_active{false};
@@ -1673,6 +1676,11 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       if (skip) {
         menu->boot_cover = true;
         menu->boot_cover_start = std::chrono::steady_clock::now();
+        // Uncapped while covered: the logo hold, fades and movie-floor waits
+        // are game time, so they pass as fast as the PC can run them.
+        menu->boot_saved_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
+        Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 0.0f);
+        menu->boot_uncapped = true;
       }
     }
     gameplay->Get("EnemyLevels", &menu->enemy_levels, 0);
@@ -2012,20 +2020,29 @@ u32 CurrentFloor() {
   return entry ? read(entry + 0xC) : 0;
 }
 
-// Skip intro cover: black until the game is past its boot floors.
+// Skip intro cover: black until the game is past its boot floors (checked by
+// the menu tick, UpdateBootCover, which also restores the emulation speed).
 bool DrawBootCover(Menu &menu) {
   if (!menu.boot_cover)
     return false;
-  const u32 floor = CurrentFloor();
-  const bool boot_floor = floor == 0 || floor == 0x398 || floor == 0x399 || floor == 0x39A;
-  if (!boot_floor ||
-      std::chrono::steady_clock::now() - menu.boot_cover_start > std::chrono::seconds(30)) {
-    menu.boot_cover = false;
-    return false;
-  }
   const auto &io = ImGui::GetIO();
   ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 255));
   return true;
+}
+
+void UpdateBootCover(Menu &menu) {
+  if (!menu.boot_cover)
+    return;
+  const u32 floor = CurrentFloor();
+  const bool boot_floor = floor == 0 || floor == 0x398 || floor == 0x399 || floor == 0x39A;
+  if (boot_floor &&
+      std::chrono::steady_clock::now() - menu.boot_cover_start <= std::chrono::seconds(30))
+    return;
+  menu.boot_cover = false;
+  if (menu.boot_uncapped) {
+    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, menu.boot_saved_speed);
+    menu.boot_uncapped = false;
+  }
 }
 
 // Photo mode: a hint bar at the bottom, a flash and the saved file name after a
@@ -2453,6 +2470,7 @@ void Host_PauseMenuTick() {
   if (!menu || !menu->active || menu->switching)
     return;
   const auto poll_time = std::chrono::steady_clock::now();
+  UpdateBootCover(*menu);
   PublishLookInput(*menu, poll_time);
   if (poll_time - menu->last_poll < std::chrono::milliseconds(16))
     return;
