@@ -319,8 +319,12 @@ int AutoFirstPersonSensitivity(const Menu &menu) {
   const double fov169 = (menu.first_person_fov > 0 ? menu.first_person_fov : kGameFovAt169) * kPi / 180.0;
   const double hfov = 2.0 * std::atan(std::tan(fov169 * 0.5) * aspect / (16.0 / 9.0));
   const double rad_per_second = kStepOfWidth * CurrentFrameRate() * hfov;
-  // The mod turns 2 rad/s at 100%.
-  return std::clamp(static_cast<int>(std::lround(rad_per_second / 2.0 * 100.0)), 40, 250);
+  // The camera sensitivity setting scales it, as it does the other cameras
+  // (it was ignored in first person before).
+  const double sensitivity = std::clamp(menu.sensitivity, 50, 200) / 100.0;
+  // The mod turns 2 rad/s at 100% (it accepts 25..300%).
+  return std::clamp(static_cast<int>(std::lround(rad_per_second * sensitivity / 2.0 * 100.0)), 25,
+                    300);
 }
 
 void ApplyFirstPersonFov(const std::shared_ptr<Menu> &menu) {
