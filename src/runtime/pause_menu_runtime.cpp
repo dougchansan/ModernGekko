@@ -122,6 +122,9 @@ struct Menu {
   // field of view, see AutoFirstPersonSensitivity). config.ini [Camera]
   // FirstPersonSensitivity.
   int first_person_sensitivity = 0;
+  // First-person look response curve + turn acceleration: 0 off, 1 normal,
+  // 2 fast. config.ini [Camera] LookAcceleration.
+  int look_acceleration = 1;
   int applied_auto_sensitivity = -1;  // last Auto value sent to the mod
   // Game speed (config.ini [Gameplay]): text 0 normal .. 3 instant, battle
   // pacing 1..4x, skip the boot logos and movies.
@@ -229,9 +232,10 @@ void Camera(const std::shared_ptr<Menu> &menu, bool recenter = false) {
   const int first_person = menu->first_person_sensitivity > 0
                                ? menu->first_person_sensitivity
                                : AutoFirstPersonSensitivity(*menu);
+  const int look_acceleration = menu->look_acceleration;
   Core::RunOnCPUThread(
       Core::System::GetInstance(),
-      [weak = std::weak_ptr(menu), sensitivity, invert, first_person, recenter] {
+      [weak = std::weak_ptr(menu), sensitivity, invert, first_person, look_acceleration, recenter] {
         const auto state = weak.lock();
         if (!state)
           return;
@@ -246,6 +250,7 @@ void Camera(const std::shared_ptr<Menu> &menu, bool recenter = false) {
             cpu.gpr[3] = sensitivity;
             cpu.gpr[4] = invert;
             cpu.gpr[5] = static_cast<u32>(first_person);
+            cpu.gpr[6] = static_cast<u32>(look_acceleration);
             function(&cpu);
             break;
           }
@@ -1136,7 +1141,8 @@ std::string AdapterLabel(const Menu &menu) {
   return "GPU   " + name;
 }
 constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
-constexpr int kBattleSpeedRow = kFirstPersonSensitivityRow + 1;
+constexpr int kLookAccelerationRow = kFirstPersonSensitivityRow + 1;
+constexpr int kBattleSpeedRow = kLookAccelerationRow + 1;
 constexpr int kTextSpeedRow = kBattleSpeedRow + 1;
 constexpr int kEnemyLevelRow = kTextSpeedRow + 1;
 constexpr int kSkipIntroRow = kEnemyLevelRow + 1;
@@ -1397,6 +1403,11 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     Camera(menu);
     break;
   }
+  case kLookAccelerationRow:
+    menu->look_acceleration = (menu->look_acceleration + (direction < 0 ? 2 : 1)) % 3;
+    SaveCameraSetting(*menu, "LookAcceleration", menu->look_acceleration);
+    Camera(menu);
+    break;
   case kTextSpeedRow:
     menu->text_speed = (menu->text_speed + (direction < 0 ? 3 : 1)) % 4;
     SaveGameSpeed(*menu);
@@ -1629,6 +1640,9 @@ std::vector<std::string> Rows(const Menu &menu) {
                  ? std::to_string(menu.first_person_sensitivity) + "%"
                  : "Auto (" + std::to_string(AutoFirstPersonSensitivity(menu)) +
                        "% at " + std::to_string(CurrentFrameRate()) + " FPS)"),
+        std::string("Look acceleration   ") +
+            std::array<const char *, 3>{"Off", "Normal", "Fast"}[static_cast<std::size_t>(
+                std::clamp(menu.look_acceleration, 0, 2))],
         "Battle speed   " + std::to_string(menu.battle_speed) + "x",
         std::string("Text speed   ") +
             std::array<const char *, 4>{"Normal", "Fast", "Faster", "Instant"}[static_cast<std::size_t>(
@@ -1696,6 +1710,8 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
   section->Get("FirstPersonFov", &menu->first_person_fov, 100);
   section->Get("FirstPersonDot", &menu->first_person_dot, true);
   section->Get("FirstPersonSensitivity", &menu->first_person_sensitivity, 0);
+  section->Get("LookAcceleration", &menu->look_acceleration, 1);
+  menu->look_acceleration = std::clamp(menu->look_acceleration, 0, 2);
   {
     auto *gameplay = ini.GetOrCreateSection("Gameplay");
     ini.GetOrCreateSection("World")->Get("TimeOfDay", &menu->time_of_day, 0);
