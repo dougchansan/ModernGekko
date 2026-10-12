@@ -800,6 +800,14 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
         target_link_libraries(moderngekko_onscreen_ui_lifecycle_test PRIVATE
             ModernGekko::Runtime uicommon imgui implot)
+        # OnScreenUI reads a Core setting, which pulls in Core objects that call
+        # the runtime's host callbacks. GNU ld reads static libraries once, in
+        # order: take the runtime object that defines them up front, as the
+        # runner's own references do.
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_link_options(moderngekko_onscreen_ui_lifecycle_test PRIVATE
+                "LINKER:--undefined=_Z17Host_TitleChangedv")
+        endif()
         target_compile_features(moderngekko_onscreen_ui_lifecycle_test PRIVATE cxx_std_23)
         if(MSVC)
             target_compile_options(moderngekko_onscreen_ui_lifecycle_test PRIVATE /Zc:preprocessor)
