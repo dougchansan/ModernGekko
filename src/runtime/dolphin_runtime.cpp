@@ -1678,11 +1678,38 @@ struct RuntimeAutomationState
   std::string watchdog_last_recovery;
 };
 
+// Presented frames (frame interpolation shows more than the game renders),
+// counted by the present hook for the title's output rate.
+std::atomic<std::uint64_t> s_title_present_count{0};
+
+// Presents per second over the last ~second, sampled by the title update.
+double TitlePresentRate() {
+  static std::uint64_t last_count = 0;
+  static std::chrono::steady_clock::time_point last_time{};
+  static double rate = 0.0;
+  const auto now = std::chrono::steady_clock::now();
+  const std::uint64_t count = s_title_present_count.load(std::memory_order_relaxed);
+  const double seconds = std::chrono::duration<double>(now - last_time).count();
+  if (last_time.time_since_epoch().count() == 0 || count < last_count) {
+    last_time = now;
+    last_count = count;
+  } else if (seconds >= 0.5) {
+    rate = static_cast<double>(count - last_count) / seconds;
+    last_time = now;
+    last_count = count;
+  }
+  return rate;
+}
+
 std::string FormatWindowTitle(const std::string &title, double fps) {
   if (!std::isfinite(fps) || fps < 0.0)
     fps = 0.0;
   const auto now = std::chrono::steady_clock::now();
   std::string formatted_title = fmt::format("{} | {:.1f} FPS", title, fps);
+  // With 120/240 Hz frame interpolation the screen gets more frames than the
+  // game renders: show that output rate too.
+  if (const double hz = TitlePresentRate(); hz > fps * 1.4 + 5.0)
+    formatted_title += fmt::format(" | {:.0f} Hz", hz);
   const NetPlay::InputWaitTelemetry telemetry =
       NetPlay::NetPlayClient::GetInputWaitTelemetry();
   if (!telemetry.active) {
@@ -3522,6 +3549,7 @@ RuntimeRunResult Runtime::Run() {
                                                    std::memory_order_relaxed);
         m_impl->automation_state.present_count.store(info.present_count,
                                                      std::memory_order_relaxed);
+        s_title_present_count.store(info.present_count, std::memory_order_relaxed);
       });
   m_impl->navigation_overlay.mode.store(
       m_impl->config.graphics.navigation_overlay, std::memory_order_relaxed);

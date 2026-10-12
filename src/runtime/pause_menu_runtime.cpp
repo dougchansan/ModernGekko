@@ -1710,7 +1710,8 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       bool skip = false;
       gameplay->Get("SkipIntro", &skip, false);
       // Booted from the title snapshot (quick_boot.hpp): nothing to cover.
-      if (skip && !quick_boot::Loaded()) {
+      // A launch from a savestate has no boot to cover either.
+      if (skip && !quick_boot::Loaded() && !config.load_state_path) {
         menu->boot_cover = true;
         menu->boot_cover_start = std::chrono::steady_clock::now();
         // Uncapped while covered: the logo hold, fades and movie-floor waits
@@ -2047,7 +2048,13 @@ std::string Upper(std::string text) {
 
 // Current field floor id: *(*(*(0x8047ACC8)) + 0xC) (0 before the first floor).
 u32 CurrentFloor() {
-  auto &memory = Core::System::GetInstance().GetMemory();
+  auto &system = Core::System::GetInstance();
+  auto &memory = system.GetMemory();
+  // Before the core runs (boot, savestate load) guest RAM is not mapped and
+  // GetPointerForRange raises an "Unknown pointer" panic.
+  const auto state = Core::GetState(system);
+  if (!memory.GetRAM() || (state != Core::State::Running && state != Core::State::Paused))
+    return 0;
   auto read = [&memory](u32 address) -> u32 {
     const u8 *p = address >= 0x80000000u ? memory.GetPointerForRange(address, 4) : nullptr;
     return p ? (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | p[3] : 0;

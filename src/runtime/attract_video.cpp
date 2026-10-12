@@ -19,6 +19,7 @@
 #include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Common/StringUtil.h"
+#include "Core/Core.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
 #include "VideoCommon/AbstractGfx.h"
@@ -52,7 +53,12 @@ struct GuestMovie {
 
 GuestMovie ReadGuest() {
   GuestMovie movie;
-  auto &memory = Core::System::GetInstance().GetMemory();
+  auto &system = Core::System::GetInstance();
+  auto &memory = system.GetMemory();
+  // Guest RAM is unmapped before the core runs; reading it then panics.
+  const auto core_state = Core::GetState(system);
+  if (!memory.GetRAM() || (core_state != Core::State::Running && core_state != Core::State::Paused))
+    return movie;
   auto bytes = [&memory](std::uint32_t address, std::uint32_t size) -> const std::uint8_t * {
     return address >= 0x80000000u ? memory.GetPointerForRange(address, size) : nullptr;
   };
