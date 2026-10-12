@@ -1147,7 +1147,9 @@ std::string AdapterLabel(const Menu &menu) {
     name += "  (Enter / A to apply)";
   return "GPU   " + name;
 }
-constexpr int kFirstPersonSensitivityRow = kFirstAmdRow + amd::kFeatureCount;
+// NVIDIA Reflex (Vulkan on NVIDIA GPUs): g_low_latency_mode.
+constexpr int kReflexRow = kFirstAmdRow + amd::kFeatureCount;
+constexpr int kFirstPersonSensitivityRow = kReflexRow + 1;
 constexpr int kLookAccelerationRow = kFirstPersonSensitivityRow + 1;
 constexpr int kBattleSpeedRow = kLookAccelerationRow + 1;
 constexpr int kTextSpeedRow = kBattleSpeedRow + 1;
@@ -1518,6 +1520,19 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
   case kFirstAmdRow + 5:
     CycleAmdSetting(menu, row - kFirstAmdRow, direction);
     break;
+  case kReflexRow: {
+    if (!g_low_latency_supported.load()) {
+      menu->status = "NVIDIA Reflex needs an NVIDIA GPU with the Vulkan graphics API.";
+      break;
+    }
+    const int mode = (g_low_latency_mode.load() + (direction < 0 ? 2 : 1)) % 3;
+    g_low_latency_mode.store(mode);
+    Common::IniFile ini;
+    ini.Load(menu->config_path);
+    ini.GetOrCreateSection("NVIDIA")->Set("Reflex", mode);
+    ini.Save(menu->config_path);
+    break;
+  }
   case kFirstPersonSensitivityRow: {
     // Auto, then 40% .. 250% in steps of 10.
     int value = menu->first_person_sensitivity;
@@ -1749,6 +1764,11 @@ std::vector<std::string> Rows(const Menu &menu) {
         AmdLabel(menu, amd::Feature::ImageSharpening),
         AmdLabel(menu, amd::Feature::EnhancedSync),
         AmdLabel(menu, amd::Feature::FluidMotionFrames),
+        std::string("NVIDIA Reflex   ") +
+            (g_low_latency_supported.load()
+                 ? std::array<const char *, 3>{"Off", "On", "On + Boost"}[static_cast<std::size_t>(
+                       std::clamp(g_low_latency_mode.load(), 0, 2))]
+                 : "Not available (NVIDIA GPU + Vulkan)"),
         "First-person turn speed   " +
             (menu.first_person_sensitivity > 0
                  ? std::to_string(menu.first_person_sensitivity) + "%"
@@ -1890,6 +1910,12 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     const char *switch_event = std::getenv("MODERNGEKKO_SWITCH_EVENT");
     amd::Initialize(config.user_directory / "amd-driver-restore.ini",
                     switch_event && *switch_event);
+    // NVIDIA Reflex: config.ini [NVIDIA] Reflex, unless MODERNGEKKO_REFLEX set it.
+    if (!std::getenv("MODERNGEKKO_REFLEX")) {
+      int reflex = 0;
+      ini.GetOrCreateSection("NVIDIA")->Get("Reflex", &reflex, 0);
+      g_low_latency_mode.store(std::clamp(reflex, 0, 2));
+    }
     const auto *amd_section = ini.GetOrCreateSection("AMD");
     for (int i = 0; i < amd::kFeatureCount; ++i) {
       amd_section->Get(amd::Key(static_cast<amd::Feature>(i)), &menu->amd_choice[i], -1);
@@ -2183,12 +2209,12 @@ const char *SettingsSection(std::size_t row) {
   case 17: return "FIRST PERSON";
   case 20: return "GRAPHICS";
   case static_cast<std::size_t>(kPresetRows + kFirstAmdRow): return "AMD RADEON";
+  case static_cast<std::size_t>(kPresetRows + kReflexRow): return "NVIDIA";
   case static_cast<std::size_t>(kPresetRows + kFirstPersonSensitivityRow): return "FEEL";
   case static_cast<std::size_t>(kPresetRows + kBattleSpeedRow): return "BATTLE SPEED";
   case static_cast<std::size_t>(kPresetRows + kEnemyLevelRow): return "DIFFICULTY";
   case static_cast<std::size_t>(kPresetRows + kSkipIntroRow): return "STARTUP & LOADING";
   case static_cast<std::size_t>(kPresetRows + kTimeOfDayRow): return "WORLD";
-  case static_cast<std::size_t>(kPresetRows + kMotionTestRow): return "TESTS";
   default: return nullptr;
   }
 }
@@ -2265,10 +2291,14 @@ void DrawInfoOverlay(const Menu &menu) {
   else
     std::snprintf(lines[2], sizeof(lines[2]), "Camera: the game's own (no camera mod stamps)");
   std::snprintf(lines[3], sizeof(lines[3]), "Eye %.1f, %.1f, %.1f", cam.eye[0], cam.eye[1], cam.eye[2]);
-  std::snprintf(lines[4], sizeof(lines[4]), "Occlusion %s   style %s   debug view %s",
+  char reflex[64] = "";
+  if (g_low_latency_supported.load())
+    std::snprintf(reflex, sizeof(reflex), "   Reflex %s %.1f ms",
+                  g_low_latency_mode.load() ? "on" : "off", g_low_latency_ms.load());
+  std::snprintf(lines[4], sizeof(lines[4]), "Occlusion %s   style %s   debug view %s%s",
                 kLevels[static_cast<std::size_t>(std::clamp(g_ambient_occlusion.load(), 0, 3))],
                 kStyles[static_cast<std::size_t>(std::clamp(g_visual_style.load(), 0, 2))],
-                kViews[static_cast<std::size_t>(std::clamp(g_debug_view.load(), 0, 3))]);
+                kViews[static_cast<std::size_t>(std::clamp(g_debug_view.load(), 0, 3))], reflex);
   std::snprintf(lines[5], sizeof(lines[5]), "Esc > Developer to change");
   const auto &io = ImGui::GetIO();
   const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.5f);
