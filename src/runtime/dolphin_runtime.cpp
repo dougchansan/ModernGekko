@@ -4408,4 +4408,13 @@ const GameMetadata &Runtime::GetGameMetadata() const {
   return m_impl->metadata;
 }
 const std::string &Runtime::GetWindowTitle() const { return m_impl->title; }
+double TitlePresentRateForHost() { return TitlePresentRate(); }
 } // namespace moderngekko
+
+namespace moderngekko {
+double TitlePresentRateForHost();
+}
+
+// Presents per second (the window title output rate), for the pause menu's
+// developer info overlay.
+double Host_PresentRate() { return moderngekko::TitlePresentRateForHost(); }

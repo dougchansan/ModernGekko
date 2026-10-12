@@ -22,6 +22,7 @@
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/CameraWarp.h"
 #include "VideoCommon/FrameDumper.h"
+#include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/Present.h"
 #include "VideoCommon/VideoConfig.h"
 #include "moderngekko/cpu_state.h"
@@ -58,6 +59,7 @@
 #endif
 
 bool Host_IsSixtyFpsEnabled();
+double Host_PresentRate();
 void Host_ToggleSixtyFps();
 bool Host_IsHighResolutionTexturesEnabled();
 void Host_ToggleHighResolutionTextures();
@@ -177,6 +179,11 @@ struct Menu {
   // a full-right look stick between these steady_clock times (ns).
   std::atomic<bool> motion_test{false};
   std::atomic<long long> spin_start_ns{0}, spin_end_ns{0};
+  // Developer page: info overlay and game speed (index into kGameSpeeds).
+  std::atomic<bool> info_overlay{false};
+  int game_speed = 0;
+  // The game's own debug displays (Developer page), as last set from here.
+  bool game_cpu_meter = false, game_collision = false, game_shadow_debug = false;
 };
 std::atomic<std::shared_ptr<Menu>> current;
 thread_local bool polling_menu = false;
@@ -1151,10 +1158,126 @@ constexpr int kTimeOfDayRow = kFastLoadingRow + 1;
 constexpr int kSoftShadowsRow = kTimeOfDayRow + 1;
 constexpr int kAmbientOcclusionRow = kSoftShadowsRow + 1;
 constexpr int kVisualStyleRow = kAmbientOcclusionRow + 1;
-constexpr int kMotionTestRow = kVisualStyleRow + 1;
-constexpr int kSpinTestRow = kMotionTestRow + 1;
-constexpr int kSettingsRows = kPresetRows + kSpinTestRow + 2;  // + Back
+constexpr int kSettingsRows = kPresetRows + kVisualStyleRow + 2;  // + Back
 constexpr double kSpinTestSeconds = 6.0;
+
+// Developer page rows.
+constexpr int kDebugViewRow = 0;
+constexpr int kInfoOverlayRow = 1;
+constexpr int kGameSpeedRow = 2;
+constexpr int kMotionTestRow = 3;
+constexpr int kSpinTestRow = 4;
+// The game's own debug displays, left in the retail game behind its stripped
+// debug menu (dbgMenu*, decomp names). The CPU meter is a flag the game reads
+// every frame; the others call the menu's own functions through the camera mod.
+// (Its memory-info and no-draw-area windows and second collision flag draw
+// nothing in the retail game, so they are not offered.)
+constexpr int kGameCpuMeterRow = 5;
+constexpr int kGameCollisionRow = 6;
+constexpr int kGameShadowDebugRow = 7;
+constexpr int kDeveloperRows = kGameShadowDebugRow + 2;  // + Back
+constexpr u32 kGameCpuMeterFlag = 0x8047ACF0;     // gapp: CPU time bars on
+constexpr u32 kDbgMenuColisionDisp = 0x801333AC;  // arg 0xB8: collision + event zones
+constexpr u32 kDebugMenuShadowBorderDisp = 0x801334A8;
+
+// Queues a guest call for the camera mod to run on the next frame (it needs a
+// live CPU state). False without the camera mod.
+bool GameDebugCall(const std::shared_ptr<Menu> &menu, u32 address, u32 arg = 0) {
+  {
+    std::lock_guard lock(menu->mods_mutex);
+    if (!menu->mods)
+      return false;
+    bool found = false;
+    for (const auto &mod : menu->mods->GetLoadedMods())
+      found = found || menu->mods->FindExport(mod.id, "moderngekko.debug.call") != nullptr;
+    if (!found)
+      return false;
+  }
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), address, arg] {
+    const auto state = weak.lock();
+    if (!state)
+      return;
+    std::lock_guard lock(state->mods_mutex);
+    if (!state->active || !state->mods)
+      return;
+    for (const auto &mod : state->mods->GetLoadedMods()) {
+      if (auto function = state->mods->FindExport(mod.id, "moderngekko.debug.call")) {
+        CPUState cpu{};
+        cpu.gpr[3] = address;
+        cpu.gpr[4] = arg;
+        function(&cpu);
+        break;
+      }
+    }
+  });
+  return true;
+}
+
+void SetGameCpuMeter(bool on) {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [on] {
+    auto &memory = Core::System::GetInstance().GetMemory();
+    if (memory.GetRAM())
+      memory.Write_U32(on ? 1u : 0u, kGameCpuMeterFlag);
+  });
+}
+// Game speed choices (0 = unlimited).
+constexpr std::array<float, 5> kGameSpeeds{1.0f, 0.5f, 2.0f, 4.0f, 0.0f};
+
+std::string GameSpeedLabel(int index) {
+  static constexpr std::array<const char *, 5> kLabels{"Normal", "Half", "2x", "4x", "Unlimited"};
+  return kLabels[static_cast<std::size_t>(std::clamp(index, 0, 4))];
+}
+
+void AdjustDeveloper(const std::shared_ptr<Menu> &menu, int direction, bool accept) {
+  switch (static_cast<int>(menu->policy.focus())) {
+  case kDebugViewRow:
+    g_debug_view.store((g_debug_view.load() + (direction < 0 ? 3 : 1)) % 4);
+    break;
+  case kInfoOverlayRow:
+    menu->info_overlay = !menu->info_overlay;
+    break;
+  case kGameSpeedRow: {
+    const int count = static_cast<int>(kGameSpeeds.size());
+    menu->game_speed = (menu->game_speed + (direction < 0 ? count - 1 : 1)) % count;
+    Config::SetCurrent(Config::MAIN_EMULATION_SPEED,
+                       kGameSpeeds[static_cast<std::size_t>(menu->game_speed)]);
+    break;
+  }
+  case kMotionTestRow:
+    // Closes the menu so the lanes animate at the game's present rate.
+    menu->motion_test = !menu->motion_test;
+    if (menu->motion_test)
+      menu->policy.close();
+    break;
+  case kGameCpuMeterRow:
+    menu->game_cpu_meter = !menu->game_cpu_meter;
+    SetGameCpuMeter(menu->game_cpu_meter);
+    break;
+  case kGameCollisionRow:
+  case kGameShadowDebugRow: {
+    const bool collision = static_cast<int>(menu->policy.focus()) == kGameCollisionRow;
+    if (!GameDebugCall(menu, collision ? kDbgMenuColisionDisp : kDebugMenuShadowBorderDisp,
+                       0xB8)) {
+      menu->status = "The game's debug displays need the camera mod.";
+      break;
+    }
+    bool &flag = collision ? menu->game_collision : menu->game_shadow_debug;
+    flag = !flag;
+    break;
+  }
+  case kSpinTestRow: {
+    if (!accept)
+      break;
+    const long long start = SteadyNs() + 500'000'000;  // after the menu closes
+    menu->spin_start_ns = start;
+    menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
+    menu->policy.close();
+    break;
+  }
+  default:
+    break;
+  }
+}
 
 void RefreshAmdStates(Menu &menu) {
   for (int i = 0; i < amd::kFeatureCount; ++i)
@@ -1219,6 +1342,10 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     direction = 1;  // other rows treat Enter / A like Right
   if (menu->policy.page() == Page::Controls) {
     CycleDevice(direction);
+    return;
+  }
+  if (menu->policy.page() == Page::Developer) {
+    AdjustDeveloper(menu, direction, accept);
     return;
   }
   if (menu->policy.focus() < kPresetRows) {
@@ -1474,19 +1601,6 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     ini.Save(menu->config_path);
     break;
   }
-  case kMotionTestRow:
-    // Closes the menu so the lanes animate at the game's present rate.
-    menu->motion_test = !menu->motion_test;
-    if (menu->motion_test)
-      menu->policy.close();
-    break;
-  case kSpinTestRow: {
-    const long long start = SteadyNs() + 500'000'000;  // after the menu closes
-    menu->spin_start_ns = start;
-    menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
-    menu->policy.close();
-    break;
-  }
   default:
     break;
   }
@@ -1569,7 +1683,7 @@ std::vector<std::string> Rows(const Menu &menu) {
   switch (menu.policy.page()) {
   case Page::Home:
     return {"Resume adventure", "Settings", "Controls", "Shadow Pok\xC3\xA9mon",
-            "Photo mode", "Save checkpoint", "Restart game", "Quit game"};
+            "Photo mode", "Save checkpoint", "Developer", "Restart game", "Quit game"};
   case Page::Shadow: {
     std::vector<std::string> rows;
     for (const auto &entry : menu.shadow.entries) {
@@ -1663,8 +1777,19 @@ std::vector<std::string> Rows(const Menu &menu) {
         std::string("Visual style   ") +
             std::array<const char *, 3>{"Off", "Vivid", "Cinematic"}[static_cast<std::size_t>(
                 std::clamp(menu.visual_style, 0, 2))],
+        "Back"};
+  case Page::Developer:
+    return {
+        std::string("Debug view   ") +
+            std::array<const char *, 4>{"Off", "Occlusion mask", "Depth", "Object IDs"}
+                [static_cast<std::size_t>(std::clamp(g_debug_view.load(), 0, 3))],
+        enabled("Info overlay", menu.info_overlay),
+        std::string("Game speed   ") + GameSpeedLabel(menu.game_speed),
         enabled("Motion test (60 / 120 / 240 Hz lanes)", menu.motion_test),
         "Camera spin test (6 s, C-stick held right)",
+        enabled("Game CPU meter", menu.game_cpu_meter),
+        enabled("Game collision & event zones", menu.game_collision),
+        enabled("Game shadow debug", menu.game_shadow_debug),
         "Back"};
   case Page::Controls: {
     std::string name = Device();
@@ -1857,7 +1982,7 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
     menu->spin_start_ns = start;
     menu->spin_end_ns = start + static_cast<long long>(kSpinTestSeconds * 1e9);
   }
-  // MODERNGEKKO_TEST_MENU=<home|settings|controls|quit>[:seconds]: opens the
+  // MODERNGEKKO_TEST_MENU=<home|settings|controls|developer|quit>[:seconds]: opens the
   // menu on that page after a delay (default 10 s) for UI screenshots.
   if (const char *test = std::getenv("MODERNGEKKO_TEST_MENU"); test && *test) {
     std::string target = test;
@@ -1876,7 +2001,9 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       else if (target == "controls")
         menu->policy.activate(2);
       else if (target == "quit")
-        menu->policy.activate(7);
+        menu->policy.activate(8);
+      else if (target == "developer")
+        menu->policy.activate(6);
       else if (target == "photo")
         ActionHost(menu, menu->policy.activate(4));
       else if (target == "shadow")
@@ -1884,6 +2011,37 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       SyncPause(menu, was_open);
     }).detach();
   }
+  // MODERNGEKKO_TEST_DEV=<row>[,<row>...][:seconds]: after a delay (default
+  // 10 s) presses Enter / A on those Developer page rows, then closes the menu.
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_DEV"); test && *test) {
+    std::string spec = test;
+    int delay = 10;
+    if (const auto colon = spec.find(':'); colon != std::string::npos) {
+      delay = std::atoi(spec.c_str() + colon + 1);
+      spec.resize(colon);
+    }
+    std::thread([menu, spec, delay] {
+      std::this_thread::sleep_for(std::chrono::seconds(delay));
+      std::lock_guard lock(menu->mutex);
+      const bool was_open = menu->policy.is_open();
+      menu->policy.open();
+      ActionHost(menu, menu->policy.activate(6));
+      menu->policy.set_rows(kDeveloperRows);
+      for (std::size_t start = 0; start < spec.size();) {
+        auto end = spec.find(',', start);
+        if (end == std::string::npos)
+          end = spec.size();
+        ActionHost(menu, menu->policy.activate(
+                             static_cast<std::size_t>(std::atoi(spec.c_str() + start))));
+        start = end + 1;
+      }
+      menu->policy.close();
+      SyncPause(menu, was_open);
+    }).detach();
+  }
+  // MODERNGEKKO_TEST_INFO=1: developer info overlay on from the start.
+  if (const char *test = std::getenv("MODERNGEKKO_TEST_INFO"); test && *test == '1')
+    menu->info_overlay = true;
   // MODERNGEKKO_TEST_RUN=1: start with running on (as a left stick click).
   if (const char *test = std::getenv("MODERNGEKKO_TEST_RUN"); test && *test == '1') {
     menu->running = true;
@@ -2084,6 +2242,48 @@ u32 CurrentFloor() {
   return entry ? read(entry + 0xC) : 0;
 }
 
+// Developer info overlay: frame rates, floor, camera, graphics debug state.
+void DrawInfoOverlay(const Menu &menu) {
+  const double present_rate = Host_PresentRate();
+  const auto &perf = Core::System::GetInstance().GetPerfMetrics();
+  const auto cam = CameraWarp::GetDebugInfo();
+  static constexpr std::array<const char *, 4> kModes{"game", "first person", "free", "orbit"};
+  static constexpr std::array<const char *, 4> kLevels{"Off", "Low", "Medium", "High"};
+  static constexpr std::array<const char *, 3> kStyles{"Off", "Vivid", "Cinematic"};
+  static constexpr std::array<const char *, 4> kViews{"Off", "Occlusion mask", "Depth", "Object IDs"};
+  constexpr double kDeg = 180.0 / 3.14159265358979323846;
+  char lines[6][160];
+  std::snprintf(lines[0], sizeof(lines[0]), "Game %.1f FPS   VI %.1f   speed %.0f%%   shown %.0f Hz",
+                perf.GetFPS(), perf.GetVPS(), perf.GetSpeed() * 100.0, present_rate);
+  std::snprintf(lines[1], sizeof(lines[1]), "Floor 0x%03X   frame rate setting %d   game speed %s",
+                CurrentFloor(), CurrentFrameRate(), GameSpeedLabel(menu.game_speed).c_str());
+  if (cam.active)
+    std::snprintf(lines[2], sizeof(lines[2]),
+                  "Camera %s   yaw %.1f   pitch %.1f   turn %.2f rad/s   240 Hz correction %.2f deg",
+                  kModes[std::min<std::size_t>(cam.mode, 3)], cam.yaw * kDeg, cam.pitch * kDeg,
+                  cam.speed, cam.correction_degrees);
+  else
+    std::snprintf(lines[2], sizeof(lines[2]), "Camera: the game's own (no camera mod stamps)");
+  std::snprintf(lines[3], sizeof(lines[3]), "Eye %.1f, %.1f, %.1f", cam.eye[0], cam.eye[1], cam.eye[2]);
+  std::snprintf(lines[4], sizeof(lines[4]), "Occlusion %s   style %s   debug view %s",
+                kLevels[static_cast<std::size_t>(std::clamp(g_ambient_occlusion.load(), 0, 3))],
+                kStyles[static_cast<std::size_t>(std::clamp(g_visual_style.load(), 0, 2))],
+                kViews[static_cast<std::size_t>(std::clamp(g_debug_view.load(), 0, 3))]);
+  std::snprintf(lines[5], sizeof(lines[5]), "Esc > Developer to change");
+  const auto &io = ImGui::GetIO();
+  const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.5f);
+  const float size = 17 * s, line_h = 21 * s;
+  ImDrawList *draw = ImGui::GetForegroundDrawList();
+  float width = 0;
+  for (const auto &line : lines)
+    width = std::max(width, ImGui::CalcTextSize(line).x * size / ImGui::GetFontSize());
+  const ImVec2 a(12 * s, 12 * s), b(a.x + width + 20 * s, a.y + line_h * 6 + 14 * s);
+  draw->AddRectFilled(a, b, IM_COL32(0, 0, 0, 170), 6 * s);
+  for (int i = 0; i < 6; ++i)
+    draw->AddText(nullptr, size, ImVec2(a.x + 10 * s, a.y + 7 * s + i * line_h),
+                  i == 5 ? IM_COL32(150, 170, 160, 255) : IM_COL32(230, 245, 235, 255), lines[i]);
+}
+
 // Skip intro cover: black until the game is past its boot floors (checked by
 // the menu tick, UpdateBootCover, which also restores the emulation speed).
 bool DrawBootCover(Menu &menu) {
@@ -2163,6 +2363,8 @@ void Draw() {
     DrawMotionTest();
   if (menu)
     DrawSpinTest(*menu);
+  if (menu && menu->info_overlay)
+    DrawInfoOverlay(*menu);
   if (menu && !menu->open && !menu->switching && menu->first_person_dot &&
       menu->first_person_active)
     DrawCentreDot();
@@ -2181,7 +2383,8 @@ void Draw() {
   menu->policy.set_rows(rows.size());
   const Page page = menu->policy.page();
   const bool list_page =
-      page == Page::Settings || page == Page::Controls || page == Page::Shadow;
+      page == Page::Settings || page == Page::Controls || page == Page::Shadow ||
+      page == Page::Developer;
 
   const auto &io = ImGui::GetIO();
   ImFont *font = MenuFont();
@@ -2242,6 +2445,7 @@ void Draw() {
                         : page == Page::Settings       ? "SETTINGS"
                         : page == Page::Controls       ? "CONTROLS"
                         : page == Page::Shadow         ? "SHADOW POK\xC3\xA9MON"
+                        : page == Page::Developer      ? "DEVELOPER"
                                                        : "PAUSE";
     const ImVec2 ts = st::TextSize(font, title_size, title);
     st::OutlinedText(draw, font, title_size, ImVec2(a.x + 40 * s, a.y + (header_h - ts.y) * 0.5f),
@@ -2635,6 +2839,7 @@ void Host_PauseMenuTick() {
   const std::size_t rows = page == Page::Settings   ? kSettingsRows
                            : page == Page::Controls ? 2
                            : page == Page::Shadow   ? menu->shadow.entries.size() + 1
+                           : page == Page::Developer ? kDeveloperRows
                                                     : 0;
   ActionHost(menu, menu->policy.update(input, now, rows));
   // A host command and an input edge in the same tick describe one toggle.
@@ -2657,7 +2862,8 @@ void Host_PauseMenuTick() {
   if (direction &&
       (direction != menu->adjust_direction || now >= menu->next_adjust) &&
       (menu->policy.page() == Page::Settings ||
-       menu->policy.page() == Page::Controls) &&
+       menu->policy.page() == Page::Controls ||
+       menu->policy.page() == Page::Developer) &&
       menu->policy.focus() + 1 < menu->policy.row_count()) {
     Adjust(menu, direction);
     menu->next_adjust =

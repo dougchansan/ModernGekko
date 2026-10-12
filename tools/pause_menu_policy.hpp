@@ -5,13 +5,14 @@
 
 namespace moderngekko::pause_menu {
 
-enum class Page { Closed, Home, Settings, Controls, Shadow, QuitConfirm, RestartConfirm };
+enum class Page { Closed, Home, Settings, Controls, Shadow, Developer, QuitConfirm, RestartConfirm };
 enum class Action {
   None,
   Resume,
   Settings,
   Controls,
   Shadow,
+  Developer,
   PhotoMode,
   SaveCheckpoint,
   Restart,
@@ -41,8 +42,13 @@ public:
   std::size_t focus() const { return focus_; }
   bool is_open() const { return page_ != Page::Closed; }
   bool blocks_game_input() const { return is_open() || release_gate_; }
+  // Pages whose row count the runtime supplies.
+  bool custom_page() const {
+    return page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow ||
+           page_ == Page::Developer;
+  }
   void set_rows(std::size_t rows) {
-    if (page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow)
+    if (custom_page())
       custom_rows_ = rows;
   }
   void reset_edges(const Input &pressed) {
@@ -57,15 +63,16 @@ public:
   }
 
   std::size_t row_count() const {
-    if (custom_rows_ && (page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow))
+    if (custom_rows_ && custom_page())
       return custom_rows_;
     switch (page_) {
     case Page::Home:
-      return 8;
+      return 9;
     case Page::Settings:
       return 4;
     case Page::Controls:
     case Page::Shadow:
+    case Page::Developer:
       return 1;
     case Page::QuitConfirm:
     case Page::RestartConfirm:
@@ -128,10 +135,14 @@ public:
       case 5:
         return Action::SaveCheckpoint;
       case 6:
+        page_ = Page::Developer;
+        focus_ = 0;
+        return Action::Developer;
+      case 7:
         page_ = Page::RestartConfirm;
         focus_ = 0;
         return Action::None;
-      case 7:
+      case 8:
         page_ = Page::QuitConfirm;
         focus_ = 0;
         return Action::None;
@@ -143,6 +154,8 @@ public:
       return row + 1 == row_count() ? back() : Action::AdjustSetting;
     case Page::Shadow:
       return row + 1 == row_count() ? back() : Action::None;
+    case Page::Developer:
+      return row + 1 == row_count() ? back() : Action::AdjustSetting;
     case Page::QuitConfirm:
       if (row == 0)
         return back();
@@ -197,7 +210,7 @@ public:
     }
     if (back_edge)
       return back();
-    if (rows && (page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow))
+    if (rows && custom_page())
       custom_rows_ = rows;
     const auto count = rows ? rows : row_count();
     if (count == 0)
