@@ -185,7 +185,29 @@ struct Menu {
   // The game's own debug displays (Developer page), as last set from here.
   bool game_cpu_meter = false, game_collision = false, game_shadow_debug = false;
 };
-std::atomic<std::shared_ptr<Menu>> current;
+// The live menu, shared across threads. A mutex-guarded slot rather than
+// std::atomic<std::shared_ptr>, which Apple's libc++ does not provide.
+class CurrentMenu {
+public:
+  std::shared_ptr<Menu> load() const {
+    std::lock_guard lock(mutex_);
+    return menu_;
+  }
+  void store(std::shared_ptr<Menu> menu) {
+    std::lock_guard lock(mutex_);
+    menu_ = std::move(menu);
+  }
+  std::shared_ptr<Menu> exchange(std::shared_ptr<Menu> menu) {
+    std::lock_guard lock(mutex_);
+    std::swap(menu_, menu);
+    return menu;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::shared_ptr<Menu> menu_;
+};
+CurrentMenu current;
 thread_local bool polling_menu = false;
 
 long long SteadyNs() {
@@ -242,7 +264,7 @@ void Camera(const std::shared_ptr<Menu> &menu, bool recenter = false) {
   const int look_acceleration = menu->look_acceleration;
   Core::RunOnCPUThread(
       Core::System::GetInstance(),
-      [weak = std::weak_ptr(menu), sensitivity, invert, first_person, look_acceleration, recenter] {
+      [weak = std::weak_ptr<Menu>(menu), sensitivity, invert, first_person, look_acceleration, recenter] {
         const auto state = weak.lock();
         if (!state)
           return;
@@ -586,7 +608,7 @@ void UpdateTimeOfDay(const std::shared_ptr<Menu> &menu, bool force = false) {
   if (!force && gains == menu->applied_tint)
     return;
   menu->applied_tint = gains;
-  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), gains] {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr<Menu>(menu), gains] {
     const auto state = weak.lock();
     if (!state)
       return;
@@ -609,7 +631,7 @@ void UpdateTimeOfDay(const std::shared_ptr<Menu> &menu, bool force = false) {
 void ConfigureGame(const std::shared_ptr<Menu> &menu) {
   const int text = menu->text_speed, battle = menu->battle_speed, levels = menu->enemy_levels;
   const bool skip = menu->skip_intro;
-  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), text, battle, skip, levels] {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr<Menu>(menu), text, battle, skip, levels] {
     const auto state = weak.lock();
     if (!state)
       return;
@@ -645,7 +667,7 @@ void SaveGameSpeed(const Menu &menu) {
 // Photo mode in the camera mod (moderngekko.camera.set_photo).
 void SetPhoto(const std::shared_ptr<Menu> &menu, bool on) {
   const int fov = menu->photo_fov;
-  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), on, fov] {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr<Menu>(menu), on, fov] {
     const auto state = weak.lock();
     if (!state)
       return;
@@ -721,7 +743,7 @@ void LeavePhotoMode(const std::shared_ptr<Menu> &menu) {
 
 // Run (left stick click toggles): Wes and Rui move and animate twice as fast.
 void SetRun(const std::shared_ptr<Menu> &menu, bool running) {
-  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), running] {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr<Menu>(menu), running] {
     const auto state = weak.lock();
     if (!state)
       return;
@@ -1195,7 +1217,7 @@ bool GameDebugCall(const std::shared_ptr<Menu> &menu, u32 address, u32 arg = 0) 
     if (!found)
       return false;
   }
-  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr(menu), address, arg] {
+  Core::RunOnCPUThread(Core::System::GetInstance(), [weak = std::weak_ptr<Menu>(menu), address, arg] {
     const auto state = weak.lock();
     if (!state)
       return;
@@ -2230,7 +2252,7 @@ std::pair<std::string, std::string> SplitRow(const std::string &row) {
 }
 
 void QueueActivate(const std::shared_ptr<Menu> &menu, std::size_t row) {
-  Core::QueueHostJob([weak = std::weak_ptr(menu), row](Core::System &) {
+  Core::QueueHostJob([weak = std::weak_ptr<Menu>(menu), row](Core::System &) {
     auto state = weak.lock();
     if (!state)
       return;
@@ -2908,7 +2930,7 @@ void Host_PauseMenuTick() {
       !menu->repaint_pending.exchange(true)) {
     menu->last_repaint = time;
     Core::RunOnCPUThread(Core::System::GetInstance(),
-                         [weak = std::weak_ptr(menu)] {
+                         [weak = std::weak_ptr<Menu>(menu)] {
                            const auto state = weak.lock();
                            if (!state || !state->active)
                              return;
