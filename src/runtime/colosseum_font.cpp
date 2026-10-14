@@ -61,7 +61,7 @@ std::unique_ptr<BitmapFont> LoadBitmapFont(const std::string &directory, const s
   std::string png;
   if (!File::ReadFileToString(directory + name + "_atlas.png", png))
     return nullptr;
-  Common::UniqueBuffer<u8> rgba;
+  std::vector<u8> rgba;
   u32 w = 0, h = 0;
   if (!Common::LoadPNG(std::span(reinterpret_cast<const u8 *>(png.data()), png.size()), &rgba, &w,
                        &h) ||

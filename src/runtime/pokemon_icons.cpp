@@ -9,6 +9,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 #include <imgui.h>
@@ -30,7 +31,7 @@ struct Icon {
 // Decoded once; each icon is copied into ImGui's font atlas texture (as a
 // custom rectangle) the first time it is drawn. The renderer already manages
 // that texture; a separate user texture is not drawn by this backend.
-Common::UniqueBuffer<u8> s_pixels;
+std::vector<u8> s_pixels;
 u32 s_width = 0, s_height = 0;
 std::unordered_map<int, Icon> s_icons;
 ImFontAtlas *s_atlas = nullptr;
