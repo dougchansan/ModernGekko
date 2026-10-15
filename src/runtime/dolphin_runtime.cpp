@@ -1101,6 +1101,28 @@ void RestoreColosseumWidescreenGuestHook()
   ApplyMemoryPatch<u32>(guard, std::bit_cast<u32>(1.0f), 0x8047E724);
 }
 
+// fn_80191118, the HSD bound test behind GSmodel and stage-chunk visibility,
+// projects two diagonal corners of a box and rejects it when both land off the
+// authored 4:3 screen: x and y against 0 (.sdata2 0x8047D8B8, shared by both
+// axes) and x against 640 (0x8047D8BC); y's 480 is 0x8047D8C0. At native Hor+
+// the visible x range in those 4:3 units is 320 -+ 320 * multiplier, so a model
+// at the extended screen edges could be culled while in view (the freecam
+// mod's black floor chunks were this test). Keep the limits on the projection
+// multiplier; 1.0 restores the authored 0 and 640. The constants are read from
+// memory by the recompiled code (lfs off r2), so this applies to the module too.
+void WidenColosseumBoundTest(Memory::MemoryManager& memory, u32 projection_bits)
+{
+  const float multiplier = std::bit_cast<float>(projection_bits);
+  if (!(multiplier >= 1.0f && multiplier < 16.0f))
+    return;
+  const u32 low = std::bit_cast<u32>(320.0f - 320.0f * multiplier);
+  const u32 high = std::bit_cast<u32>(320.0f + 320.0f * multiplier);
+  if (memory.Read_U32(0x8047D8B8) != low)
+    memory.Write_U32(low, 0x8047D8B8);
+  if (memory.Read_U32(0x8047D8BC) != high)
+    memory.Write_U32(high, 0x8047D8BC);
+}
+
 // The PDA frame itself occupies 602 of the authored 640 horizontal pixels.
 // Match that edge so the ultrawide extension covers only the unused world
 // bands and never overlaps the PDA's foreground widgets.
@@ -3636,12 +3658,19 @@ RuntimeRunResult Runtime::Run() {
           // and the character model flickered between aspects for the whole
           // transition. Its job is to keep the word from being clobbered, not
           // to have an opinion about what the word should be.
+          // MODERNGEKKO_AUTHORED_PROJECTION=1 (diagnostic): keep the game's
+          // own 4:3 projection under any presentation.
+          static const bool authored_projection =
+              std::getenv("MODERNGEKKO_AUTHORED_PROJECTION") != nullptr;
           const u32 projection_bits =
-              m_impl->navigation_overlay.guest_projection_bits.load(
-                  std::memory_order_acquire);
+              authored_projection ?
+                  std::bit_cast<u32>(1.0f) :
+                  m_impl->navigation_overlay.guest_projection_bits.load(
+                      std::memory_order_acquire);
           auto& memory = Core::System::GetInstance().GetMemory();
           if (memory.Read_U32(0x8047E724) != projection_bits)
             memory.Write_U32(projection_bits, 0x8047E724);
+          WidenColosseumBoundTest(memory, projection_bits);
           });
       // The callback also owns PDA side-fill and the optional controller
       // overlay, so keep it registered even when the minimap itself is hidden.
@@ -4242,8 +4271,11 @@ RuntimeRunResult Runtime::Run() {
             // scale changes exactly when the aspect does.
             const bool settled_gameplay_ultrawide =
                 m_impl->navigation_overlay.field_aspect_active;
+            static const bool authored_projection =
+                std::getenv("MODERNGEKKO_AUTHORED_PROJECTION") != nullptr;
             const float guest_projection_aspect =
-                settled_gameplay_ultrawide ? target.aspect : kAuthoredGameAspect;
+                settled_gameplay_ultrawide && !authored_projection ? target.aspect :
+                                                                     kAuthoredGameAspect;
             const u32 projection_bits = std::bit_cast<u32>(
                 guest_projection_aspect / kAuthoredGameAspect);
             m_impl->navigation_overlay.guest_projection_bits.store(
