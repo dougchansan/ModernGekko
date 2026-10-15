@@ -818,10 +818,15 @@ void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
     best.archive_name = FindLoadedFieldArchiveName(ram);
 
   std::lock_guard lock(state.mutex);
+  const bool new_room = state.collision_room_id != room_id;
   state.collision_room_id = room_id;
   state.collision_segments = std::move(best.segments);
   state.collision_valid = !state.collision_segments.empty();
-  if (!state.collision_valid)
+  // Only the first scan of a room arms the retries. Re-arming on every failed
+  // retry made the chain endless wherever there is no field collision (every
+  // battle, cutscenes): a full scan of game RAM every 30 frames on the
+  // emulation thread, about 1% of it and a periodic hitch.
+  if (!state.collision_valid && new_room)
   {
     // A room change fires this scan the instant the new room id appears, which
     // is before the field archive has finished streaming in -- the scan then
@@ -836,7 +841,7 @@ void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
     state.collision_refresh_delay_frames = 30;
     state.collision_refresh_retries = 6;
   }
-  else
+  else if (state.collision_valid)
   {
     // Found it -- stop any retry still pending so a successful scan does not
     // keep paying for the next several.
