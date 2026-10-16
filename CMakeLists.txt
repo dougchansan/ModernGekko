@@ -282,12 +282,15 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     if(APPLE)
         # Dolphin's windowed backend for macOS
         target_sources(moderngekko PRIVATE
-            vendor/dolphin/Source/Core/DolphinNoGUI/PlatformMacos.mm)
+            vendor/dolphin/Source/Core/DolphinNoGUI/PlatformMacos.mm
+            src/runtime/gba_window_macos.mm)
         set_source_files_properties(
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformMacos.mm
+            src/runtime/gba_window_macos.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_link_libraries(moderngekko PRIVATE
-            "${APPKIT_LIBRARY}" "${COREFOUNDATION_LIBRARY}" "${IOK_LIBRARY}")
+            "${APPKIT_LIBRARY}" "${COREFOUNDATION_LIBRARY}" "${IOK_LIBRARY}"
+            "-framework QuartzCore")
         target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_HAVE_COCOA=1)
     endif()
     target_include_directories(moderngekko PRIVATE

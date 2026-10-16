@@ -271,7 +271,7 @@ void TickWindows()
 }
 }  // namespace moderngekko::gba_screen::detail
 
-#else
+#elif !defined(__APPLE__)  // macOS: gba_window_macos.mm
 
 namespace moderngekko::gba_screen::detail
 {

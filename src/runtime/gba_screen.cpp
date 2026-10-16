@@ -308,7 +308,7 @@ void Draw()
         settings.show_numbers = !settings.show_numbers;
         save_now = true;
       }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
       if (ImGui::MenuItem("Move to its own window"))
       {
         view.detached = true;
