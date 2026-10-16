@@ -385,11 +385,10 @@ void Tick()
   detail::TickWindows();
 
   // Holding L+R+Start+Select on a GBA's controller for a second turns that
-  // GBA off and on. Dolphin only reads a GBA's buttons when the game polls
-  // it, which a linked Colosseum rarely does, so poll here as well. Over
-  // netplay the reset has to travel with the inputs: Dolphin's reset request
-  // rides on the next poll of that controller, which this poll would eat, so
-  // it is put back for netplay to send.
+  // GBA off and on. Not over netplay: reading the pad here takes Dolphin's
+  // pending reset (the X bit netplay must send with the inputs), and putting
+  // it back re-armed it forever, so the GBA kept rebooting and could not read
+  // its cartridge's save. There, the Players menu and automation reset it.
   static auto s_last_poll = std::chrono::steady_clock::time_point{};
   static std::array<std::chrono::steady_clock::time_point, 4> s_held_since{};
   static std::array<bool, 4> s_fired{};
@@ -397,21 +396,18 @@ void Tick()
   if (now - s_last_poll < std::chrono::milliseconds(16) || !Pad::IsGBAInitialized())
     return;
   s_last_poll = now;
-  const bool netplay = NetPlay::IsNetPlayRunning();
+  if (NetPlay::IsNetPlayRunning())
+    return;
   constexpr u16 combo = PAD_TRIGGER_L | PAD_TRIGGER_R | PAD_TRIGGER_Z | PAD_BUTTON_START;
   for (int i = 0; i < 4; ++i)
   {
-    // Outside netplay controller i drives port i's GBA; over netplay it is
-    // this player's i-th controller, wherever netplay put it.
-    if (!netplay && !IsActive(i))
+    if (!IsActive(i))
     {
       s_held_since[i] = {};
       s_fired[i] = false;
       continue;
     }
     const GCPadStatus status = Pad::GetGBAStatus(i);
-    if (netplay && (status.button & PAD_BUTTON_X))
-      Pad::SetGBAReset(i, true);
     if ((status.button & combo) != combo)
     {
       s_held_since[i] = {};
@@ -423,10 +419,7 @@ void Tick()
     else if (!s_fired[i] && now - s_held_since[i] >= std::chrono::seconds(1))
     {
       s_fired[i] = true;
-      if (netplay)
-        Pad::SetGBAReset(i, true);
-      else
-        ResetGba(i);
+      ResetGba(i);
     }
   }
 }
