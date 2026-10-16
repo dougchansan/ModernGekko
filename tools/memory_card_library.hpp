@@ -11,6 +11,7 @@
 // <name>.gci.bak). Saves made outside the launcher are therefore never lost.
 
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -45,6 +46,10 @@ public:
   bool Create(const std::string& name, std::string* error);
   bool Duplicate(int index, const std::string& name, std::string* error);
   bool Rename(int index, const std::string& name, std::string* error);
+  // Removes a card (and its .bak) with `remove`, e.g. a move to the Recycle
+  // Bin. The card in Slot A cannot be deleted; insert another first.
+  bool Delete(int index, const std::function<bool(const std::filesystem::path&)>& remove,
+              std::string* error);
 
   // Copies Slot A back into the inserted card: after a play session.
   bool CollectSlot(std::string* error);

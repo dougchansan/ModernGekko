@@ -253,7 +253,7 @@ struct NavigationOverlayState
   std::filesystem::path pending_load_state;
   bool pending_save_is_recovery = false;
   bool has_seen_valid_room = false;
-  GCPadStatus input_status{};
+  std::array<GCPadStatus, 4> input_status{};  // ports 1-4
   // Queued like the save/load paths rather than acted on in the window
   // procedure: these have to happen on the thread that owns the core, and the
   // UI thread does not.
@@ -758,34 +758,121 @@ std::string FindLoadedFieldArchiveName(std::span<const u8> ram)
   return {};
 }
 
+// Field archives are named <area>_<place>[_<floor>][_<part>][_bf|_ev_N|_rl]
+// (M2_cave_2F_1, D4_tower_1F_2_bf). The area code is the town or dungeon; the
+// place names below are the ones the game itself uses where they are known.
+// A place not listed is shown as its area, so a guess is never presented as a
+// name.
 std::string FriendlyLocationName(const std::string& archive_name,
                                  unsigned int room_id)
 {
-  if (archive_name == "S1_out")
-    return "Outskirt Stand";
-  if (archive_name == "S1_shop_1F")
-    return "Outskirt Stand Shop 1F";
-  if (archive_name == "M1_out")
-    return "Phenac City";
-  if (archive_name == "M1_stadium_1F")
-    return "Phenac Stadium 1F";
+  if (archive_name.empty())
+    return fmt::format("Room {:02X}", room_id);
 
-  if (!archive_name.empty())
+  std::vector<std::string> parts;
+  for (std::size_t start = 0; start <= archive_name.size();)
   {
-    std::string name = archive_name;
-    std::ranges::replace(name, '_', ' ');
-    if (name.size() > 3 && std::isalpha(static_cast<unsigned char>(name[0])) &&
-        std::isdigit(static_cast<unsigned char>(name[1])) && name[2] == ' ')
+    std::size_t end = archive_name.find('_', start);
+    if (end == std::string::npos)
+      end = archive_name.size();
+    parts.push_back(archive_name.substr(start, end - start));
+    start = end + 1;
+  }
+  const std::string area = parts.front();
+  const std::string place = parts.size() > 1 ? parts[1] : "out";
+  std::string floor;
+  std::string number;
+  for (std::size_t i = 2; i < parts.size(); ++i)
+  {
+    const std::string& part = parts[i];
+    if (part == "bf" || part == "rl")
+      continue;
+    if (part == "ev")
     {
-      name.erase(0, 3);
+      ++i;  // the event variant's number
+      continue;
     }
-    if (!name.empty())
-      name[0] = static_cast<char>(
-          std::toupper(static_cast<unsigned char>(name[0])));
-    return name;
+    const bool is_floor = part.size() >= 2 &&
+                          ((std::isdigit(static_cast<unsigned char>(part[0])) && part.back() == 'F') ||
+                           (part[0] == 'B' && std::isdigit(static_cast<unsigned char>(part[1]))));
+    if (is_floor && floor.empty())
+      floor = part;
+    else if (!part.empty() &&
+             std::ranges::all_of(part, [](unsigned char c) { return std::isdigit(c); }) &&
+             number.empty())
+      number = part;
   }
 
-  return fmt::format("Room {:02X}", room_id);
+  struct Area
+  {
+    const char* code;
+    const char* name;
+  };
+  static constexpr Area kAreas[] = {
+      {"S1", "Outskirt Stand"}, {"S2", "Snagem Hideout"}, {"M1", "Phenac City"},
+      {"M2", "Pyrite Town"},    {"M3", "Agate Village"},  {"M4", "The Under"},
+      {"D1", "Shadow Pok\xC3\xA9mon Lab"}, {"D2", "Mt. Battle"},
+      {"D4", "Realgam Tower"},  {"T1", "Orre Colosseum"},
+  };
+  const char* area_name = nullptr;
+  for (const Area& entry : kAreas)
+    if (area == entry.code)
+      area_name = entry.name;
+  if (!area_name)
+    return fmt::format("Room {:02X}", room_id);
+
+  struct Place
+  {
+    const char* area;  // nullptr: any area
+    const char* place;
+    const char* name;  // "{}" is the area's name
+    bool floors;       // say which floor
+    bool numbered;     // say which numbered part (rest areas)
+  };
+  static constexpr Place kPlaces[] = {
+      {nullptr, "out", "{}", false, false},
+      {nullptr, "pc", "{} Pok\xC3\xA9mon Center", false, false},
+      {nullptr, "shop", "{} Pok\xC3\xA9 Mart", false, false},
+      {nullptr, "houseA", "{}", false, false},
+      {nullptr, "houseB", "{}", false, false},
+      {nullptr, "houseC", "{}", false, false},
+      {nullptr, "houseD", "{}", false, false},
+      {"S1", "shop", "Outskirt Stand", false, false},
+      {"S2", "bossroom", "Snagem Hideout, Gonzap's Room", false, false},
+      {"S2", "snatchroom", "Snagem Hideout, Snag Machine Room", false, false},
+      {"S2", "building", "Snagem Hideout", true, false},
+      {"M1", "stadium", "Phenac Stadium", false, false},
+      {"M1", "water", "Phenac Stadium", false, false},
+      {"M2", "building", "Pyrite Building", true, false},
+      {"M2", "cave", "Pyrite Cave", true, false},
+      {"M2", "earth", "Pyrite Colosseum", false, false},
+      {"M2", "police", "Pyrite Police", false, false},
+      {"M3", "cave", "Relic Cave", true, false},
+      {"M3", "shrine", "Relic Stone", false, false},
+      {"M4", "subway", "Under Subway", true, false},
+      {"M4", "train", "Under Subway", false, false},
+      {"M4", "bottom", "Under Colosseum", false, false},
+      {"M4", "cylinder", "Deep Colosseum", false, false},
+      {"D1", "labo", "Shadow Pok\xC3\xA9mon Lab", true, false},
+      {"D2", "rest", "Mt. Battle Rest Area", false, true},
+      {"D2", "crater", "Mt. Battle Summit", false, false},
+      {"D2", "present", "Mt. Battle Prize Room", false, false},
+      {"D4", "casino", "Realgam Tower Colosseum", false, false},
+      {"D4", "dome", "Realgam Tower Dome", false, false},
+      {"D4", "tower", "Realgam Tower", true, false},
+  };
+  const Place* match = nullptr;
+  for (const Place& entry : kPlaces)
+    if (place == entry.place && (!entry.area || area == entry.area))
+      match = &entry;  // area-specific entries come after the generic ones
+  if (!match)
+    return area_name;
+  std::string name = fmt::format(fmt::runtime(match->name), area_name);
+  if (match->floors && !floor.empty())
+    name += " " + floor;
+  if (match->numbered && !number.empty())
+    name += " " + number;
+  return name;
 }
 
 void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
@@ -1229,25 +1316,8 @@ PdaBackgroundLayout GetPdaBackgroundLayout(int width, int height)
   };
 }
 
-void DrawInputOverlay(NavigationOverlayState& state)
+moderngekko::gc_art::State ArtStateFromPad(const GCPadStatus& pad)
 {
-  if (!state.input_overlay_enabled.load(std::memory_order_relaxed))
-    return;
-
-  GCPadStatus pad;
-  {
-    std::lock_guard lock(state.mutex);
-    pad = state.input_status;
-  }
-  const float ui_scale =
-      static_cast<float>(state.accessibility_ui_scale.load(
-          std::memory_order_relaxed)) /
-      100.0f;
-  const ImVec2 display = ImGui::GetIO().DisplaySize;
-
-  // The controller itself, bottom left, lighting each button as it is
-  // pressed: a picture reads at a glance on a stream where a row of letters
-  // does not.
   moderngekko::gc_art::State art;
   const auto bit = [&](PadButton mask, unsigned out) {
     if (pad.button & mask)
@@ -1276,20 +1346,78 @@ void DrawInputOverlay(NavigationOverlayState& state)
                     GCPadStatus::C_STICK_RADIUS};
   art.l = pad.triggerLeft / 255.0f;
   art.r = pad.triggerRight / 255.0f;
+  return art;
+}
 
-  const float width = std::clamp(display.y * 0.2f, 160.0f, 480.0f) * ui_scale;
+// Whether a port shows any input: a pressed button, a pushed stick or trigger.
+bool PadInUse(const GCPadStatus& pad)
+{
+  const auto off = [](int value, int centre) { return std::abs(value - centre) > 40; };
+  return pad.button != 0 || pad.triggerLeft > 60 || pad.triggerRight > 60 ||
+         off(pad.stickX, GCPadStatus::MAIN_STICK_CENTER_X) ||
+         off(pad.stickY, GCPadStatus::MAIN_STICK_CENTER_Y) ||
+         off(pad.substickX, GCPadStatus::C_STICK_CENTER_X) ||
+         off(pad.substickY, GCPadStatus::C_STICK_CENTER_Y);
+}
+
+void DrawInputOverlay(NavigationOverlayState& state)
+{
+  if (!state.input_overlay_enabled.load(std::memory_order_relaxed))
+    return;
+
+  std::array<GCPadStatus, 4> pads;
+  {
+    std::lock_guard lock(state.mutex);
+    pads = state.input_status;
+  }
+  // Player 1 is always shown; players 2-4 join the row once their port has
+  // been used, so idle ports do not fill the screen with neutral pads.
+  static std::array<bool, 4> seen{true, false, false, false};
+  for (int port = 1; port < 4; ++port)
+    seen[port] = seen[port] || PadInUse(pads[port]);
+  const int shown = static_cast<int>(std::ranges::count(seen, true));
+
+  const float ui_scale =
+      static_cast<float>(state.accessibility_ui_scale.load(
+          std::memory_order_relaxed)) /
+      100.0f;
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+
+  // The controller itself, bottom left, lighting each button as it is
+  // pressed: a picture reads at a glance on a stream where a row of letters
+  // does not. With more players the pads shrink a little and sit in a row.
+  const float full = std::clamp(display.y * 0.2f, 160.0f, 480.0f) * ui_scale;
+  const float width = shown > 1 ? full * 0.8f : full;
   const float height = moderngekko::gc_art::Height(width);
   const float margin = std::max(16.0f, display.y * 0.025f);
+  const float gap = width * 0.08f;
   ImDrawList* dl = ImGui::GetBackgroundDrawList();
-  moderngekko::gc_art::Draw(dl, {margin + width / 2, display.y - margin - height / 2}, width,
-                            art, 0.92f);
+  ImFont* font = ImGui::GetFont();
+  const float label_size = ImGui::GetFontSize() * ui_scale;
+  float x = margin;
+  for (int port = 0; port < 4; ++port)
+  {
+    if (!seen[port])
+      continue;
+    moderngekko::gc_art::Draw(dl, {x + width / 2, display.y - margin - height / 2}, width,
+                              ArtStateFromPad(pads[port]), 0.92f);
+    if (shown > 1)
+    {
+      char label[8];
+      std::snprintf(label, sizeof(label), "P%d", port + 1);
+      const ImVec2 at{x + width * 0.02f, display.y - margin - height - label_size * 0.2f};
+      dl->AddText(font, label_size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 200), label);
+      dl->AddText(font, label_size, at, IM_COL32(255, 214, 80, 255), label);
+    }
+    x += width + gap;
+  }
   if (state.fast_forward_active.load(std::memory_order_relaxed))
   {
     char text[32];
     std::snprintf(text, sizeof(text), "FAST %dx",
                   state.fast_forward_multiplier.load(std::memory_order_relaxed));
     const float size = ImGui::GetFontSize() * ui_scale;
-    const ImVec2 at{margin, display.y - margin - height - size * 1.4f};
+    const ImVec2 at{margin, display.y - margin - height - size * (shown > 1 ? 2.6f : 1.4f)};
     dl->AddText(ImGui::GetFont(), size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 200), text);
     dl->AddText(ImGui::GetFont(), size, at, IM_COL32(80, 255, 230, 255), text);
   }
@@ -4153,9 +4281,11 @@ RuntimeRunResult Runtime::Run() {
                   std::memory_order_relaxed);
           if (want_pad_status)
           {
-            const GCPadStatus pad = Pad::GetStatus(0);
+            std::array<GCPadStatus, 4> pads;
+            for (int port = 0; port < 4; ++port)
+              pads[port] = Pad::GetStatus(port);
             std::lock_guard lock(m_impl->navigation_overlay.mutex);
-            m_impl->navigation_overlay.input_status = pad;
+            m_impl->navigation_overlay.input_status = pads;
           }
           const bool widescreen_active =
               m_impl->navigation_overlay.widescreen_enabled.load(

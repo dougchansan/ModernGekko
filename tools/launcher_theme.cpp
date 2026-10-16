@@ -428,6 +428,7 @@ Input ReadInput(bool* last_was_gamepad)
   const bool kb_help = once(ImGuiKey_H);
   const bool kb_rename = once(ImGuiKey_R) || once(ImGuiKey_F2);
   const bool kb_duplicate = once(ImGuiKey_D);
+  const bool kb_erase = once(ImGuiKey_Delete);
   const bool pad_up = key(ImGuiKey_GamepadDpadUp) || key(ImGuiKey_GamepadLStickUp);
   const bool pad_down = key(ImGuiKey_GamepadDpadDown) || key(ImGuiKey_GamepadLStickDown);
   const bool pad_left = key(ImGuiKey_GamepadDpadLeft) || key(ImGuiKey_GamepadLStickLeft);
@@ -447,9 +448,11 @@ Input ReadInput(bool* last_was_gamepad)
   in.help = kb_help || pad_help;
   in.rename = kb_rename || pad_rename;
   in.duplicate = kb_duplicate || pad_duplicate;
+  in.erase = kb_erase;
   const bool pad = pad_up || pad_down || pad_left || pad_right || pad_accept || pad_back ||
                    pad_help || pad_rename || pad_duplicate;
   const bool kb = kb_up || kb_down || kb_left || kb_right || kb_accept || kb_back || kb_help ||
+                  kb_erase ||
                   ImGui::IsMouseClicked(ImGuiMouseButton_Left);
   if (pad)
     *last_was_gamepad = true;

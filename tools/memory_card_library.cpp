@@ -305,6 +305,31 @@ bool MemoryCardLibrary::Duplicate(int index, const std::string& name, std::strin
   return List(error);
 }
 
+bool MemoryCardLibrary::Delete(int index,
+                               const std::function<bool(const fs::path&)>& remove,
+                               std::string* error)
+{
+  if (index < 0 || index >= static_cast<int>(m_cards.size()))
+    return false;
+  if (index == m_inserted)
+  {
+    if (error)
+      *error = "put another card in Slot A before deleting this one";
+    return false;
+  }
+  const fs::path file = m_cards[static_cast<std::size_t>(index)].file;
+  if (!remove(file))
+  {
+    if (error)
+      *error = "could not delete " + file.string();
+    return false;
+  }
+  std::error_code ec;
+  if (fs::exists(fs::path(file).concat(".bak"), ec))
+    remove(fs::path(file).concat(".bak"));
+  return List(error);
+}
+
 bool MemoryCardLibrary::Rename(int index, const std::string& name, std::string* error)
 {
   if (index < 0 || index >= static_cast<int>(m_cards.size()))

@@ -7,6 +7,7 @@
 #include "dol_patch.hpp"
 #include "launcher_theme.hpp"
 #include "memory_card_library.hpp"
+#include "onscreen_keyboard.hpp"
 #include "moderngekko/game.hpp"
 #include "moderngekko/hd_texture_pack.hpp"
 #include "netplay_session.hpp"
@@ -18,7 +19,12 @@
 #include "DiscIO/Volume.h"
 
 #include <SDL3/SDL.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <shellapi.h>
+#endif
 #include <imgui.h>
+#include <imgui_internal.h>  // ImGui::ClearActiveID
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 
@@ -555,7 +561,7 @@ constexpr std::array<const char*, kPageCount> kPageNames = {
     "GAMEPLAY", "CONTROLLERS",  "MODS & OVERLAYS", "NETPLAY"};
 constexpr std::array<const char*, kPageCount> kPageHelp = {
     "Start the game, from the memory card or from a save state.",
-    "The memory cards in Slot A and Slot B. Each card is one Colosseum save.",
+    "Your memory cards. Each card is one Colosseum save; the one in Slot A is played.",
     "Save states from the pause menu and the room autosaves, newest first.",
     "Window mode, render resolution, aspect ratio and texture filtering.",
     "Frame rate, speed and the safety nets: autosaves and stall recovery.",
@@ -629,6 +635,42 @@ StateEntry DescribeState(const fs::path& path)
   return entry;
 }
 
+// Deleting goes through the Recycle Bin where there is one, so a slip can be
+// undone.
+bool MoveToTrash(const fs::path& path)
+{
+#if defined(_WIN32)
+  std::wstring from = path.wstring();
+  from.push_back(L'\0');  // the list ends with a double null
+  SHFILEOPSTRUCTW operation{};
+  operation.wFunc = FO_DELETE;
+  operation.pFrom = from.c_str();
+  operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+  return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted;
+#else
+  std::error_code ec;
+  return fs::remove(path, ec);
+#endif
+}
+
+// A yes / no question over the page.
+struct Confirm
+{
+  bool open = false;
+  std::string title, detail;
+  std::function<void()> yes;
+  bool fresh = true;  // opened this frame: the press that opened it is not an answer
+};
+
+// What can be done with a card (A on the Memory Cards page).
+struct CardMenu
+{
+  bool open = false;
+  int index = -1;
+  int focus = 0;
+  bool fresh = true;  // opened this frame
+};
+
 // The naming dialog for a new, renamed or copied card.
 struct Naming
 {
@@ -643,6 +685,8 @@ struct Naming
   int index = -1;
   std::array<char, 25> text{};  // 24 characters
   bool focus = false;
+  bool typed = false;  // the suggestion has been replaced
+  moderngekko::onscreen_keyboard::Cursor cursor;
   std::string error;
 };
 
@@ -659,33 +703,6 @@ std::string CardWhen(const moderngekko::frontend::LibraryCard& card)
   return card.saved ? "Saved " + DescribeTime(*card.saved) : std::string();
 }
 
-// The memory card in a GCI-folder slot. Colosseum keeps one save per card.
-struct CardInfo
-{
-  std::string label = "EMPTY", detail = "No save on this card", when;
-};
-
-CardInfo ReadCard(const fs::path& folder)
-{
-  CardInfo card;
-  std::error_code ec;
-  fs::path newest;
-  fs::file_time_type newest_time{};
-  for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
-  {
-    if (it->path().extension() != ".gci")
-      continue;
-    const auto time = it->last_write_time(ec);
-    if (newest.empty() || time > newest_time)
-      newest = it->path(), newest_time = time;
-  }
-  if (newest.empty())
-    return card;
-  card.label = "SAVE 1";
-  card.detail = "Colosseum save";
-  card.when = "Saved " + DescribeTime(newest_time);
-  return card;
-}
 } // namespace
 
 
@@ -923,7 +940,7 @@ int main(int argc, char** argv)
   // hit the filesystem on each redraw. A state written while the launcher is
   // open therefore appears on the next launch, which is the case that matters:
   // states are written by the running game, not by the launcher.
-  const std::vector<fs::path> launcher_savestates =
+  std::vector<fs::path> launcher_savestates =
       moderngekko::frontend::ListLauncherSavestates(user_directory / "StateSaves");
   // Normal boot keeps ordinary memory-card progression as the default.
   // Loading a savestate must always be an explicit launcher choice.
@@ -1061,6 +1078,15 @@ int main(int argc, char** argv)
   std::vector<StateEntry> state_entries;
   for (const fs::path& path : launcher_savestates)
     state_entries.push_back(DescribeState(path));
+  const auto reload_states = [&]
+  {
+    launcher_savestates =
+        moderngekko::frontend::ListLauncherSavestates(user_directory / "StateSaves");
+    state_entries.clear();
+    for (const fs::path& path : launcher_savestates)
+      state_entries.push_back(DescribeState(path));
+    selected_savestate = -1;
+  };
   // Named memory cards; the inserted one lives in Slot A.
 #ifdef MODERNGEKKO_REQUIRED_DISC_ID
   const std::string game_id = MODERNGEKKO_REQUIRED_DISC_ID;
@@ -1201,6 +1227,8 @@ int main(int argc, char** argv)
   float carousel_t = 0, carousel_pos = 0;
   int carousel_focus = 0;
   Naming naming;
+  Confirm confirm;
+  CardMenu card_menu;
 
   const auto persist = [&]
   {
@@ -1349,6 +1377,8 @@ int main(int argc, char** argv)
     naming.mode = mode;
     naming.index = index;
     naming.focus = true;
+    naming.typed = false;
+    naming.cursor = {};
     naming.error.clear();
     const std::string initial = mode == Naming::Mode::Rename ?
                                     card_library.Cards()[static_cast<std::size_t>(index)].name :
@@ -1404,6 +1434,49 @@ int main(int argc, char** argv)
     controller_index = FindController(controllers, selected_controller);
     controller_profile_exists = true;
     controller_status = std::move(message);
+  };
+  const auto ask_delete_card = [&](int index)
+  {
+    const auto& cards = card_library.Cards();
+    if (index < 0 || index >= static_cast<int>(cards.size()))
+      return;
+    if (index == card_library.Inserted())
+    {
+      card_failed("put another card in Slot A before deleting this one");
+      return;
+    }
+    confirm = {true, "DELETE " + Upper(cards[static_cast<std::size_t>(index)].name) + "?",
+               "The card and its save go to the Recycle Bin.", [&, index]
+               {
+                 std::string error;
+                 if (!card_library.Delete(index, MoveToTrash, &error))
+                   card_failed(error);
+               }};
+  };
+  const auto ask_delete_state = [&](int index)
+  {
+    if (index < 0 || index >= static_cast<int>(state_entries.size()))
+      return;
+    const StateEntry entry = state_entries[static_cast<std::size_t>(index)];
+    confirm = {true, "DELETE " + entry.title + "?",
+               entry.file + " (" + entry.when + ") goes to the Recycle Bin.", [&, entry]
+               {
+                 if (!MoveToTrash(entry.path))
+                 {
+                   std::lock_guard lock(dialog.mutex);
+                   dialog.error = "Could not delete " + entry.file;
+                   return;
+                 }
+                 // Its picture and camera go with it.
+                 for (const char* side : {".png", ".camera"})
+                 {
+                   std::error_code ec;
+                   const fs::path file = fs::path(entry.path).concat(side);
+                   if (fs::exists(file, ec))
+                     MoveToTrash(file);
+                 }
+                 reload_states();
+               }};
   };
   const auto start_solo = [&](int state)
   {
@@ -1504,7 +1577,7 @@ int main(int argc, char** argv)
     // then the help card open on a display setting and the Slot A card.
     constexpr int kCaptureFrames = 4;
     const int capture_shot = capture_frame / kCaptureFrames;
-    constexpr int kCaptureShots = kPageCount + 4;
+    constexpr int kCaptureShots = kPageCount + 6;
     if (capture_directory)
     {
       in_page = true;
@@ -1530,6 +1603,23 @@ int main(int argc, char** argv)
       }
       if (capture_shot == kPageCount + 3 && naming.mode == Naming::Mode::None)
         open_naming(Naming::Mode::New, -1);
+      if (capture_shot >= kPageCount + 4)
+      {
+        carousel_open = false;
+        carousel_t = 0;
+        naming.mode = Naming::Mode::None;
+        page = kCards;
+        const int other = card_library.Inserted() == 0 ? 1 : 0;
+        if (capture_shot == kPageCount + 4 && !card_menu.open)
+          card_menu = {true, other, 0};
+        if (capture_shot == kPageCount + 5 && !confirm.open)
+        {
+          card_menu.open = false;
+          ask_delete_card(other);
+        }
+        if (confirm.open)
+          confirm.fresh = true;  // stays up for the picture
+      }
     }
 
     ImGui_ImplSDLRenderer3_NewFrame();
@@ -1552,7 +1642,8 @@ int main(int argc, char** argv)
                  viewport->Pos.y + (viewport->Size.y - theme::kCanvasH * cv.scale) / 2};
     const theme::Input raw_in = theme::ReadInput(&gamepad_input);
     // The carousel and the naming dialog sit above the pages and take input.
-    const bool overlay = carousel_open || naming.mode != Naming::Mode::None;
+    const bool overlay = carousel_open || naming.mode != Naming::Mode::None || confirm.open ||
+                         card_menu.open;
     const theme::Input in = overlay ? theme::Input{.gamepad = raw_in.gamepad} : raw_in;
     const bool clicked = !overlay && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
     const auto mouse_in = [&](float x0, float y0, float x1, float y1)
@@ -1821,13 +1912,15 @@ int main(int argc, char** argv)
                    "This card is in Slot A: the game loads and saves it. Rename it, or copy it "
                    "to branch your playthrough." :
                    "Insert this card into Slot A. The card that was there keeps its save.";
-        page_hint = gamepad_input ? "A INSERT    X RENAME    Y COPY    B BACK" :
-                                    "ENTER INSERT    R RENAME    D COPY    ESC BACK";
+        page_hint = gamepad_input ? "A OPTIONS    X RENAME    Y COPY    B BACK" :
+                                    "ENTER OPTIONS    R RENAME    D COPY    DEL DELETE    ESC BACK";
       }
       if (activated == count - 1)
         open_naming(Naming::Mode::New, -1);
       else if (activated >= 0)
-        insert_card(activated);
+        card_menu = {true, activated, activated == card_library.Inserted() ? 1 : 0};
+      else if (in_page && focus < count - 1 && page_in.erase)
+        ask_delete_card(focus);
       else if (in_page && focus < count - 1 && page_in.rename)
         open_naming(Naming::Mode::Rename, focus);
       else if (in_page && focus < count - 1 && page_in.duplicate)
@@ -1889,10 +1982,16 @@ int main(int argc, char** argv)
                     y + 30, entry.when, theme::color::kGrey);
       }
       if (in_page)
+      {
         help = state_entries[static_cast<std::size_t>(focus)].file + ". Loads straight into "
                "this moment instead of booting from the memory card. Solo play only.";
+        page_hint = gamepad_input ? "A LOAD    X DELETE    B BACK" :
+                                    "ENTER LOAD    DEL DELETE    ESC BACK";
+      }
       if (activated >= 0)
         start_solo(activated);
+      else if (in_page && (page_in.erase || page_in.rename))
+        ask_delete_state(focus);
       break;
     }
     case kDisplay:
@@ -2376,7 +2475,8 @@ int main(int argc, char** argv)
         const auto& cards = card_library.Cards();
         const int count = static_cast<int>(cards.size()) + 1;  // + NEW
         carousel_focus = std::clamp(carousel_focus, 0, count - 1);
-        const bool active = carousel_open && naming.mode == Naming::Mode::None;
+        const bool active = carousel_open && naming.mode == Naming::Mode::None && !confirm.open &&
+                            !card_menu.open;
         if (active)
         {
           const float wheel = ImGui::GetIO().MouseWheel;
@@ -2512,18 +2612,165 @@ int main(int argc, char** argv)
       }
     }
 
-    // ---- naming dialog ----
-    if (naming.mode != Naming::Mode::None)
+    // ---- card options ----
+    if (card_menu.open && naming.mode == Naming::Mode::None && !confirm.open)
+    {
+      const auto& cards = card_library.Cards();
+      if (card_menu.index < 0 || card_menu.index >= static_cast<int>(cards.size()))
+        card_menu.open = false;
+      else
+      {
+        const bool inserted = card_menu.index == card_library.Inserted();
+        struct Item
+        {
+          const char* label;
+          bool enabled;
+        };
+        const Item items[] = {{"PUT IN SLOT A", !inserted}, {"RENAME", true}, {"COPY", true},
+                              {"DELETE", !inserted}, {"CANCEL", true}};
+        constexpr int n = static_cast<int>(std::size(items));
+        dl->AddRectFilled({0, 0}, viewport->Size, IM_COL32(0, 0, 0, 140));
+        const float x0 = 470, x1 = 810, y0 = 210, step = 56;
+        const float y1 = y0 + 78 + n * step + 10;
+        theme::SteelPanel(dl, cv, x0, y0, x1, y1, 16, IM_COL32(12, 20, 19, 245));
+        const std::string title = Upper(cards[static_cast<std::size_t>(card_menu.index)].name);
+        const float title_size =
+            std::min(36.0f, 36 * 280 / std::max(1.0f, theme::TextWidth(fonts.menu, 36, title)));
+        theme::Text(dl, cv, fonts.menu, title_size, x0 + 30, y0 + 22 + (36 - title_size) / 2, title,
+                    theme::color::kGold);
+        int choose = -1;
+        if (raw_in.up)
+          do
+            card_menu.focus = (card_menu.focus + n - 1) % n;
+          while (!items[card_menu.focus].enabled);
+        if (raw_in.down)
+          do
+            card_menu.focus = (card_menu.focus + 1) % n;
+          while (!items[card_menu.focus].enabled);
+        if (!items[card_menu.focus].enabled)
+          card_menu.focus = 1;
+        for (int i = 0; i < n; ++i)
+        {
+          const float y = y0 + 78 + i * step;
+          if (items[i].enabled &&
+              ImGui::IsMouseHoveringRect(cv.P(x0 + 20, y - 6), cv.P(x1 - 20, y + 44), false))
+          {
+            if (ImGui::GetIO().MouseDelta.x != 0 || ImGui::GetIO().MouseDelta.y != 0)
+              card_menu.focus = i;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !card_menu.fresh)
+              choose = i;
+          }
+          if (i == card_menu.focus)
+          {
+            dl->AddRectFilled(cv.P(x0 + 20, y - 6), cv.P(x1 - 20, y + 44), IM_COL32(255, 255, 255, 18));
+            theme::Chevron(dl, cv, x0 + 30, y + 6, 14);
+          }
+          theme::Text(dl, cv, fonts.menu, 36, x0 + 60, y, items[i].label,
+                      items[i].enabled ? theme::color::kWhite : theme::color::kDim);
+        }
+        if (raw_in.accept && !card_menu.fresh)
+          choose = card_menu.focus;
+        card_menu.fresh = false;
+        const int index = card_menu.index;
+        if (choose < 0 && !card_menu.fresh && (raw_in.back || ImGui::IsMouseClicked(ImGuiMouseButton_Right)))
+          card_menu.open = false;
+        else if (choose >= 0 && items[choose].enabled)
+        {
+          card_menu.open = false;
+          switch (choose)
+          {
+          case 0: insert_card(index); break;
+          case 1: open_naming(Naming::Mode::Rename, index); break;
+          case 2: open_naming(Naming::Mode::Duplicate, index); break;
+          case 3: ask_delete_card(index); break;
+          default: break;
+          }
+        }
+      }
+    }
+
+    // ---- yes / no ----
+    if (confirm.open)
     {
       dl->AddRectFilled({0, 0}, viewport->Size, IM_COL32(0, 0, 0, 150));
-      theme::SteelPanel(dl, cv, 380, 270, 900, 480, 16, IM_COL32(12, 20, 19, 245));
+      theme::SteelPanel(dl, cv, 360, 270, 920, 470, 16, IM_COL32(12, 20, 19, 245));
+      float size = 36;
+      if (theme::TextWidth(fonts.menu, size, confirm.title) > 500)
+        size *= 500 / theme::TextWidth(fonts.menu, size, confirm.title);
+      theme::Text(dl, cv, fonts.menu, size, 392, 296, confirm.title, theme::color::kGold);
+      theme::Paragraph(dl, cv, fonts.body, 13, 394, 352, 496, confirm.detail, theme::color::kText, 22);
+      const char* hint = gamepad_input ? "A DELETE    B KEEP" : "ENTER DELETE    ESC KEEP";
+      theme::Text(dl, cv, fonts.small, 26, 888 - theme::TextWidth(fonts.small, 26, hint), 422, hint,
+                  theme::color::kText);
+      const bool answer_ok = !confirm.fresh;
+      confirm.fresh = false;
+      if (raw_in.accept && answer_ok)
+      {
+        confirm.open = false;
+        if (confirm.yes)
+          confirm.yes();
+      }
+      else if (answer_ok && (raw_in.back || ImGui::IsMouseClicked(ImGuiMouseButton_Right)))
+        confirm.open = false;
+    }
+
+    // ---- naming dialog: a text box, and a keyboard for controllers ----
+    if (naming.mode != Naming::Mode::None)
+    {
+      namespace osk = moderngekko::onscreen_keyboard;
+      dl->AddRectFilled({0, 0}, viewport->Size, IM_COL32(0, 0, 0, 150));
+      theme::SteelPanel(dl, cv, 380, 150, 900, 640, 16, IM_COL32(12, 20, 19, 245));
       const char* title = naming.mode == Naming::Mode::New    ? "NAME THE NEW CARD" :
                           naming.mode == Naming::Mode::Rename ? "RENAME THE CARD" :
                                                                 "NAME THE COPY";
-      theme::Text(dl, cv, fonts.menu, 36, 412, 294, title, theme::color::kGold);
-      dl->AddRectFilled(cv.P(412, 350), cv.P(868, 394), IM_COL32(8, 12, 12, 230));
-      dl->AddRect(cv.P(412, 350), cv.P(868, 394), IM_COL32(120, 126, 132, 255), 0, 0, cv.S(1));
-      ImGui::SetCursorScreenPos(cv.P(426, 354));
+      theme::Text(dl, cv, fonts.menu, 36, 412, 174, title, theme::color::kGold);
+      dl->AddRectFilled(cv.P(412, 230), cv.P(868, 274), IM_COL32(8, 12, 12, 230));
+      dl->AddRect(cv.P(412, 230), cv.P(868, 274), IM_COL32(120, 126, 132, 255), 0, 0, cv.S(1));
+
+      // Controller: D-pad / stick move, A types, X deletes, Start saves, B
+      // cancels. Typing on it takes the text box out of keyboard focus, as
+      // the box owns its text while focused.
+      // Not on the frame it opened: the A that opened it is not a key press.
+      const bool fresh = naming.focus;
+      const auto pad = [fresh](ImGuiKey key) { return !fresh && ImGui::IsKeyPressed(key, true); };
+      int dx = 0, dy = 0;
+      if (pad(ImGuiKey_GamepadDpadLeft) || pad(ImGuiKey_GamepadLStickLeft))
+        dx = -1;
+      if (pad(ImGuiKey_GamepadDpadRight) || pad(ImGuiKey_GamepadLStickRight))
+        dx = 1;
+      if (pad(ImGuiKey_GamepadDpadUp) || pad(ImGuiKey_GamepadLStickUp))
+        dy = -1;
+      if (pad(ImGuiKey_GamepadDpadDown) || pad(ImGuiKey_GamepadLStickDown))
+        dy = 1;
+      if (dx || dy)
+        osk::Move(&naming.cursor, dx, dy);
+      bool commit = false;
+      const auto edit = [&](const auto& change)
+      {
+        ImGui::ClearActiveID();
+        std::string text = naming.text.data();
+        if (!naming.typed)
+        {
+          text.clear();
+          naming.typed = true;
+        }
+        change(text);
+        std::snprintf(naming.text.data(), naming.text.size(), "%s", text.c_str());
+      };
+      if (!fresh && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false))
+      {
+        if (osk::KeyAt(naming.cursor) == osk::Key::Done)
+          commit = true;
+        else
+          edit([&](std::string& text) { osk::Press(naming.cursor, &text, 24); });
+      }
+      if (pad(ImGuiKey_GamepadFaceLeft))
+        edit([](std::string& text) {
+          if (!text.empty())
+            text.pop_back();
+        });
+
+      ImGui::SetCursorScreenPos(cv.P(426, 234));
       const ImGuiStyle& style = ImGui::GetStyle();
       ImGui::PushFont(fonts.menu ? fonts.menu : ImGui::GetFont(),
                       cv.S(36) / (style.FontScaleMain * style.FontScaleDpi));
@@ -2538,17 +2785,63 @@ int main(int argc, char** argv)
       }
       const bool entered = ImGui::InputText(
           "##card_name", naming.text.data(), naming.text.size(),
-          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter,
+          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter |
+              ImGuiInputTextFlags_AutoSelectAll,
           CardNameFilter);
+      if (ImGui::IsItemEdited())
+        naming.typed = true;
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
       ImGui::PopFont();
       if (!naming.error.empty())
-        theme::Text(dl, cv, fonts.body, 13, 414, 408, naming.error, theme::color::kWarn, false);
-      const char* hint = gamepad_input ? "A OK    B CANCEL" : "ENTER OK    ESC CANCEL";
-      theme::Text(dl, cv, fonts.small, 26, 868 - theme::TextWidth(fonts.small, 26, hint), 432,
-                  hint, theme::color::kText);
-      if (entered || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false))
+        theme::Text(dl, cv, fonts.body, 13, 414, 284, naming.error, theme::color::kWarn, false);
+
+      // The keyboard.
+      const float key_w = 452.0f / osk::kColumns, key_h = 40, top = 306;
+      for (int row = 0; row < osk::kRows; ++row)
+      {
+        const float y = top + row * (key_h + 6);
+        const int keys = row < 4 ? osk::RowLength(row) : 3;
+        for (int key = 0; key < keys; ++key)
+        {
+          const int c0 = row < 4 ? key : (key == 0 ? 0 : key == 1 ? 4 : 7);
+          const int c1 = row < 4 ? key + 1 : (key == 0 ? 4 : key == 1 ? 7 : 10);
+          const float x0 = 414 + c0 * key_w + 2, x1 = 414 + c1 * key_w - 2;
+          const bool focus = naming.cursor.row == row &&
+                             (row < 4 ? naming.cursor.column == key :
+                                        osk::ActionAt(naming.cursor.column) == osk::ActionAt(c0));
+          if (ImGui::IsMouseHoveringRect(cv.P(x0, y), cv.P(x1, y + key_h), false) &&
+              ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+          {
+            naming.cursor = {row, c0};
+            if (osk::KeyAt(naming.cursor) == osk::Key::Done)
+              commit = true;
+            else
+              edit([&](std::string& text) { osk::Press(naming.cursor, &text, 24); });
+          }
+          dl->AddRectFilled(cv.P(x0, y), cv.P(x1, y + key_h),
+                            focus ? IM_COL32(110, 26, 30, 235) : IM_COL32(20, 30, 28, 230), cv.S(4));
+          dl->AddRect(cv.P(x0, y), cv.P(x1, y + key_h),
+                      focus ? theme::color::kRed : IM_COL32(120, 126, 132, 255), cv.S(4), 0,
+                      cv.S(focus ? 2.0f : 1.0f));
+          const std::string label =
+              row < 4 ? std::string(1, osk::kKeys[row][key]) : osk::ActionLabel(osk::ActionAt(c0));
+          const float size = row < 4 ? 26 : 22;
+          if (label == "_")  // the game font has no underscore glyph
+            dl->AddRectFilled(cv.P((x0 + x1) / 2 - 8, y + key_h - 13), cv.P((x0 + x1) / 2 + 8, y + key_h - 10),
+                              theme::color::kWhite);
+          else
+            theme::Text(dl, cv, fonts.small, size,
+                        (x0 + x1) / 2 - theme::TextWidth(fonts.small, size, label) / 2,
+                        y + (key_h - size) / 2 - 1, label,
+                        row == 4 && c0 == 7 ? theme::color::kGold : theme::color::kWhite);
+        }
+      }
+      const char* hint = gamepad_input ? "A TYPE   X DELETE   START SAVE   B CANCEL" :
+                                         "ENTER SAVE    ESC CANCEL";
+      theme::Text(dl, cv, fonts.small, 22, 868 - theme::TextWidth(fonts.small, 22, hint), 600, hint,
+                  theme::color::kText);
+      if (entered || commit || ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false))
         commit_naming();
       else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
                ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))

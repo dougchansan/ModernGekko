@@ -32,6 +32,7 @@
 #include "moderngekko/runtime.hpp"
 #include "amd_driver_settings.h"
 #include "pause_menu_host.hpp"
+#include "onscreen_keyboard.hpp"
 #include "pause_menu_policy.hpp"
 #include "colosseum_menu_style.hpp"
 #include "shadow_tracker.hpp"
@@ -201,6 +202,8 @@ struct Menu {
   bool naming_resume = false;  // the prompt paused the game itself
   bool naming_swallow = false; // keys/buttons that closed it still held
   u16 naming_buttons = 0xFFFF;
+  moderngekko::onscreen_keyboard::Cursor naming_cursor;  // the controller keyboard
+  int naming_stick = 0;  // stick direction last tick (moves on the edge)
   std::mutex naming_input_mutex;
   std::string naming_input;  // characters from the window thread, '\b' = backspace
   std::string toast;         // "Saved ..." shown briefly after the prompt closes
@@ -1724,6 +1727,8 @@ void BeginNaming(Menu &menu) {
   menu.naming_text = menu.naming_suggestions.front();
   menu.naming_typed = false;
   menu.naming_buttons = 0xFFFF;  // a button held when it opened is not a press
+  menu.naming_cursor = {};
+  menu.naming_stick = -1;  // likewise a stick held when it opened
   {
     std::lock_guard lock(menu.naming_input_mutex);
     menu.naming_input.clear();
@@ -1811,12 +1816,47 @@ void HandleNaming(Menu &menu, const GCPadStatus &pad) {
       menu.naming_text += c;
     }
   }
+  namespace osk = moderngekko::onscreen_keyboard;
   const u16 pressed = pad.button & ~menu.naming_buttons;
   menu.naming_buttons = pad.button;
-  const bool save = menu.pressed_keys[13].exchange(false) || (pressed & PAD_BUTTON_A);
+  // The controller keyboard: D-pad or stick moves, A types, X deletes, Start
+  // saves; L / R pick a suggestion. The keyboard keeps Enter / Esc / arrows.
+  const int stick = pad.stickX < 64 ? 1 : pad.stickX > 192 ? 2 : pad.stickY > 192 ? 3
+                    : pad.stickY < 64 ? 4 : 0;
+  const int stick_edge = stick != menu.naming_stick && menu.naming_stick >= 0 ? stick : 0;
+  menu.naming_stick = stick;
+  int dx = 0, dy = 0;
+  if ((pressed & PAD_BUTTON_LEFT) || stick_edge == 1)
+    dx = -1;
+  if ((pressed & PAD_BUTTON_RIGHT) || stick_edge == 2)
+    dx = 1;
+  if ((pressed & PAD_BUTTON_UP) || stick_edge == 3)
+    dy = -1;
+  if ((pressed & PAD_BUTTON_DOWN) || stick_edge == 4)
+    dy = 1;
+  if (dx || dy)
+    osk::Move(&menu.naming_cursor, dx, dy);
+  bool done_key = false;
+  const auto start_typing = [&] {
+    if (!menu.naming_typed) {
+      menu.naming_text.clear();
+      menu.naming_typed = true;
+    }
+  };
+  if (pressed & PAD_BUTTON_A) {
+    if (osk::KeyAt(menu.naming_cursor) != osk::Key::Done)
+      start_typing();
+    done_key = osk::Press(menu.naming_cursor, &menu.naming_text, 32);
+  }
+  if ((pressed & PAD_BUTTON_X) && !menu.naming_text.empty()) {
+    start_typing();
+    if (!menu.naming_text.empty())
+      menu.naming_text.pop_back();
+  }
+  const bool save = menu.pressed_keys[13].exchange(false) || (pressed & PAD_BUTTON_START) || done_key;
   const bool cancel = menu.pressed_keys[27].exchange(false) || (pressed & PAD_BUTTON_B);
-  const bool left = menu.pressed_keys[37].exchange(false) || (pressed & PAD_BUTTON_LEFT);
-  const bool right = menu.pressed_keys[39].exchange(false) || (pressed & PAD_BUTTON_RIGHT);
+  const bool left = menu.pressed_keys[37].exchange(false) || (pressed & PAD_TRIGGER_L);
+  const bool right = menu.pressed_keys[39].exchange(false) || (pressed & PAD_TRIGGER_R);
   for (const int key : {8, 38, 40})
     menu.pressed_keys[key] = false;
   if ((left || right) && !menu.naming_suggestions.empty()) {
@@ -2550,7 +2590,7 @@ void DrawNaming(Menu &menu) {
   const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.6f);
   ImDrawList *draw = ImGui::GetForegroundDrawList();
   draw->AddRectFilled(ImVec2(0, 0), io.DisplaySize, st::Rgb(0, 6, 10, 140));
-  const float width = std::min(820 * s, io.DisplaySize.x - 32 * s), height = 300 * s;
+  const float width = std::min(820 * s, io.DisplaySize.x - 32 * s), height = 560 * s;
   const ImVec2 o((io.DisplaySize.x - width) * 0.5f, (io.DisplaySize.y - height) * 0.5f);
   const float header_h = 74 * s;
   st::ChromePlate(draw, o, ImVec2(o.x + width, o.y + header_h), 18 * s, 8 * s, col::kTealTop,
@@ -2582,16 +2622,63 @@ void DrawNaming(Menu &menu) {
                         col::kWhite);
   // Suggestions.
   char which[64];
-  std::snprintf(which, sizeof(which), "<   SUGGESTION %d OF %d   >", menu.naming_choice + 1,
+  std::snprintf(which, sizeof(which), "<  SUGGESTION %d OF %d  >", menu.naming_choice + 1,
                 static_cast<int>(menu.naming_suggestions.size()));
   const float small = 20 * s;
   const ImVec2 ws = st::TextSize(font, small, which);
   st::OutlinedText(draw, font, small, ImVec2(o.x + (width - ws.x) * 0.5f, fb.y + 16 * s), col::kHeaderGreen,
                    which, 1.5f * s);
-  const char *hint = "TYPE A NAME     ENTER / A  SAVE     ESC / B  CANCEL";
-  const ImVec2 hs = st::TextSize(font, small, hint);
-  st::OutlinedText(draw, font, small, ImVec2(o.x + (width - hs.x) * 0.5f, pb.y - hs.y - 20 * s), col::kYellow,
-                   hint, 1.5f * s);
+  // The controller keyboard.
+  {
+    namespace osk = moderngekko::onscreen_keyboard;
+    const float key_w = (width - 60 * s) / osk::kColumns, key_h = 40 * s;
+    const float top = fb.y + 50 * s;
+    const float key_size = 24 * s;
+    for (int row = 0; row < osk::kRows; ++row) {
+      const float y = top + row * (key_h + 6 * s);
+      if (row < 4) {
+        for (int column = 0; column < osk::RowLength(row); ++column) {
+          const ImVec2 ka(o.x + 30 * s + column * key_w + 3 * s, y),
+              kb(ka.x + key_w - 6 * s, y + key_h);
+          const bool focus = menu.naming_cursor.row == row && menu.naming_cursor.column == column;
+          st::Panel(draw, ka, kb, 6 * s, 3 * s, focus);
+          const char label[2] = {osk::kKeys[row][column], 0};
+          if (label[0] == '_') {  // drawn as a bar: not every game font has the glyph
+            const float cx = (ka.x + kb.x) * 0.5f;
+            draw->AddRectFilled(ImVec2(cx - 8 * s, kb.y - 12 * s), ImVec2(cx + 8 * s, kb.y - 9 * s), col::kWhite);
+            continue;
+          }
+          const ImVec2 ls = st::TextSize(font, key_size, label);
+          st::OutlinedText(draw, font, key_size,
+                           ImVec2((ka.x + kb.x - ls.x) * 0.5f, (ka.y + kb.y - ls.y) * 0.5f), col::kWhite,
+                           label, 1.2f * s);
+        }
+      } else {
+        const int spans[3][2] = {{0, 4}, {4, 7}, {7, 10}};
+        for (int key = 0; key < 3; ++key) {
+          const ImVec2 ka(o.x + 30 * s + spans[key][0] * key_w + 3 * s, y),
+              kb(o.x + 30 * s + spans[key][1] * key_w - 3 * s, y + key_h);
+          const bool focus = menu.naming_cursor.row == 4 &&
+                             osk::ActionAt(menu.naming_cursor.column) == osk::ActionAt(spans[key][0]);
+          st::Panel(draw, ka, kb, 6 * s, 3 * s, focus);
+          const char *label = osk::ActionLabel(osk::ActionAt(spans[key][0]));
+          const ImVec2 ls = st::TextSize(font, key_size, label);
+          st::OutlinedText(draw, font, key_size,
+                           ImVec2((ka.x + kb.x - ls.x) * 0.5f, (ka.y + kb.y - ls.y) * 0.5f),
+                           key == 2 ? col::kYellow : col::kWhite, label, 1.2f * s);
+        }
+      }
+    }
+  }
+  const char *hint = "KEYBOARD: TYPE   ENTER SAVE   ESC CANCEL";
+  const char *pad_hint = "CONTROLLER: A TYPE   X DELETE   START SAVE   B CANCEL   L / R SUGGESTIONS";
+  const float hint_size = 18 * s;
+  const ImVec2 hs = st::TextSize(font, hint_size, hint), ps = st::TextSize(font, hint_size, pad_hint);
+  st::OutlinedText(draw, font, hint_size, ImVec2(o.x + (width - ps.x) * 0.5f, pb.y - ps.y - 18 * s),
+                   col::kYellow, pad_hint, 1.5f * s);
+  st::OutlinedText(draw, font, hint_size,
+                   ImVec2(o.x + (width - hs.x) * 0.5f, pb.y - ps.y - hs.y - 26 * s), col::kYellow, hint,
+                   1.5f * s);
 }
 
 void DrawToast(Menu &menu) {
@@ -3117,6 +3204,33 @@ void Host_RequestPauseMenuToggle() {
     menu->toggle = true;
 }
 
+// The emulator presents no frames while paused, so the menu (or the naming
+// prompt) asks for one about every 16 ms to stay on screen and animate.
+static void RepaintWhilePaused(const std::shared_ptr<moderngekko::pause_menu::Menu> &menu) {
+  using moderngekko::pause_menu::Menu;
+  const auto time = std::chrono::steady_clock::now();
+  if ((menu->open || menu->naming) &&
+      Core::GetState(Core::System::GetInstance()) == Core::State::Paused &&
+      time - menu->last_repaint >= std::chrono::milliseconds(16) &&
+      !menu->repaint_pending.exchange(true)) {
+    menu->last_repaint = time;
+    Core::RunOnCPUThread(Core::System::GetInstance(),
+                         [weak = std::weak_ptr<Menu>(menu)] {
+                           const auto state = weak.lock();
+                           if (!state || !state->active)
+                             return;
+                           AsyncRequests::GetInstance()->PushEvent([weak] {
+                             if (const auto state = weak.lock()) {
+                               if (state->active && (state->open || state->naming) &&
+                                   g_presenter)
+                                 g_presenter->Present();
+                               state->repaint_pending = false;
+                             }
+                           });
+                         });
+  }
+}
+
 void Host_PauseMenuTick() {
   using namespace moderngekko::pause_menu;
   const auto menu = current.load();
@@ -3157,6 +3271,7 @@ void Host_PauseMenuTick() {
     BeginNaming(*menu);
   if (menu->naming) {
     HandleNaming(*menu, pad);
+    RepaintWhilePaused(menu);
     return;
   }
   Input input;
@@ -3265,25 +3380,5 @@ void Host_PauseMenuTick() {
   }
   menu->adjust_direction = direction;
   SyncPause(menu, was_open);
-  const auto time = std::chrono::steady_clock::now();
-  if ((menu->open || menu->naming) &&
-      Core::GetState(Core::System::GetInstance()) == Core::State::Paused &&
-      time - menu->last_repaint >= std::chrono::milliseconds(16) &&
-      !menu->repaint_pending.exchange(true)) {
-    menu->last_repaint = time;
-    Core::RunOnCPUThread(Core::System::GetInstance(),
-                         [weak = std::weak_ptr<Menu>(menu)] {
-                           const auto state = weak.lock();
-                           if (!state || !state->active)
-                             return;
-                           AsyncRequests::GetInstance()->PushEvent([weak] {
-                             if (const auto state = weak.lock()) {
-                               if (state->active && (state->open || state->naming) &&
-                                   g_presenter)
-                                 g_presenter->Present();
-                               state->repaint_pending = false;
-                             }
-                           });
-                         });
-  }
+  RepaintWhilePaused(menu);
 }

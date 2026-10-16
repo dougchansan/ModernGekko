@@ -127,6 +127,7 @@ struct Input
   bool up = false, down = false, left = false, right = false;
   bool accept = false, back = false, help = false;
   bool rename = false, duplicate = false;  // R / X and D / Y
+  bool erase = false;                      // Delete
   bool gamepad = false;  // a gamepad was used last, for button hints
 };
 Input ReadInput(bool* last_was_gamepad);
