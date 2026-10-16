@@ -1455,41 +1455,47 @@ void DrawInputOverlay(NavigationOverlayState& state)
       100.0f;
   const ImVec2 display = ImGui::GetIO().DisplaySize;
 
-  // The controller itself, bottom left, lighting each button as it is
-  // pressed: a picture reads at a glance on a stream where a row of letters
-  // does not. With more players the pads shrink a little and sit in a row.
-  const float full = std::clamp(display.y * 0.2f, 160.0f, 480.0f) * ui_scale;
-  const float width = shown > 1 ? full * 0.8f : full;
+  // The controller itself, top left, lighting each button as it is pressed: a
+  // picture reads at a glance on a stream where a row of letters does not.
+  // Players stack downwards in the margin beside the game's 4:3 picture, so
+  // they cover none of its menus (battle commands, timers, text boxes).
+  const float margin = std::max(12.0f, display.y * 0.02f);
+  const float side = std::max(0.0f, (display.x - display.y * 4.0f / 3.0f) * 0.5f);
+  const float full = std::clamp(display.y * 0.2f, 120.0f, 480.0f) * ui_scale;
+  const float label_size = ImGui::GetFontSize() * ui_scale;
+  const float label_room = shown > 1 ? label_size * 1.1f : 0.0f;
+  // As wide as the margin allows, and short enough for every shown pad.
+  float width = side > margin * 2 ? std::min(full, side - margin * 2) : full * 0.6f;
+  const float per_pad =
+      (display.y - margin * 2) / static_cast<float>(std::max(shown, 1)) - label_room - margin * 0.5f;
+  while (width > 40.0f && moderngekko::gc_art::Height(width) > per_pad)
+    width *= 0.9f;
   const float height = moderngekko::gc_art::Height(width);
-  const float margin = std::max(16.0f, display.y * 0.025f);
-  const float gap = width * 0.08f;
   ImDrawList* dl = ImGui::GetBackgroundDrawList();
   ImFont* font = ImGui::GetFont();
-  const float label_size = ImGui::GetFontSize() * ui_scale;
-  float x = margin;
+  float y = margin;
   for (int port = 0; port < 4; ++port)
   {
     if (!seen[port])
       continue;
-    moderngekko::gc_art::Draw(dl, {x + width / 2, display.y - margin - height / 2}, width,
-                              ArtStateFromPad(pads[port]), 0.92f);
     if (shown > 1)
     {
       char label[8];
       std::snprintf(label, sizeof(label), "P%d", port + 1);
-      const ImVec2 at{x + width * 0.02f, display.y - margin - height - label_size * 0.2f};
+      const ImVec2 at{margin, y};
       dl->AddText(font, label_size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 200), label);
       dl->AddText(font, label_size, at, IM_COL32(255, 214, 80, 255), label);
     }
-    x += width + gap;
-  }
-  if (state.fast_forward_active.load(std::memory_order_relaxed))
+    moderngekko::gc_art::Draw(dl, {margin + width / 2, y + label_room + height / 2}, width,
+                              ArtStateFromPad(pads[port]), 0.92f);
+    y += label_room + height + margin * 0.5f;
+  }  if (state.fast_forward_active.load(std::memory_order_relaxed))
   {
     char text[32];
     std::snprintf(text, sizeof(text), "FAST %dx",
                   state.fast_forward_multiplier.load(std::memory_order_relaxed));
     const float size = ImGui::GetFontSize() * ui_scale;
-    const ImVec2 at{margin, display.y - margin - height - size * (shown > 1 ? 2.6f : 1.4f)};
+    const ImVec2 at{margin, y};
     dl->AddText(ImGui::GetFont(), size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 200), text);
     dl->AddText(ImGui::GetFont(), size, at, IM_COL32(80, 255, 230, 255), text);
   }

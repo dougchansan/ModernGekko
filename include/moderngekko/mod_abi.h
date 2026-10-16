@@ -132,6 +132,10 @@ typedef struct ModernGekkoModDesc
 
 typedef const ModernGekkoModDesc* (*ModernGekkoGetModFn)(void);
 
+/* A patch replaces the guest function at `address`: it returns by setting
+   pc (moderngekko_mod_return_u32 sets r3 and pc = lr). A patch that leaves pc
+   at `address` declines that call, and the original function runs instead,
+   with the registers as they were. */
 #define RECOMP_PATCH(address, function) \
     { (address), (function), MODERNGEKKO_MOD_PATCH_NONE }
 #define RECOMP_FORCE_PATCH(address, function) \

@@ -630,7 +630,15 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
   const auto patch = m_impl->patches.find(address);
   if (patch == m_impl->patches.end())
     return false;
+  // A patch that leaves pc on the function's entry declined this call: the
+  // original runs, as if nothing were patched (see mod_abi.h).
+  const CPUState saved = *state;
   patch->second(state);
+  // (The core may ask again with the cached-RAM alias of a physical pc.)
+  if ((state->pc | 0x80000000u) == (address | 0x80000000u)) {
+    *state = saved;
+    return false;
+  }
   return true;
 }
 
