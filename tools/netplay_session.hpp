@@ -32,6 +32,10 @@ struct NetplayOptions {
   std::string nickname = "Player";
   std::string buffer = "auto";
   std::vector<std::string> controllers;
+  // Unattended sessions (testing two machines from a script): mark this
+  // player ready on its own, and on the host start once everyone is ready.
+  bool auto_ready = false;
+  bool auto_start = false;
 };
 
 int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,

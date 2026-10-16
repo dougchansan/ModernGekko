@@ -1,5 +1,6 @@
 #include "colosseum_icon_extract.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <iterator>

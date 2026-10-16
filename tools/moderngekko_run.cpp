@@ -55,7 +55,7 @@ void Usage() {
                "       [--mods <directory>] [--no-mods]\n"
                "       [--wayland] [-X11] [--headless] [--allow-interpreter]\n"
                "       [--netplay-host | --netplay-join <host>] "
-               "[--netplay-port <port>]\n"
+               "[--netplay-port <port>] [--netplay-ready] [--netplay-autostart]\n"
                "       [--nickname <name>] [--buffer <auto|1-20>] "
                "[--controller <device>]...\n"
                "       Automation protocol: drop key=value command files into "
@@ -215,6 +215,7 @@ int RunMain(int argc, char **argv) {
   std::string netplay_nickname;
   std::string netplay_buffer;
   std::vector<std::string> netplay_controllers;
+  bool netplay_ready = false, netplay_autostart = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const auto value = [&](const char *option) -> const char * {
@@ -264,6 +265,10 @@ int RunMain(int argc, char **argv) {
       config.headless = true;
     else if (arg == "--allow-interpreter")
       config.allow_interpreter = true;
+    else if (arg == "--netplay-ready")
+      netplay_ready = true;
+    else if (arg == "--netplay-autostart")
+      netplay_autostart = true;
     else if (arg == "--netplay-host")
       netplay_role = moderngekko::frontend::NetplayRole::Host;
     else if (arg == "--netplay-join") {
@@ -488,6 +493,8 @@ int RunMain(int argc, char **argv) {
   if (netplay_role) {
     moderngekko::frontend::NetplayOptions options;
     options.role = *netplay_role;
+    options.auto_ready = netplay_ready;
+    options.auto_start = netplay_autostart;
     options.address = netplay_address.empty() ? frontend_config.netplay_address
                                               : netplay_address;
     options.port = netplay_port.value_or(frontend_config.netplay_port);

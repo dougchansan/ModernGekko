@@ -579,7 +579,9 @@ std::string Upper(std::string text)
 // "today 14:02", "yesterday 09:15", "Oct 13  20:30".
 std::string DescribeTime(fs::file_time_type when)
 {
-  const auto system = std::chrono::clock_cast<std::chrono::system_clock>(when);
+  // Through "now" on both clocks: libc++ (macOS) has no std::chrono::clock_cast.
+  const auto system = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+      when - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
   const std::time_t then = std::chrono::system_clock::to_time_t(system);
   const std::time_t now = std::time(nullptr);
   const std::tm a = State::Layout::LocalTime(then), b = State::Layout::LocalTime(now);

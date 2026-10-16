@@ -275,7 +275,7 @@ public:
       return false;
     const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     m_window = SDL_CreateWindow(
-        "KirbyRecomp Netplay Lobby", static_cast<int>(820 * scale),
+        "Netplay Lobby", static_cast<int>(820 * scale),
         static_cast<int>(600 * scale),
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!m_window)
@@ -358,6 +358,7 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
   std::vector<ControllerOption> available = EnumerateControllers();
   auto last_refresh = std::chrono::steady_clock::now();
   bool running = true;
+  bool auto_start_requested = false;
   while (running) {
     if (!window.Frame())
       break;
@@ -380,6 +381,17 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
       SaveConfig(runtime_config.user_directory, frontend_config, &ignored);
     }
 
+    // The lobby hands out controller slots as Wii Remote slots (the server's
+    // start check counts those); a GameCube game reads the GameCube ports,
+    // which nothing assigned, so neither player's input reached the game. The
+    // host gives each player the same GameCube ports as their slots: the host
+    // port 1, the first to join port 2, and so on.
+    if (server) {
+      const NetPlay::PadMappingArray ports = server->GetWiimoteMapping();
+      if (ports != server->GetPadMapping())
+        server->SetPadMapping(ports);
+    }
+
     if (ui.TakeStartRequest())
       client.StartGame(runtime_config.game_root.string() + "/sys/main.dol");
     auto boot_data = ui.TakeBootData();
@@ -392,7 +404,7 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
-    ImGui::Begin("KirbyRecomp Netplay", nullptr,
+    ImGui::Begin("Netplay", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextUnformatted(server ? "Hosting direct-IP netplay"
@@ -430,7 +442,7 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
             continue;
           if (!slots.empty())
             slots += ", ";
-          slots += "Wii " + std::to_string(i + 1);
+          slots += "Port " + std::to_string(i + 1);
         }
         ImGui::TextUnformatted(slots.empty() ? "None" : slots.c_str());
         ImGui::TableSetColumnIndex(3);
@@ -445,7 +457,7 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
     }
 
     ImGui::Spacing();
-    ImGui::TextUnformatted("Local sideways Wii Remotes");
+    ImGui::TextUnformatted("Local controllers");
     std::size_t total_assigned = 0;
     for (const NetPlay::Player &player : players)
       total_assigned += player.controller_count;
@@ -482,6 +494,12 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
         });
     const bool local_ready =
         local_player != players.end() && local_player->ready;
+    if (options.auto_ready && local_player != players.end() && !local_ready)
+      client.SetReady(true);
+    if (server && options.auto_start && !auto_start_requested && server->CanStart()) {
+      server->RequestStartGame();
+      auto_start_requested = true;
+    }
     if (ImGui::Button(local_ready ? "Not Ready" : "Ready", ImVec2(140, 38)))
       client.SetReady(!local_ready);
 
