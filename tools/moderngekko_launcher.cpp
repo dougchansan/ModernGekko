@@ -13,6 +13,7 @@
 #include "netplay_session.hpp"
 
 #include "Common/FileUtil.h"
+#include "Common/IniFile.h"
 #include "Common/Image.h"
 #include "DiscIO/DiscExtractor.h"
 #include "DiscIO/Filesystem.h"
@@ -519,6 +520,64 @@ bool ExtractDisc(const fs::path& image, const fs::path& user_directory,
   return true;
 }
 
+// Game Boy Advance link settings, kept in config.ini where the runtime's
+// Players panel reads and writes them: [GBA] rom/bios, and [Players] port2.
+struct GbaSettings
+{
+  fs::path rom;
+  fs::path bios;
+  bool player2 = false;  // player 2 plays on an emulated GBA
+};
+
+GbaSettings ReadGbaSettings(const fs::path& user_directory)
+{
+  Common::IniFile ini;
+  ini.Load((user_directory / "config.ini").string());
+  GbaSettings settings;
+  std::string value;
+  if (ini.GetOrCreateSection("GBA")->Get("rom", &value))
+    settings.rom = value;
+  if (ini.GetOrCreateSection("GBA")->Get("bios", &value))
+    settings.bios = value;
+  settings.player2 = ini.GetOrCreateSection("Players")->Get("port2", &value) && value == "gba";
+  return settings;
+}
+
+void WriteGbaSettings(const fs::path& user_directory, const GbaSettings& settings)
+{
+  const std::string path = (user_directory / "config.ini").string();
+  Common::IniFile ini;
+  ini.Load(path);
+  auto* gba = ini.GetOrCreateSection("GBA");
+  gba->Set("rom", settings.rom.string());
+  gba->Set("bios", settings.bios.string());
+  ini.GetOrCreateSection("Players")->Set("port2", std::string(settings.player2 ? "gba" : "controller"));
+  ini.Save(path);
+}
+
+// The pad that plays player 2's GBA: the first gamepad that is not player
+// 1's, or player 1's own when it is the only one. Buttons sit where a
+// handheld has them (A on the right face button, B below it).
+void MapGbaPad(const fs::path& user_directory, const std::string& device)
+{
+  const std::string path = (user_directory / "Config" / "GBA.ini").string();
+  Common::IniFile ini;
+  ini.Load(path);
+  auto* map = ini.GetOrCreateSection("GBA2");
+  map->Set("Device", device);
+  map->Set("Buttons/B", std::string("`Button A`"));
+  map->Set("Buttons/A", std::string("`Button B`"));
+  map->Set("Buttons/L", std::string("`Shoulder L` | `Trigger L`"));
+  map->Set("Buttons/R", std::string("`Shoulder R` | `Trigger R`"));
+  map->Set("Buttons/SELECT", std::string("Back"));
+  map->Set("Buttons/START", std::string("Start"));
+  map->Set("D-Pad/Up", std::string("`Pad N` | `Left Y+`"));
+  map->Set("D-Pad/Down", std::string("`Pad S` | `Left Y-`"));
+  map->Set("D-Pad/Left", std::string("`Pad W` | `Left X-`"));
+  map->Set("D-Pad/Right", std::string("`Pad E` | `Left X+`"));
+  ini.Save(path);
+}
+
 void SDLCALL FileDialogCallback(void* userdata, const char* const* filelist, int)
 {
   auto* state = static_cast<DialogState*>(userdata);
@@ -960,6 +1019,8 @@ int main(int argc, char** argv)
   int selected_savestate = -1;
 
   DialogState dialog;
+  DialogState gba_rom_dialog, gba_bios_dialog;
+  GbaSettings gba = ReadGbaSettings(user_directory);
   std::vector<ControllerOption> controllers = EnumerateControllers();
   bool controller_profile_exists = moderngekko::frontend::ControllerConfigExists(user_directory);
   std::vector<std::string> configured_controllers =
@@ -1590,6 +1651,17 @@ int main(int argc, char** argv)
       {
         selected_image = std::move(dialog.selected);
         dialog.selected.reset();
+      }
+    }
+    for (auto [state, target] : {std::pair{&gba_rom_dialog, &gba.rom},
+                                 std::pair{&gba_bios_dialog, &gba.bios}})
+    {
+      std::lock_guard lock(state->mutex);
+      if (state->selected)
+      {
+        *target = std::move(*state->selected);
+        state->selected.reset();
+        WriteGbaSettings(user_directory, gba);
       }
     }
     {
@@ -2226,9 +2298,9 @@ int main(int argc, char** argv)
       const int p1 = FindController(controllers, ports[0].empty() ? selected_controller : ports[0]);
       const int p2 = FindController(controllers, ports[1]);
       int& focus = row_focus[page];
-      focus = std::clamp(focus, 0, 2);
+      focus = std::clamp(focus, 0, 4);
       if (page_in.down)
-        focus = std::min(focus + 1, 2);
+        focus = std::min(focus + 1, 4);
       if (page_in.up)
         focus = std::max(focus - 1, 0);
       int dir = page_in.right || page_in.accept ? 1 : page_in.left ? -1 : 0;
@@ -2246,13 +2318,27 @@ int main(int argc, char** argv)
           }
         }
       }
-      if (mouse_in(440, 486, 800, 566))
+      for (int i = 0; i < 2; ++i)
+      {
+        const float y = 426 + i * 34.0f;
+        if (mouse_in(440, y, 830, y + 32))
+        {
+          if (mouse_moved)
+            focus = 2 + i;
+          if (clicked)
+          {
+            focus = 2 + i;
+            dir = 1;
+          }
+        }
+      }
+      if (mouse_in(440, 500, 800, 580))
       {
         if (mouse_moved)
-          focus = 2;
+          focus = 4;
         if (clicked)
         {
-          focus = 2;
+          focus = 4;
           dir = 1;
         }
       }
@@ -2264,17 +2350,52 @@ int main(int argc, char** argv)
         if (next != p2)
           assign_port(0, controllers[static_cast<std::size_t>(next)].device);
       }
-      else if (dir && focus == 1 && pad_count > 0)
+      else if (dir && focus == 1)
       {
-        // Options: none, then every pad except player 1's.
-        int option = p2 + 1;
+        // Options: none, every pad except player 1's, then a Game Boy Advance.
+        const int options = pad_count + 2;
+        int option = gba.player2 ? pad_count + 1 : p2 + 1;
         do
-          option = ((option + dir) % (pad_count + 1) + pad_count + 1) % (pad_count + 1);
-        while (option > 0 && option - 1 == p1);
-        assign_port(1, option == 0 ? std::string() :
-                                     controllers[static_cast<std::size_t>(option - 1)].device);
+          option = ((option + dir) % options + options) % options;
+        while (option > 0 && option <= pad_count && option - 1 == p1);
+        const bool to_gba = option == pad_count + 1;
+        if (to_gba != gba.player2)
+        {
+          gba.player2 = to_gba;
+          WriteGbaSettings(user_directory, gba);
+        }
+        if (to_gba)
+        {
+          // The GBA is played on the first pad that is not player 1's.
+          std::string pad;
+          for (int i = 0; i < pad_count && pad.empty(); ++i)
+            if (i != p1)
+              pad = controllers[static_cast<std::size_t>(i)].device;
+          if (pad.empty() && p1 >= 0)
+            pad = controllers[static_cast<std::size_t>(p1)].device;
+          if (!pad.empty())
+            MapGbaPad(user_directory, pad);
+          assign_port(1, std::string());
+        }
+        else
+        {
+          assign_port(1, option == 0 ? std::string() :
+                                       controllers[static_cast<std::size_t>(option - 1)].device);
+        }
       }
-      else if (dir && focus == 2)
+      else if (dir && (focus == 2 || focus == 3))
+      {
+        const bool rom = focus == 2;
+        static constexpr SDL_DialogFileFilter rom_filters[] = {{"Game Boy Advance games", "gba"}};
+        static constexpr SDL_DialogFileFilter bios_filters[] = {{"GBA BIOS", "bin;rom"}};
+        const fs::path& current = rom ? gba.rom : gba.bios;
+        const std::string start = current.empty() ? DocumentsDirectory().string() :
+                                                    current.parent_path().string();
+        SDL_ShowOpenFileDialog(FileDialogCallback, rom ? &gba_rom_dialog : &gba_bios_dialog,
+                               window, rom ? rom_filters : bios_filters, 1, start.c_str(),
+                               false);
+      }
+      else if (dir && focus == 4)
       {
         config.input_overlay = !config.input_overlay;
         if (!persist())
@@ -2294,6 +2415,7 @@ int main(int argc, char** argv)
         // that is unplugged) is shown as the profile has it.
         const std::string configured = ports[static_cast<std::size_t>(i)];
         std::string device =
+            i == 1 && gba.player2 ? std::string("GAME BOY ADVANCE") :
             assigned >= 0 ? Upper(controllers[static_cast<std::size_t>(assigned)].label) :
             configured.find("Keyboard") != std::string::npos ? std::string("KEYBOARD") :
             !configured.empty() ? Upper(configured.substr(configured.rfind('/') + 1)) :
@@ -2302,19 +2424,29 @@ int main(int argc, char** argv)
                              std::string("NONE");
         theme::ValueSelector(dl, cv, fonts, 554, y + 48, device, 300, pad_count > 0);
       }
-      theme::Text(dl, cv, fonts.small, 26, 450, 434, "PORTS 3-4", theme::color::kGold);
-      theme::Text(dl, cv, fonts.small, 26, 590, 434, "NOT CONNECTED", theme::color::kDim);
-      theme::Text(dl, cv, fonts.small, 26, 450, 490, "INPUT OVERLAY", theme::color::kGold);
-      if (in_page && focus == 2)
-        theme::Chevron(dl, cv, 427, 494, 14);
-      theme::PokeBall(dl, cv, 454, 528, config.input_overlay);
-      theme::Text(dl, cv, fonts.menu, 36, 500, 524, config.input_overlay ? "ON" : "OFF",
+      for (int i = 0; i < 2; ++i)
+      {
+        const float y = 430 + i * 34.0f;
+        const fs::path& file = i == 0 ? gba.rom : gba.bios;
+        if (in_page && focus == 2 + i)
+          theme::Chevron(dl, cv, 427, y + 4, 14);
+        theme::Text(dl, cv, fonts.small, 24, 450, y, i == 0 ? "GBA GAME" : "GBA BIOS",
+                    theme::color::kGold);
+        std::string name = file.empty() ? std::string("CHOOSE...") : Upper(file.stem().string());
+        if (name.size() > 26)
+          name = name.substr(0, 25) + "...";
+        theme::Text(dl, cv, fonts.small, 24, 590, y, name,
+                    file.empty() ? theme::color::kDim : theme::color::kWhite);
+      }
+      theme::Text(dl, cv, fonts.small, 26, 450, 506, "INPUT OVERLAY", theme::color::kGold);
+      if (in_page && focus == 4)
+        theme::Chevron(dl, cv, 427, 510, 14);
+      theme::PokeBall(dl, cv, 454, 544, config.input_overlay);
+      theme::Text(dl, cv, fonts.menu, 36, 500, 540, config.input_overlay ? "ON" : "OFF",
                   config.input_overlay ? theme::color::kWhite : theme::color::kDim);
-      theme::Text(dl, cv, fonts.body, 13, 450, 574, "Draws the controller on screen and",
+      theme::Text(dl, cv, fonts.body, 13, 450, 588, "Draws the controller on screen and",
                   theme::color::kDim, false);
-      theme::Text(dl, cv, fonts.body, 13, 450, 598, "lights each button as it is pressed.",
-                  theme::color::kDim, false);
-      theme::Text(dl, cv, fonts.body, 13, 450, 622, "Made for recordings and streams.",
+      theme::Text(dl, cv, fonts.body, 13, 450, 610, "lights each button as it is pressed.",
                   theme::color::kDim, false);
       theme::Text(dl, cv, fonts.body, 13, 450, 656, controller_status, theme::color::kGrey,
                   false);
@@ -2335,8 +2467,14 @@ int main(int argc, char** argv)
       if (in_page)
         help = focus == 0 ? "The gamepad for player 1. Changing it writes a fresh GameCube "
                             "button layout for the pads in use." :
-               focus == 1 ? "A second gamepad for player 2, for two-player battles. NONE "
-                            "leaves port 2 empty. Player 1's setup is not touched." :
+               focus == 1 ? "A second gamepad for player 2, for two-player battles, or a "
+                            "GAME BOY ADVANCE for Colosseum's GBA battles. NONE leaves port "
+                            "2 empty. Player 1's setup is not touched." :
+               focus == 2 ? "The GBA game that Colosseum links with: Pokemon Ruby or "
+                            "Sapphire. Each GBA keeps its own save; save at a Pokemon "
+                            "Center on it before linking." :
+               focus == 3 ? "A GBA BIOS dumped from your own Game Boy Advance. Colosseum "
+                            "boots each GBA over the link cable, which needs it." :
                             "Draws the controller on screen in game and lights each button as "
                             "it is pressed.";
       break;
@@ -2959,6 +3097,21 @@ int main(int argc, char** argv)
         {
           argument_storage.emplace_back("--controller");
           argument_storage.emplace_back(controller);
+        }
+        if (!gba.rom.empty())
+        {
+          argument_storage.emplace_back("--gba-rom");
+          argument_storage.emplace_back(gba.rom.string());
+          if (!gba.bios.empty())
+          {
+            argument_storage.emplace_back("--gba-bios");
+            argument_storage.emplace_back(gba.bios.string());
+          }
+          if (launch_mode == LaunchMode::Host && gba.player2)
+          {
+            argument_storage.emplace_back("--gba-port");
+            argument_storage.emplace_back("2");
+          }
         }
       }
       if (use_wayland)
