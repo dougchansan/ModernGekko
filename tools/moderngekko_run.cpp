@@ -58,6 +58,7 @@ void Usage() {
                "[--netplay-port <port>] [--netplay-ready] [--netplay-autostart]\n"
                "       [--nickname <name>] [--buffer <auto|1-20>] "
                "[--controller <device>]...\n"
+               "       [--gba-port <1-4> --gba-rom <rom.gba>] [--gba-bios <bios.bin>]\n"
                "       Automation protocol: drop key=value command files into "
                "<automation-dir>/commands.\n"
                "       Supported commands: pause, resume, stop, clear_pad, "
@@ -216,6 +217,8 @@ int RunMain(int argc, char **argv) {
   std::string netplay_buffer;
   std::vector<std::string> netplay_controllers;
   bool netplay_ready = false, netplay_autostart = false;
+  std::filesystem::path gba_rom;
+  int gba_port = -1;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const auto value = [&](const char *option) -> const char * {
@@ -265,7 +268,18 @@ int RunMain(int argc, char **argv) {
       config.headless = true;
     else if (arg == "--allow-interpreter")
       config.allow_interpreter = true;
-    else if (arg == "--netplay-ready")
+    else if (arg == "--gba-rom")
+      gba_rom = value("--gba-rom");
+    else if (arg == "--gba-bios")
+      config.input.gba_bios = value("--gba-bios");
+    else if (arg == "--gba-port") {
+      const std::string port_value = value("--gba-port");
+      if (port_value.size() != 1 || port_value[0] < '1' || port_value[0] > '4') {
+        std::cerr << "--gba-port must be 1, 2, 3 or 4\n";
+        return 2;
+      }
+      gba_port = port_value[0] - '1';
+    } else if (arg == "--netplay-ready")
       netplay_ready = true;
     else if (arg == "--netplay-autostart")
       netplay_autostart = true;
@@ -301,6 +315,15 @@ int RunMain(int argc, char **argv) {
       return 2;
     }
   }
+  // A netplay guest takes its GBA port from the host, so only needs the ROM.
+  if ((gba_port >= 0 && gba_rom.empty()) ||
+      (!gba_rom.empty() && gba_port < 0 &&
+       netplay_role != moderngekko::frontend::NetplayRole::Join)) {
+    std::cerr << "--gba-port and --gba-rom go together\n";
+    return 2;
+  }
+  if (!netplay_role && gba_port >= 0)
+    config.input.gba_roms[gba_port] = gba_rom;
   if (config.game_root.empty())
     config.game_root =
         ReadDefaultGame(config.user_directory, executable_directory);
@@ -495,6 +518,8 @@ int RunMain(int argc, char **argv) {
     options.role = *netplay_role;
     options.auto_ready = netplay_ready;
     options.auto_start = netplay_autostart;
+    options.gba_rom = gba_rom.string();
+    options.gba_port = gba_port;
     options.address = netplay_address.empty() ? frontend_config.netplay_address
                                               : netplay_address;
     options.port = netplay_port.value_or(frontend_config.netplay_port);

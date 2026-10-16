@@ -36,6 +36,11 @@ struct NetplayOptions {
   // player ready on its own, and on the host start once everyone is ready.
   bool auto_ready = false;
   bool auto_start = false;
+  // Game Boy Advance link: every player runs the GBA in lockstep, so all of
+  // them need this ROM. The host also names the port (0-3) that is a GBA and
+  // sends its save for that port to the others.
+  std::string gba_rom;
+  int gba_port = -1;
 };
 
 int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,

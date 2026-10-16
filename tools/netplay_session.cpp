@@ -12,6 +12,9 @@
 #include "UICommon/GameFile.h"
 #include "UICommon/UICommon.h"
 #include "runtime/dolphin_runtime_internal.hpp"
+#ifdef HAS_LIBMGBA
+#include "Core/HW/GBACore.h"
+#endif
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -209,8 +212,25 @@ public:
     return m_game;
   }
 
-  std::string FindGBARomPath(const std::array<u8, 20> &, std::string_view,
-                             int) override {
+  void SetGBARom(std::string path) {
+    std::lock_guard lock(m_mutex);
+    m_gba_rom = std::move(path);
+  }
+
+  std::string FindGBARomPath(const std::array<u8, 20> &hash,
+                             std::string_view, int) override {
+#ifdef HAS_LIBMGBA
+    std::string path;
+    {
+      std::lock_guard lock(m_mutex);
+      path = m_gba_rom;
+    }
+    std::array<u8, 20> ours{};
+    std::string title;
+    if (!path.empty() &&
+        HW::GBA::Core::GetRomInfo(path.c_str(), ours, title) && ours == hash)
+      return path;
+#endif
     return {};
   }
 
@@ -250,6 +270,7 @@ public:
 
 private:
   std::shared_ptr<UICommon::GameFile> m_game;
+  std::string m_gba_rom;
   mutable std::mutex m_mutex;
   NetPlay::NetPlayClient *m_client = nullptr;
   Runtime *m_runtime = nullptr;
@@ -550,6 +571,13 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
   Config::SetBase(Config::NETPLAY_STRICT_SETTINGS_SYNC, true);
   Config::SetBase(Config::NETPLAY_NETWORK_MODE, std::string("fixeddelay"));
   Config::SetBase(Config::NETPLAY_USE_INDEX, false);
+#ifdef HAS_LIBMGBA
+  // The GBA's ROM by port, for this run only. The host reads it to describe
+  // the GBA to the others and to find the save it sends them.
+  if (!options.gba_rom.empty())
+    for (const auto &path : Config::MAIN_GBA_ROM_PATHS)
+      Config::SetCurrent(path, options.gba_rom);
+#endif
 
   auto game = std::make_shared<UICommon::GameFile>(
       (runtime_config.game_root / "sys/main.dol").string());
@@ -571,6 +599,7 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
   std::cerr << "netplay: compatibility validated\n";
 
   SessionUI ui(game);
+  ui.SetGBARom(options.gba_rom);
   const NetPlay::NetTraversalConfig direct{};
   std::unique_ptr<NetPlay::NetPlayServer> server;
   std::unique_ptr<NetPlay::NetPlayClient> client;
@@ -592,6 +621,11 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
           static_cast<unsigned int>(std::stoul(options.buffer)));
     server->ChangeGame(game->GetSyncIdentifier(),
                        inspected.metadata->game_name);
+    if (options.gba_port >= 0 && options.gba_port < 4) {
+      NetPlay::GBAConfigArray gba{};
+      gba[options.gba_port].enabled = true;
+      server->SetGBAConfig(gba, true);
+    }
     client = std::make_unique<NetPlay::NetPlayClient>(
         "127.0.0.1", server->GetPort(), &ui, options.nickname, direct,
         static_cast<u8>(options.controllers.size()));

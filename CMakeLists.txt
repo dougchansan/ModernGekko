@@ -98,6 +98,7 @@ if(MODERNGEKKO_FRONTEND_SDK)
     endif()
 endif()
 
+option(MODERNGEKKO_GBA "Build Dolphin's emulated GBA (mGBA) for link play" OFF)
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(MODERNGEKKO_ENABLE_IMGUI_LAUNCHER ON CACHE BOOL "" FORCE)
     set(ENABLE_QT OFF CACHE BOOL "" FORCE)
@@ -108,7 +109,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(ENABLE_ANALYTICS OFF CACHE BOOL "" FORCE)
     set(USE_RETRO_ACHIEVEMENTS OFF CACHE BOOL "" FORCE)
     set(USE_DISCORD_PRESENCE OFF CACHE BOOL "" FORCE)
-    set(USE_MGBA OFF CACHE BOOL "" FORCE)
+    # Emulated Game Boy Advance link (Dolphin's mGBA core): Colosseum's
+    # multiplayer pairs a GameCube player with GBAs running Ruby / Sapphire.
+    set(USE_MGBA ${MODERNGEKKO_GBA} CACHE BOOL "" FORCE)
     set(USE_UPNP OFF CACHE BOOL "" FORCE)
     set(ENCODE_FRAMEDUMPS OFF CACHE BOOL "" FORCE)
     set(ENABLE_LLVM OFF CACHE BOOL "" FORCE)

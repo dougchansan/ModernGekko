@@ -3,6 +3,7 @@
 #include "moderngekko/game.hpp"
 #include "moderngekko/module_abi.h"
 
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -78,6 +79,9 @@ struct AudioSettings
 struct InputSettings
 {
   bool background_input = false;
+  // Ports (0-3) wired to an emulated Game Boy Advance, by the ROM it runs.
+  std::array<std::filesystem::path, 4> gba_roms;
+  std::filesystem::path gba_bios;
 };
 
 struct AutomationSettings

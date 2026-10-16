@@ -247,6 +247,18 @@ bool ParsePadCommand(const std::map<std::string, std::string>& values, Command* 
   {
     if (key == "command" || key == "port" || (require_frames && key == "frames"))
       continue;
+    const auto gba = std::ranges::find(kGbaPadButtons, key, &GbaPadButton::field);
+    if (gba != kGbaPadButtons.end())
+    {
+      if (value != "0" && value != "1")
+      {
+        if (error)
+          *error = key + " must be 0 or 1";
+        return false;
+      }
+      command->pad.gba[gba - kGbaPadButtons.begin()] = value == "1";
+      continue;
+    }
     const PadField* field = FindPadField(key);
     if (!field)
     {

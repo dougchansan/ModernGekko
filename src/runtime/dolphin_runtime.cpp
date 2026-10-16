@@ -21,8 +21,9 @@
 #include "Core/Debugger/PPCDebugInterface.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
+#include "Core/HW/SI/SI_Device.h"
 #include "Core/State.h"
-#include "Core/HW/GBACore.h"
+#include "Core/HW/GBAPad.h"
 #include "Core/HW/GCPad.h"
 #include "Core/Host.h"
 #include "Core/NetPlay/NetPlayClient.h"
@@ -48,6 +49,8 @@
 #include "moderngekko/mod_loader.hpp"
 #include "moderngekko/module_loader.hpp"
 #include "InputCommon/GCPadStatus.h"
+#include "InputCommon/InputConfig.h"
+#include "InputCommon/ControllerEmu/ControllerEmu.h"
 
 #include <algorithm>
 #include <array>
@@ -2755,6 +2758,26 @@ void MarkAutomationCommand(RuntimeAutomationState& state, std::string command_na
   state.last_error.clear();
 }
 
+// Automation buttons held on each port's emulated Game Boy Advance. Held
+// buttons replace the mapped input; released ones leave it alone.
+std::array<std::array<std::atomic<bool>, automation::kGbaPadButtons.size()>, 4>
+    s_automation_gba{};
+
+void RegisterAutomationGba(int port)
+{
+  Pad::GetGBAConfig()->GetController(port)->SetInputOverrideFunction(
+      [port](std::string_view group, std::string_view control,
+             ControlState) -> std::optional<ControlState> {
+        for (std::size_t i = 0; i < automation::kGbaPadButtons.size(); ++i)
+        {
+          const auto& button = automation::kGbaPadButtons[i];
+          if (button.group == group && button.control == control)
+            return s_automation_gba[port][i] ? std::make_optional(1.0) : std::nullopt;
+        }
+        return std::nullopt;
+      });
+}
+
 void ClearAutomationPad(int port)
 {
   for (int control = static_cast<int>(ciface::Touch::FIRST_GC_CONTROL);
@@ -2763,11 +2786,15 @@ void ClearAutomationPad(int port)
     ciface::Touch::ClearControlState(port,
                                      static_cast<ciface::Touch::ControlID>(control));
   }
+  for (auto& held : s_automation_gba[port])
+    held = false;
 }
 
 void ApplyAutomationPad(const automation::PadState& pad)
 {
   ClearAutomationPad(pad.port);
+  for (std::size_t i = 0; i < pad.gba.size(); ++i)
+    s_automation_gba[pad.port][i] = pad.gba[i];
   for (std::size_t index = 0; index < pad.controls.size(); ++index)
   {
     ciface::Touch::SetControlState(
@@ -3649,10 +3676,28 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
   Config::SetBase(Config::MAIN_INPUT_BACKGROUND_INPUT,
                   impl->config.input.background_input);
+#ifdef HAS_LIBMGBA
+  // For this run only: the current-run layer is never written to Dolphin.ini.
+  if (!impl->config.input.gba_bios.empty()) {
+    Config::SetCurrent(Config::MAIN_GBA_BIOS_PATH, impl->config.input.gba_bios.string());
+    File::SetUserPath(F_GBABIOS_IDX, impl->config.input.gba_bios.string());
+  }
+  for (int port = 0; port < 4; ++port) {
+    const auto& rom = impl->config.input.gba_roms[port];
+    if (rom.empty())
+      continue;
+    Config::SetCurrent(Config::MAIN_GBA_ROM_PATHS[port], rom.string());
+    Config::SetCurrent(Config::GetInfoForSIDevice(port),
+                    SerialInterface::SIDEVICE_GC_GBA_EMULATED);
+  }
+#endif
   EnsureAutomationDirectories(impl->config.automation.directory);
   if (!impl->config.automation.directory.empty()) {
     for (int port = 0; port < 4; ++port)
+    {
       ciface::Touch::RegisterGameCubeInputOverrider(port);
+      RegisterAutomationGba(port);
+    }
     impl->automation_registered = true;
   }
 
@@ -3702,7 +3747,10 @@ Runtime::~Runtime() {
   m_impl->state_hook = {};
   if (m_impl->automation_registered) {
     for (int port = 0; port < 4; ++port)
+    {
       ciface::Touch::UnregisterGameCubeInputOverrider(port);
+      Pad::GetGBAConfig()->GetController(port)->ClearInputOverrideFunction();
+    }
   }
   if (m_impl->controllers_initialized)
     UICommon::ShutdownControllers();

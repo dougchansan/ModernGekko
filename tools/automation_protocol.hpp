@@ -384,7 +384,30 @@ struct PadState
   int port = 0;
   std::array<double, ciface::Touch::LAST_GC_CONTROL - ciface::Touch::FIRST_GC_CONTROL + 1>
       controls{};
+  // The emulated Game Boy Advance on this port, in kGbaPadButtons order.
+  std::array<bool, 10> gba{};
 };
+
+// Game Boy Advance buttons, as pad fields and as (group, control) names on
+// Dolphin's GBA pad.
+struct GbaPadButton
+{
+  std::string_view field;
+  std::string_view group;
+  std::string_view control;
+};
+inline constexpr std::array<GbaPadButton, 10> kGbaPadButtons = {{
+    {"gba_b", "Buttons", "B"},
+    {"gba_a", "Buttons", "A"},
+    {"gba_l", "Buttons", "L"},
+    {"gba_r", "Buttons", "R"},
+    {"gba_select", "Buttons", "SELECT"},
+    {"gba_start", "Buttons", "START"},
+    {"gba_up", "D-Pad", "Up"},
+    {"gba_down", "D-Pad", "Down"},
+    {"gba_left", "D-Pad", "Left"},
+    {"gba_right", "D-Pad", "Right"},
+}};
 
 struct Command
 {
