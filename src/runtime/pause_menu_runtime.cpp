@@ -32,6 +32,7 @@
 #include "moderngekko/runtime.hpp"
 #include "amd_driver_settings.h"
 #include "pause_menu_host.hpp"
+#include "players_ui.hpp"
 #include "onscreen_keyboard.hpp"
 #include "pause_menu_policy.hpp"
 #include "colosseum_menu_style.hpp"
@@ -3232,6 +3233,9 @@ static void RepaintWhilePaused(const std::shared_ptr<moderngekko::pause_menu::Me
 }
 
 void Host_PauseMenuTick() {
+  // The window loop's one call into the runtime on every platform: the GBA
+  // screens' own windows and reset combo ride along, menu or not.
+  moderngekko::players_ui::Tick();
   using namespace moderngekko::pause_menu;
   const auto menu = current.load();
   if (!menu || !menu->active || menu->switching)

@@ -4,6 +4,7 @@
 #include "automation_protocol.hpp"
 #include "pause_menu_host.hpp"
 #include "gba_screen.hpp"
+#include "players_ui.hpp"
 #include "gc_controller_art.hpp"
 #include "launcher_savestates.hpp"
 #include "quick_boot.hpp"
@@ -1499,7 +1500,7 @@ void DrawNavigationOverlay()
 {
   if (!ImGui::GetCurrentContext())
     return;
-  moderngekko::gba_screen::Draw();
+  moderngekko::players_ui::Draw();
   moderngekko::pause_menu::Draw();
   if (Host_IsPauseMenuOpen())
     return;
@@ -3700,6 +3701,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                     SerialInterface::SIDEVICE_GC_GBA_EMULATED);
   }
 #endif
+  moderngekko::players_ui::Initialize(impl->config);
   EnsureAutomationDirectories(impl->config.automation.directory);
   if (!impl->config.automation.directory.empty()) {
     for (int port = 0; port < 4; ++port)
