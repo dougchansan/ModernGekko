@@ -23,6 +23,7 @@
 #include "Common/CommonPaths.h"
 #include "Common/FileUtil.h"
 #include "Common/Image.h"
+#include "VideoCommon/ColosseumTextUpscale.h"
 
 namespace moderngekko::pause_menu {
 namespace {
@@ -177,13 +178,30 @@ bool BakedLoadGlyph(ImFontAtlas *atlas, ImFontConfig *src, ImFontBaked *baked, v
     return false;
   ImTextureRect *r = ImFontAtlasPackGetRect(atlas, pack_id);
 
-  // Resample: average the source pixels each target pixel covers (shrinking)
-  // or bilinear (growing), so the game's bitmap stays smooth at any size.
+  // Resample: average the source pixels each target pixel covers (shrinking),
+  // or, growing, rebuild the edges the way the game's HD text does
+  // (VideoCommon/ColosseumTextUpscale.h): a centre-weighted footprint of
+  // bilinear samples half a texel around the point, then a narrow smoothstep,
+  // so enlarged glyphs come out with clean rounded edges instead of blur.
   std::vector<unsigned char> pixels(static_cast<std::size_t>(w) * h);
   const float step = 1.0f / raster;  // source pixels per target pixel
   const int taps = std::clamp(static_cast<int>(std::ceil(step)), 1, 4);
   for (int py = 0; py < h; ++py) {
     for (int px = 0; px < w; ++px) {
+      if (raster > 1.0f) {
+        namespace hd = ColosseumTextUpscale;
+        const float x = g.x + (px + 0.5f) * step, y = g.y + (py + 0.5f) * step;
+        const float r = hd::RECONSTRUCTION_RADIUS;
+        const auto cov = [&](float sx, float sy) { return font->Coverage(sx, sy) / 255.0f; };
+        const float axial = cov(x + r, y) + cov(x - r, y) + cov(x, y + r) + cov(x, y - r);
+        const float diagonal =
+            cov(x + r, y + r) + cov(x - r, y - r) + cov(x + r, y - r) + cov(x - r, y + r);
+        const float coverage =
+            hd::ReconstructCoverage(hd::CombineCoverage(cov(x, y), axial, diagonal));
+        pixels[static_cast<std::size_t>(py) * w + px] =
+            static_cast<unsigned char>(std::lround(coverage * 255.0f));
+        continue;
+      }
       float sum = 0;
       for (int sy = 0; sy < taps; ++sy)
         for (int sx = 0; sx < taps; ++sx)

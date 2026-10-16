@@ -29,6 +29,16 @@ bool WriteAll(const fs::path& path, const std::vector<char>& data, std::string* 
   return false;
 }
 
+// A card's date is when the game last saved it, not when the library copied
+// it: copies carry the source file's modification time across.
+void KeepTime(const fs::path& from, const fs::path& to)
+{
+  std::error_code ec;
+  const auto time = fs::last_write_time(from, ec);
+  if (!ec)
+    fs::last_write_time(to, time, ec);
+}
+
 std::string Lower(std::string text)
 {
   for (char& c : text)
@@ -186,6 +196,8 @@ bool MemoryCardLibrary::Load(std::string* error)
     if (!WriteAll(m_library / (name + ".gci"), saves.empty() ? std::vector<char>{} : ReadAll(saves.front()),
                   error))
       return false;
+    if (!saves.empty())
+      KeepTime(saves.front(), m_library / (name + ".gci"));
     if (!List(error))
       return false;
     for (std::size_t i = 0; i < m_cards.size(); ++i)
@@ -206,13 +218,28 @@ bool MemoryCardLibrary::CollectSlot(std::string* error)
   const std::vector<char> slot = saves.empty() ? std::vector<char>{} : ReadAll(saves.front());
   const std::vector<char> stored = ReadAll(card.file);
   if (slot == stored)
+  {
+    if (!saves.empty())
+    {
+      std::error_code ec;
+      const auto slot_time = fs::last_write_time(saves.front(), ec);
+      std::error_code card_ec;
+      if (!ec && fs::last_write_time(card.file, card_ec) != slot_time && !card_ec)
+      {
+        KeepTime(saves.front(), card.file);
+        return List(error);
+      }
+    }
     return true;
+  }
   std::error_code ec;
   if (!stored.empty())
     fs::copy_file(card.file, fs::path(card.file).concat(".bak"),
                   fs::copy_options::overwrite_existing, ec);
   if (!WriteAll(card.file, slot, error))
     return false;
+  if (!saves.empty())
+    KeepTime(saves.front(), card.file);
   return List(error);
 }
 
@@ -241,8 +268,12 @@ bool MemoryCardLibrary::Insert(int index, std::string* error)
     if (m_cards[i].name == target)
       m_inserted = static_cast<int>(i);
   const std::vector<char> data = ReadAll(m_cards[static_cast<std::size_t>(m_inserted)].file);
-  if (!data.empty() && !WriteAll(m_slot / DolphinFileName(data), data, error))
-    return false;
+  if (!data.empty())
+  {
+    if (!WriteAll(m_slot / DolphinFileName(data), data, error))
+      return false;
+    KeepTime(m_cards[static_cast<std::size_t>(m_inserted)].file, m_slot / DolphinFileName(data));
+  }
   return WriteInserted(error);
 }
 
@@ -267,9 +298,11 @@ bool MemoryCardLibrary::Duplicate(int index, const std::string& name, std::strin
   }
   if (index == m_inserted && !CollectSlot(error))
     return false;
-  return WriteAll(m_library / (name + ".gci"), ReadAll(m_cards[static_cast<std::size_t>(index)].file),
-                  error) &&
-         List(error);
+  if (!WriteAll(m_library / (name + ".gci"), ReadAll(m_cards[static_cast<std::size_t>(index)].file),
+                error))
+    return false;
+  KeepTime(m_cards[static_cast<std::size_t>(index)].file, m_library / (name + ".gci"));
+  return List(error);
 }
 
 bool MemoryCardLibrary::Rename(int index, const std::string& name, std::string* error)
