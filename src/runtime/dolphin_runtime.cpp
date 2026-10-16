@@ -254,6 +254,12 @@ struct NavigationOverlayState
   bool pending_save_is_recovery = false;
   bool has_seen_valid_room = false;
   std::array<GCPadStatus, 4> input_status{};  // ports 1-4
+  // Memory card info (UpdateMemoryCardInfo): the save count last seen, the
+  // play time stored with it, and whether its .info file is still to write.
+  u32 memcard_savecount = 0xFFFFFFFF;
+  u32 memcard_playtime = 0;
+  bool memcard_info_pending = false;
+  int memcard_check_countdown = 0;
   // Queued like the save/load paths rather than acted on in the window
   // procedure: these have to happen on the thread that owns the core, and the
   // UI thread does not.
@@ -1358,6 +1364,67 @@ bool PadInUse(const GCPadStatus& pad)
          off(pad.stickY, GCPadStatus::MAIN_STICK_CENTER_Y) ||
          off(pad.substickX, GCPadStatus::C_STICK_CENTER_X) ||
          off(pad.substickY, GCPadStatus::C_STICK_CENTER_Y);
+}
+
+// What a Colosseum memory card holds, beside it as <save>.gci.info, so the
+// launcher can show where and how long without decrypting the save:
+//   location=Pyrite Town / playtime=<seconds> / savecount=<n>
+// The save's status block (savedataGetStatus(0, 1), reached from the pointer
+// at r13 - 0x5A68) keeps a save counter at +0x10 and the play time recorded
+// with the last save, in seconds as a float, at +0x20 (capped at 99:59:00).
+// The file is written when the game saves (the counter goes up by one) and
+// when a save is loaded from the card (it appears from nothing on a normal
+// boot), once the room the player is in has a name. Any other jump is a save
+// state being loaded, whose memory may come from another playthrough than the
+// card in the slot, so it is noted but not written; likewise the first value
+// seen in a session booted from a state (`booted_from_state`).
+void UpdateMemoryCardInfo(const Memory::MemoryManager& memory, NavigationOverlayState& state,
+                          const std::filesystem::path& slot_directory, bool booted_from_state)
+{
+  if (state.memcard_check_countdown-- > 0)
+    return;
+  state.memcard_check_countdown = 30;  // about twice a second
+  constexpr u32 kSaveRoot = 0x8047ADB8;
+  const u32 save_root = memory.Read_U32(kSaveRoot);
+  if (save_root < 0x80000000u || save_root >= 0x81800000u)
+    return;
+  const u32 save_count = memory.Read_U32(save_root + 0x10);
+  if (save_count != state.memcard_savecount)
+  {
+    const u32 previous = state.memcard_savecount;
+    state.memcard_savecount = save_count;
+    const float seconds = ReadGuestFloat(memory, save_root + 0x20);
+    state.memcard_playtime =
+        std::isfinite(seconds) && seconds > 0 ? static_cast<u32>(seconds) : 0;
+    const bool saved = previous != 0xFFFFFFFFu && save_count == previous + 1;
+    const bool loaded_from_card =
+        (previous == 0xFFFFFFFFu && !booted_from_state) || previous == 0;
+    state.memcard_info_pending = save_count != 0 && (saved || loaded_from_card);
+  }
+  if (!state.memcard_info_pending)
+    return;
+  std::string location;
+  {
+    std::lock_guard lock(state.mutex);
+    location = state.location_name;
+  }
+  if (location.empty() || location.starts_with("Room "))
+    return;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(slot_directory, ec), end; !ec && it != end;
+       it.increment(ec))
+  {
+    if (it->path().extension() != ".gci")
+      continue;
+    char code[4] = {};
+    std::ifstream(it->path(), std::ios::binary).read(code, 4);
+    if (std::string_view(code, 4) != "GC6E")
+      continue;
+    std::ofstream info(it->path().string() + ".info", std::ios::trunc);
+    info << "location=" << location << "\nplaytime=" << state.memcard_playtime
+         << "\nsavecount=" << save_count << '\n';
+    state.memcard_info_pending = false;
+  }
 }
 
 void DrawInputOverlay(NavigationOverlayState& state)
@@ -4272,6 +4339,13 @@ RuntimeRunResult Runtime::Run() {
                   m_impl->navigation_overlay.widescreen_enabled.load(
                       std::memory_order_relaxed),
                   movie_active, character_naming_active);
+          if (m_impl->metadata.disc_id == "GC6E01")
+          {
+            static const std::filesystem::path slot_a =
+                std::filesystem::path(File::GetUserPath(D_GCUSER_IDX)) / "USA" / "Card A";
+            UpdateMemoryCardInfo(memory, m_impl->navigation_overlay, slot_a,
+                                 m_impl->config.load_state_path.has_value());
+          }
           // Sample the pad for whichever overlay wants to draw it. This used
           // to test only input_overlay_enabled, so the harness controller
           // overlay drew a permanently neutral pad whenever the text overlay

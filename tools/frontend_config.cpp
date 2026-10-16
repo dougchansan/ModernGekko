@@ -678,6 +678,113 @@ bool GenerateControllerConfig(const fs::path &user_directory,
   return true;
 }
 
+std::array<std::string, 4>
+ReadControllerPorts(const fs::path &user_directory) {
+  std::array<std::string, 4> ports;
+  std::ifstream input(ControllerConfigPath(user_directory));
+  std::string line;
+  std::size_t port = 4;
+  const std::string_view section_prefix = ControllerSectionPrefix();
+  while (std::getline(input, line)) {
+    const std::string trimmed = Trim(line);
+    if (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+      port = 4;
+      if (trimmed.size() == section_prefix.size() + 2 && trimmed.starts_with(section_prefix) &&
+          trimmed[section_prefix.size()] >= '1' && trimmed[section_prefix.size()] <= '4')
+        port = static_cast<std::size_t>(trimmed[section_prefix.size()] - '1');
+      continue;
+    }
+    const std::size_t separator = trimmed.find('=');
+    if (port < 4 && separator != std::string::npos &&
+        Trim(trimmed.substr(0, separator)) == "Device")
+      ports[port] = Trim(trimmed.substr(separator + 1));
+  }
+  return ports;
+}
+
+bool SetControllerPort(const fs::path &user_directory, int port, std::string_view controller,
+                       std::string *message) {
+  if (port < 0 || port > 3 || controller.find_first_of("\r\n") != std::string_view::npos) {
+    if (message)
+      *message = "invalid controller port";
+    return false;
+  }
+  // The generated section for this port, taken from a one-pad profile.
+  std::string generated;
+  if (!controller.empty()) {
+    const fs::path scratch = user_directory / "Config" / ".port-mapping";
+    const std::string value(controller);
+    if (!GenerateControllerConfig(scratch, std::span<const std::string>(&value, 1), message))
+      return false;
+    std::ifstream in(ControllerConfigPath(scratch));
+    std::string line;
+    bool inside = false;
+    while (std::getline(in, line)) {
+      const std::string trimmed = Trim(line);
+      if (trimmed.starts_with('[')) {
+        inside = trimmed == std::string(ControllerSectionPrefix()) + "1]";
+        continue;
+      }
+      if (inside && !trimmed.empty())
+        generated += line + '\n';
+    }
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+  }
+  // Rebuild the profile, replacing only this port's section body.
+  std::vector<std::string> lines;
+  {
+    std::ifstream in(ControllerConfigPath(user_directory));
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      lines.push_back(line);
+    }
+  }
+  const std::string header =
+      std::string(ControllerSectionPrefix()) + std::to_string(port + 1) + "]";
+  std::string output;
+  bool replaced = false, skipping = false;
+  for (const std::string &line : lines) {
+    const std::string trimmed = Trim(line);
+    if (trimmed.starts_with('[')) {
+      skipping = false;
+      output += line + '\n';
+      if (trimmed == header) {
+        output += generated;
+        replaced = true;
+        skipping = true;
+      }
+      continue;
+    }
+    if (!skipping)
+      output += line + '\n';
+  }
+  if (!replaced) {
+    // Sections for every port up to this one, so the profile stays in order.
+    for (int p = 0; p < 4; ++p) {
+      const std::string h = std::string(ControllerSectionPrefix()) + std::to_string(p + 1) + "]";
+      if (output.find(h) == std::string::npos)
+        output += h + '\n' + (p == port ? generated : std::string());
+    }
+  }
+  const fs::path destination = ControllerConfigPath(user_directory);
+  std::error_code ec;
+  fs::create_directories(destination.parent_path(), ec);
+  std::ofstream file(destination, std::ios::trunc);
+  file << output;
+  if (!file) {
+    if (message)
+      *message = "can't write " + destination.string();
+    return false;
+  }
+  if (message)
+    *message = controller.empty() ? "Player " + std::to_string(port + 1) + " disconnected"
+                                  : "Player " + std::to_string(port + 1) + " mapped";
+  return true;
+}
+
 bool GenerateControllerConfig(const fs::path &user_directory,
                               std::string_view controller,
                               std::string *message) {

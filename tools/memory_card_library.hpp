@@ -25,6 +25,9 @@ struct LibraryCard
   bool blank = true;
   int blocks = 0;
   std::optional<std::filesystem::file_time_type> saved;
+  // From <card>.gci.info, written by the runtime when the game saves.
+  std::string location;
+  int playtime = -1;  // seconds
 };
 
 class MemoryCardLibrary

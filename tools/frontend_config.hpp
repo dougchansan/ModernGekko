@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -106,6 +107,15 @@ bool GenerateControllerConfig(const std::filesystem::path &user_directory,
 bool GenerateControllerConfig(const std::filesystem::path &user_directory,
                               std::string_view controller,
                               std::string *message);
+// Maps one port (0-3) to an SDL gamepad, or leaves it empty for "", and
+// keeps every other port's section exactly as it is (a keyboard player 1 or a
+// hand-tuned mapping survives a change to player 2).
+bool SetControllerPort(const std::filesystem::path &user_directory, int port,
+                       std::string_view controller, std::string *message);
+// The device configured for each port, empty where none ("" keeps its place,
+// unlike ReadConfiguredControllers).
+std::array<std::string, 4>
+ReadControllerPorts(const std::filesystem::path &user_directory);
 bool EnsureControllerConfig(const std::filesystem::path &user_directory,
                             std::span<const std::string> controllers,
                             std::string *message);

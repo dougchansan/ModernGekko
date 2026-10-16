@@ -696,6 +696,17 @@ int CardNameFilter(ImGuiInputTextCallbackData* data)
   return c < 128 && (std::isalnum(c) || c == ' ' || c == '-' || c == '_') ? 0 : 1;
 }
 
+// "Play time 42:17" (hours:minutes, as the game shows it), or empty.
+std::string CardPlayTime(const moderngekko::frontend::LibraryCard& card)
+{
+  if (card.playtime < 0)
+    return {};
+  char text[32];
+  std::snprintf(text, sizeof(text), "Play time %d:%02d", card.playtime / 3600,
+                card.playtime / 60 % 60);
+  return text;
+}
+
 std::string CardWhen(const moderngekko::frontend::LibraryCard& card)
 {
   if (card.blank)
@@ -1411,6 +1422,29 @@ int main(int argc, char** argv)
       }
     naming.mode = Naming::Mode::None;
   };
+  // Sets one player's pad (empty: none) and refreshes what the page shows;
+  // the other players' sections are left as they are.
+  const auto assign_port = [&](int port, const std::string& device)
+  {
+    std::string message;
+    if (!moderngekko::frontend::SetControllerPort(user_directory, port, device, &message))
+    {
+      std::lock_guard lock(dialog.mutex);
+      dialog.error = std::move(message);
+      return;
+    }
+    configured_controllers = moderngekko::frontend::ReadConfiguredControllers(user_directory);
+    if (!configured_controllers.empty())
+    {
+      config.controllers = configured_controllers;
+      config.controller = configured_controllers.front();
+      selected_controller = configured_controllers.front();
+      persist();
+    }
+    controller_index = FindController(controllers, selected_controller);
+    controller_profile_exists = true;
+    controller_status = std::move(message);
+  };
   const auto assign_players = [&](std::vector<std::string> devices)
   {
     std::string message;
@@ -1797,11 +1831,17 @@ int main(int argc, char** argv)
           std::string name = Upper(card.name);
           const float size = std::min(36.0f, 36 * 176 / std::max(1.0f, theme::TextWidth(fonts.menu, 36, name)));
           theme::Text(dl, cv, fonts.menu, size, 1046, 254, name);
-          theme::Text(dl, cv, fonts.body, 13, 1046, 298,
-                      card.blank ? std::string("New game") : std::to_string(card.blocks) + " blocks",
-                      theme::color::kGrey, false);
-          theme::Text(dl, cv, fonts.body, 13, 1046, 320, CardWhen(card), theme::color::kGrey,
-                      false);
+          const std::string first =
+              card.blank ? std::string("New game") :
+              !card.location.empty() ? card.location :
+                                       std::to_string(card.blocks) + " blocks";
+          const std::string second =
+              CardPlayTime(card).empty() ? CardWhen(card) : CardPlayTime(card);
+          theme::Text(dl, cv, fonts.body, 13, 1046, 298, first, theme::color::kGrey, false);
+          theme::Text(dl, cv, fonts.body, 13, 1046, 320, second, theme::color::kGrey, false);
+          if (!CardPlayTime(card).empty())
+            theme::Text(dl, cv, fonts.body, 13, 1046, 342, CardWhen(card), theme::color::kDim,
+                        false);
         }
         else
         {
@@ -1894,8 +1934,11 @@ int main(int argc, char** argv)
         const auto& card = cards[static_cast<std::size_t>(focus)];
         theme::Text(dl, cv, fonts.body, 13, 450, 668,
                     card.name + ".gci   " +
-                        (card.blank ? std::string("blank") : std::to_string(card.blocks) + " blocks") +
-                        "   " + CardWhen(card),
+                        (card.blank ? std::string("blank") :
+                         !card.location.empty() ? card.location :
+                                                  std::to_string(card.blocks) + " blocks") +
+                        (CardPlayTime(card).empty() ? "" : "   " + CardPlayTime(card)) + "   " +
+                        CardWhen(card),
                     theme::color::kGrey, false);
       }
       else
@@ -2177,12 +2220,9 @@ int main(int argc, char** argv)
     case kControllers:
     {
       const int pad_count = static_cast<int>(controllers.size());
-      const int p1 = FindController(controllers, configured_controllers.empty() ?
-                                                     selected_controller :
-                                                     configured_controllers.front());
-      const int p2 = configured_controllers.size() > 1 ?
-                         FindController(controllers, configured_controllers[1]) :
-                         -1;
+      const auto ports = moderngekko::frontend::ReadControllerPorts(user_directory);
+      const int p1 = FindController(controllers, ports[0].empty() ? selected_controller : ports[0]);
+      const int p2 = FindController(controllers, ports[1]);
       int& focus = row_focus[page];
       focus = std::clamp(focus, 0, 2);
       if (page_in.down)
@@ -2216,23 +2256,21 @@ int main(int argc, char** argv)
       }
       if (dir && focus == 0 && pad_count > 0)
       {
-        const int next = p1 < 0 ? 0 : ((p1 + dir) % pad_count + pad_count) % pad_count;
-        std::vector<std::string> devices{controllers[static_cast<std::size_t>(next)].device};
-        if (p2 >= 0 && p2 != next)
-          devices.push_back(controllers[static_cast<std::size_t>(p2)].device);
-        assign_players(devices);
+        int next = p1 < 0 ? 0 : ((p1 + dir) % pad_count + pad_count) % pad_count;
+        if (next == p2 && pad_count > 1)
+          next = ((next + dir) % pad_count + pad_count) % pad_count;
+        if (next != p2)
+          assign_port(0, controllers[static_cast<std::size_t>(next)].device);
       }
-      else if (dir && focus == 1 && pad_count > 0 && p1 >= 0)
+      else if (dir && focus == 1 && pad_count > 0)
       {
         // Options: none, then every pad except player 1's.
         int option = p2 + 1;
         do
           option = ((option + dir) % (pad_count + 1) + pad_count + 1) % (pad_count + 1);
-        while (option - 1 == p1 && pad_count > 1);
-        std::vector<std::string> devices{controllers[static_cast<std::size_t>(p1)].device};
-        if (option > 0 && option - 1 != p1)
-          devices.push_back(controllers[static_cast<std::size_t>(option - 1)].device);
-        assign_players(devices);
+        while (option > 0 && option - 1 == p1);
+        assign_port(1, option == 0 ? std::string() :
+                                     controllers[static_cast<std::size_t>(option - 1)].device);
       }
       else if (dir && focus == 2)
       {
@@ -2252,10 +2290,7 @@ int main(int argc, char** argv)
         const int assigned = i == 0 ? p1 : p2;
         // A profile device that is not a connected pad (the keyboard, or a pad
         // that is unplugged) is shown as the profile has it.
-        const std::string configured =
-            static_cast<std::size_t>(i) < configured_controllers.size() ?
-                configured_controllers[static_cast<std::size_t>(i)] :
-                std::string();
+        const std::string configured = ports[static_cast<std::size_t>(i)];
         std::string device =
             assigned >= 0 ? Upper(controllers[static_cast<std::size_t>(assigned)].label) :
             configured.find("Keyboard") != std::string::npos ? std::string("KEYBOARD") :
@@ -2263,8 +2298,7 @@ int main(int argc, char** argv)
             pad_count == 0 ? std::string("NO GAMEPAD") :
             i == 0         ? std::string("CHOOSE A PAD") :
                              std::string("NONE");
-        theme::ValueSelector(dl, cv, fonts, 554, y + 48, device, 300,
-                             pad_count > 0 && (i == 0 || p1 >= 0));
+        theme::ValueSelector(dl, cv, fonts, 554, y + 48, device, 300, pad_count > 0);
       }
       theme::Text(dl, cv, fonts.small, 26, 450, 434, "PORTS 3-4", theme::color::kGold);
       theme::Text(dl, cv, fonts.small, 26, 590, 434, "NOT CONNECTED", theme::color::kDim);
@@ -2300,7 +2334,7 @@ int main(int argc, char** argv)
         help = focus == 0 ? "The gamepad for player 1. Changing it writes a fresh GameCube "
                             "button layout for the pads in use." :
                focus == 1 ? "A second gamepad for player 2, for two-player battles. NONE "
-                            "leaves port 2 empty." :
+                            "leaves port 2 empty. Player 1's setup is not touched." :
                             "Draws the controller on screen in game and lights each button as "
                             "it is pressed.";
       break;
@@ -2599,8 +2633,11 @@ int main(int argc, char** argv)
           theme::Text(dl, cv, fonts.small, 26, 640 - theme::TextWidth(fonts.small, 26, where) / 2,
                       574, where, fade(theme::color::kGold));
           const std::string detail =
-              (card.blank ? std::string("Blank") : std::to_string(card.blocks) + " blocks") +
-              "     " + CardWhen(card);
+              (card.blank ? std::string("Blank") :
+               !card.location.empty() ? card.location :
+                                        std::to_string(card.blocks) + " blocks") +
+              (CardPlayTime(card).empty() ? "" : "     " + CardPlayTime(card)) + "     " +
+              CardWhen(card);
           theme::Text(dl, cv, fonts.body, 13, 640 - theme::TextWidth(fonts.body, 13, detail) / 2,
                       612, detail, fade(theme::color::kGrey), false);
         }

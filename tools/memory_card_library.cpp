@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 
@@ -37,6 +38,23 @@ void KeepTime(const fs::path& from, const fs::path& to)
   const auto time = fs::last_write_time(from, ec);
   if (!ec)
     fs::last_write_time(to, time, ec);
+}
+
+// Beside a card or a slot save: what the runtime recorded when the game last
+// saved it (see UpdateMemoryCardInfo).
+fs::path InfoFor(const fs::path& save)
+{
+  return fs::path(save).concat(".info");
+}
+
+// Copies (or, with no source, removes) the .info beside `to`.
+void CarryInfo(const fs::path& from, const fs::path& to)
+{
+  std::error_code ec;
+  if (!from.empty() && fs::exists(InfoFor(from), ec))
+    fs::copy_file(InfoFor(from), InfoFor(to), fs::copy_options::overwrite_existing, ec);
+  else
+    fs::remove(InfoFor(to), ec);
 }
 
 std::string Lower(std::string text)
@@ -149,6 +167,17 @@ bool MemoryCardLibrary::List(std::string* error)
       if (!time_ec)
         card.saved = time;
     }
+    {
+      std::ifstream info(InfoFor(card.file));
+      std::string line;
+      while (std::getline(info, line))
+      {
+        if (line.starts_with("location="))
+          card.location = line.substr(9);
+        else if (line.starts_with("playtime="))
+          card.playtime = std::atoi(line.c_str() + 9);
+      }
+    }
     m_cards.push_back(std::move(card));
   }
   std::ranges::sort(m_cards, [](const LibraryCard& a, const LibraryCard& b)
@@ -197,7 +226,10 @@ bool MemoryCardLibrary::Load(std::string* error)
                   error))
       return false;
     if (!saves.empty())
+    {
       KeepTime(saves.front(), m_library / (name + ".gci"));
+      CarryInfo(saves.front(), m_library / (name + ".gci"));
+    }
     if (!List(error))
       return false;
     for (std::size_t i = 0; i < m_cards.size(); ++i)
@@ -221,6 +253,18 @@ bool MemoryCardLibrary::CollectSlot(std::string* error)
   {
     if (!saves.empty())
     {
+      std::error_code info_ec;
+      if (fs::exists(InfoFor(saves.front()), info_ec))
+      {
+        std::ifstream a(InfoFor(saves.front())), b(InfoFor(card.file));
+        const std::string sa{std::istreambuf_iterator<char>(a), {}},
+            sb{std::istreambuf_iterator<char>(b), {}};
+        if (sa != sb)
+        {
+          CarryInfo(saves.front(), card.file);
+          return List(error);
+        }
+      }
       std::error_code ec;
       const auto slot_time = fs::last_write_time(saves.front(), ec);
       std::error_code card_ec;
@@ -240,6 +284,7 @@ bool MemoryCardLibrary::CollectSlot(std::string* error)
     return false;
   if (!saves.empty())
     KeepTime(saves.front(), card.file);
+  CarryInfo(saves.empty() ? fs::path() : saves.front(), card.file);
   return List(error);
 }
 
@@ -256,6 +301,7 @@ bool MemoryCardLibrary::Insert(int index, std::string* error)
   fs::create_directories(m_slot, ec);
   for (const fs::path& save : SlotSaves())
   {
+    fs::remove(InfoFor(save), ec);
     fs::remove(save, ec);
     if (ec)
     {
@@ -273,6 +319,7 @@ bool MemoryCardLibrary::Insert(int index, std::string* error)
     if (!WriteAll(m_slot / DolphinFileName(data), data, error))
       return false;
     KeepTime(m_cards[static_cast<std::size_t>(m_inserted)].file, m_slot / DolphinFileName(data));
+    CarryInfo(m_cards[static_cast<std::size_t>(m_inserted)].file, m_slot / DolphinFileName(data));
   }
   return WriteInserted(error);
 }
@@ -302,6 +349,7 @@ bool MemoryCardLibrary::Duplicate(int index, const std::string& name, std::strin
                 error))
     return false;
   KeepTime(m_cards[static_cast<std::size_t>(index)].file, m_library / (name + ".gci"));
+  CarryInfo(m_cards[static_cast<std::size_t>(index)].file, m_library / (name + ".gci"));
   return List(error);
 }
 
@@ -327,6 +375,8 @@ bool MemoryCardLibrary::Delete(int index,
   std::error_code ec;
   if (fs::exists(fs::path(file).concat(".bak"), ec))
     remove(fs::path(file).concat(".bak"));
+  if (fs::exists(InfoFor(file), ec))
+    remove(InfoFor(file));
   return List(error);
 }
 
@@ -358,6 +408,8 @@ bool MemoryCardLibrary::Rename(int index, const std::string& name, std::string* 
   }
   if (fs::exists(fs::path(card.file).concat(".bak"), ec))
     fs::rename(fs::path(card.file).concat(".bak"), fs::path(target).concat(".bak"), ec);
+  if (fs::exists(InfoFor(card.file), ec))
+    fs::rename(InfoFor(card.file), InfoFor(target), ec);
   const bool inserted = index == m_inserted;
   card.name = name;
   card.file = target;
