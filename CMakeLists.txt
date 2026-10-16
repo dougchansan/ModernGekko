@@ -249,6 +249,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         src/runtime/dolphin_runtime.cpp
         src/runtime/pause_menu_runtime.cpp
   src/runtime/colosseum_font.cpp
+  src/runtime/gc_controller_art.cpp
   src/runtime/shadow_tracker.cpp
   src/runtime/quick_boot.cpp
   src/runtime/attract_video.cpp
@@ -552,6 +553,10 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         tools/moderngekko_launcher.cpp
         tools/frontend_config.cpp
         tools/dol_patch.cpp
+        tools/colosseum_font_extract.cpp
+        tools/colosseum_icon_extract.cpp
+        tools/launcher_theme.cpp
+        tools/memory_card_library.cpp
         vendor/dolphin/Externals/imgui/imgui/backends/imgui_impl_sdl3.cpp
         vendor/dolphin/Externals/imgui/imgui/backends/imgui_impl_sdlrenderer3.cpp)
     target_include_directories(moderngekko-launcher PRIVATE

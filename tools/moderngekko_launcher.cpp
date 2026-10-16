@@ -1,12 +1,18 @@
 #include "automation_protocol.hpp"
 #include "cache_affinity.hpp"
+#include "colosseum_font_extract.hpp"
+#include "colosseum_icon_extract.hpp"
 #include "frontend_config.hpp"
 #include "launcher_savestates.hpp"
 #include "dol_patch.hpp"
+#include "launcher_theme.hpp"
+#include "memory_card_library.hpp"
 #include "moderngekko/game.hpp"
 #include "moderngekko/hd_texture_pack.hpp"
 #include "netplay_session.hpp"
 
+#include "Common/FileUtil.h"
+#include "Common/Image.h"
 #include "DiscIO/DiscExtractor.h"
 #include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
@@ -19,6 +25,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <chrono>
+#include <ctime>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -26,12 +36,14 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
+namespace theme = moderngekko::frontend::theme;
 
 namespace
 {
@@ -522,6 +534,158 @@ fs::path SiblingRunner(const char* argv0)
   const fs::path sibling = self.parent_path() / runner;
   return fs::is_regular_file(sibling) ? sibling : runner;
 }
+
+// ---- launcher pages ----
+constexpr const char* kTitle = "POK\xC3\xA9MON COLOSSEUM";
+
+enum Page
+{
+  kPlay,
+  kCards,
+  kStates,
+  kDisplay,
+  kGameplay,
+  kControllers,
+  kMods,
+  kNetplay,
+  kPageCount,
+};
+constexpr std::array<const char*, kPageCount> kPageNames = {
+    "PLAY",     "MEMORY CARDS", "SAVE STATES",     "DISPLAY",
+    "GAMEPLAY", "CONTROLLERS",  "MODS & OVERLAYS", "NETPLAY"};
+constexpr std::array<const char*, kPageCount> kPageHelp = {
+    "Start the game, from the memory card or from a save state.",
+    "The memory cards in Slot A and Slot B. Each card is one Colosseum save.",
+    "Save states from the pause menu and the room autosaves, newest first.",
+    "Window mode, render resolution, aspect ratio and texture filtering.",
+    "Frame rate, speed and the safety nets: autosaves and stall recovery.",
+    "Which gamepad plays, and the on-screen input display.",
+    "Minimap, overlays, and the HD texture and text upgrades.",
+    "Play with a friend over the internet. Still experimental."};
+
+std::string Upper(std::string text)
+{
+  for (char& c : text)
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return text;
+}
+
+// "today 14:02", "yesterday 09:15", "Oct 13  20:30".
+std::string DescribeTime(fs::file_time_type when)
+{
+  const auto system = std::chrono::clock_cast<std::chrono::system_clock>(when);
+  const std::time_t then = std::chrono::system_clock::to_time_t(system);
+  const std::time_t now = std::time(nullptr);
+  const std::tm a = State::Layout::LocalTime(then), b = State::Layout::LocalTime(now);
+  char text[32] = {};
+  std::tm yesterday = b;
+  yesterday.tm_mday -= 1;
+  std::mktime(&yesterday);
+  if (a.tm_year == b.tm_year && a.tm_yday == b.tm_yday)
+    std::strftime(text, sizeof(text), "today %H:%M", &a);
+  else if (a.tm_year == yesterday.tm_year && a.tm_yday == yesterday.tm_yday)
+    std::strftime(text, sizeof(text), "yesterday %H:%M", &a);
+  else
+    std::strftime(text, sizeof(text), "%b %d  %H:%M", &a);
+  return text;
+}
+
+struct StateEntry
+{
+  std::string title, kind, when, file;
+  fs::path path;
+};
+
+StateEntry DescribeState(const fs::path& path)
+{
+  StateEntry entry;
+  entry.file = path.filename().string();
+  entry.path = path;
+  std::string stem = path.stem().string();
+  const bool automatic = stem.starts_with(State::Layout::AUTOMATIC_PREFIX);
+  entry.kind = automatic ? "AUTOSAVE" : "SAVE STATE";
+  // Whatever follows the prefix that is not the timestamp is the game's own
+  // name for the moment (a room, a checkpoint) or the player's.
+  const std::string_view prefix =
+      automatic ? State::Layout::AUTOMATIC_PREFIX : State::Layout::MANUAL_PREFIX;
+  if (stem.starts_with(prefix))
+    stem.erase(0, prefix.size());
+  std::string name;
+  for (std::size_t start = 0; start <= stem.size();)
+  {
+    std::size_t end = stem.find('-', start);
+    if (end == std::string::npos)
+      end = stem.size();
+    const std::string part = stem.substr(start, end - start);
+    if (!part.empty() && !std::ranges::all_of(part, [](unsigned char c) { return std::isdigit(c); }))
+      name += (name.empty() ? "" : " ") + part;
+    start = end + 1;
+  }
+  std::ranges::replace(name, '_', ' ');
+  entry.title = name.empty() ? entry.kind : Upper(name);
+  std::error_code ec;
+  const auto time = fs::last_write_time(path, ec);
+  entry.when = ec ? std::string() : DescribeTime(time);
+  return entry;
+}
+
+// The naming dialog for a new, renamed or copied card.
+struct Naming
+{
+  enum class Mode
+  {
+    None,
+    New,
+    Rename,
+    Duplicate,
+  };
+  Mode mode = Mode::None;
+  int index = -1;
+  std::array<char, 25> text{};  // 24 characters
+  bool focus = false;
+  std::string error;
+};
+
+int CardNameFilter(ImGuiInputTextCallbackData* data)
+{
+  const ImWchar c = data->EventChar;
+  return c < 128 && (std::isalnum(c) || c == ' ' || c == '-' || c == '_') ? 0 : 1;
+}
+
+std::string CardWhen(const moderngekko::frontend::LibraryCard& card)
+{
+  if (card.blank)
+    return "Blank card";
+  return card.saved ? "Saved " + DescribeTime(*card.saved) : std::string();
+}
+
+// The memory card in a GCI-folder slot. Colosseum keeps one save per card.
+struct CardInfo
+{
+  std::string label = "EMPTY", detail = "No save on this card", when;
+};
+
+CardInfo ReadCard(const fs::path& folder)
+{
+  CardInfo card;
+  std::error_code ec;
+  fs::path newest;
+  fs::file_time_type newest_time{};
+  for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
+  {
+    if (it->path().extension() != ".gci")
+      continue;
+    const auto time = it->last_write_time(ec);
+    if (newest.empty() || time > newest_time)
+      newest = it->path(), newest_time = time;
+  }
+  if (newest.empty())
+    return card;
+  card.label = "SAVE 1";
+  card.detail = "Colosseum save";
+  card.when = "Saved " + DescribeTime(newest_time);
+  return card;
+}
 } // namespace
 
 
@@ -577,6 +741,9 @@ int main(int argc, char** argv)
 #endif
   bool use_wayland = false;
   std::optional<fs::path> extract_only;
+  // Renders every launcher page once into this directory and exits, so the
+  // screens can be checked against the design without driving the window.
+  std::optional<fs::path> capture_directory;
   for (int i = 1; i < argc; ++i)
   {
     if (std::string_view(argv[i]) == "-X11" || std::string_view(argv[i]) == "--x11")
@@ -585,6 +752,8 @@ int main(int argc, char** argv)
       use_wayland = true;
     else if (std::string_view(argv[i]) == "--extract" && i + 1 < argc)
       extract_only = argv[++i];
+    else if (std::string_view(argv[i]) == "--capture-pages" && i + 1 < argc)
+      capture_directory = argv[++i];
   }
 
   const fs::path release_directory = ExecutableDirectory(argv[0]);
@@ -624,8 +793,15 @@ int main(int argc, char** argv)
     return 1;
 
   const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
-  SDL_Window* window = SDL_CreateWindow(MODERNGEKKO_FRONTEND_NAME, static_cast<int>(900 * scale),
-                                        static_cast<int>(820 * scale),
+  int window_width = static_cast<int>(1280 * scale), window_height = static_cast<int>(760 * scale);
+  SDL_Rect usable{};
+  if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 && usable.h > 0)
+  {
+    const float fit = std::min({1.0f, usable.w * 0.9f / window_width, usable.h * 0.9f / window_height});
+    window_width = static_cast<int>(window_width * fit);
+    window_height = static_cast<int>(window_height * fit);
+  }
+  SDL_Window* window = SDL_CreateWindow(MODERNGEKKO_FRONTEND_NAME, window_width, window_height,
                                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
   if (!window)
   {
@@ -644,11 +820,18 @@ int main(int argc, char** argv)
     return 1;
   }
   SDL_SetRenderVSync(renderer, 1);
+  // Whether "Auto" aspect means native ultrawide on this display.
+  std::string display_size = "unknown";
+  bool ultrawide_display = false;
+  if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window)))
+  {
+    display_size = std::to_string(mode->w) + "x" + std::to_string(mode->h);
+    ultrawide_display = mode->w * 10 >= mode->h * 22;
+  }
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
-  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
   io.IniFilename = nullptr;
   ImGui::StyleColorsDark();
   ImGui::GetStyle().ScaleAllSizes(scale);
@@ -767,7 +950,8 @@ int main(int argc, char** argv)
     }
     std::string error;
     if (!moderngekko::frontend::SaveConfig(user_directory, resolutions[resolution_index].text,
-                                           show_fps_in_title, controllers[index].device, &error))
+                                           config.show_fps_in_title, controllers[index].device,
+                                           &error))
     {
       std::lock_guard lock(dialog.mutex);
       dialog.error = std::move(error);
@@ -778,7 +962,6 @@ int main(int argc, char** argv)
     config.controller = selected_controller;
     config.controllers = configured_controllers;
     config.resolution = resolutions[resolution_index].text;
-    config.show_fps_in_title = show_fps_in_title;
     controller_profile_exists = true;
     controller_status = std::move(message);
     return true;
@@ -842,6 +1025,438 @@ int main(int argc, char** argv)
   };
   bool done = false;
   LaunchMode launch_mode = LaunchMode::None;
+
+  // ---- the themed launcher ----
+  // Pokemon Colosseum's own fonts, rebuilt from the player's game files on
+  // first run (nothing from the game ships with the launcher).
+  const fs::path font_directory = user_directory / "Load" / "ColosseumFont";
+  {
+    std::string font_error;
+    if (!moderngekko::frontend::EnsureColosseumFonts(current_game, font_directory, &font_error))
+      SDL_Log("Colosseum fonts unavailable: %s", font_error.c_str());
+  }
+  const theme::Fonts fonts = theme::LoadFonts(font_directory.string() + "/");
+  // The Pokemon face portraits (also what the pause menu draws).
+  const fs::path icon_directory = user_directory / "Load" / "ColosseumIcons";
+  {
+    std::string icon_error;
+    if (!moderngekko::frontend::EnsureColosseumIcons(current_game, icon_directory, &icon_error))
+      SDL_Log("Colosseum portraits unavailable: %s", icon_error.c_str());
+  }
+  std::string release_version;
+  {
+    std::ifstream version_file(release_directory / "VERSION");
+    std::getline(version_file, release_version);
+    while (!release_version.empty() && std::isspace(static_cast<unsigned char>(release_version.back())))
+      release_version.pop_back();
+  }
+  int page = kPlay;
+  int capture_frame = 0;
+  bool in_page = true;
+  std::array<int, kPageCount> row_focus{};
+  bool help_open = false;
+  bool gamepad_input = false;
+  std::array<char, 8> netplay_port_text{};
+  std::snprintf(netplay_port_text.data(), netplay_port_text.size(), "%d", netplay_port);
+  std::vector<StateEntry> state_entries;
+  for (const fs::path& path : launcher_savestates)
+    state_entries.push_back(DescribeState(path));
+  // Named memory cards; the inserted one lives in Slot A.
+#ifdef MODERNGEKKO_REQUIRED_DISC_ID
+  const std::string game_id = MODERNGEKKO_REQUIRED_DISC_ID;
+#else
+  const std::string game_id =
+      current_metadata ? current_metadata.metadata->disc_id : std::string("GC6E01");
+#endif
+  moderngekko::frontend::MemoryCardLibrary card_library(user_directory, game_id);
+  {
+    std::string card_error;
+    if (!card_library.Load(&card_error))
+    {
+      std::lock_guard lock(dialog.mutex);
+      dialog.error = "Memory cards: " + card_error;
+    }
+  }
+  // Save-state thumbnails (<state>.png, written by the runtime), loaded into
+  // textures the first time a row shows them.
+  std::unordered_map<std::string, SDL_Texture*> thumbnails;
+  const auto png_texture = [&](const std::string& file) -> SDL_Texture*
+  {
+    const std::string key = file;
+    if (const auto it = thumbnails.find(key); it != thumbnails.end())
+      return it->second;
+    SDL_Texture* texture = nullptr;
+    std::string png;
+    std::vector<u8> rgba;
+    u32 w = 0, h = 0;
+    if (File::ReadFileToString(key, png) &&
+        Common::LoadPNG(std::span(reinterpret_cast<const u8*>(png.data()), png.size()), &rgba, &w,
+                        &h) &&
+        w && h)
+    {
+      texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+                                  static_cast<int>(w), static_cast<int>(h));
+      if (texture)
+      {
+        SDL_UpdateTexture(texture, nullptr, rgba.data(), static_cast<int>(w * 4));
+        SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+      }
+    }
+    thumbnails[key] = texture;
+    return texture;
+  };
+  const auto thumbnail = [&](const fs::path& state) { return png_texture(state.string() + ".png"); };
+  // Draws species' face as a framed portrait.
+  const auto draw_portrait = [&](ImDrawList* dl, const theme::Canvas& cv, int species, float x,
+                                 float y, float size, bool active, const std::string& fallback)
+  {
+    SDL_Texture* atlas = png_texture((icon_directory / "icons_atlas.png").string());
+    const int index = moderngekko::frontend::ColosseumIconIndex(species);
+    ImVec2 uv0{0, 0}, uv1{0, 0};
+    if (atlas && index >= 0)
+    {
+      float aw = 0, ah = 0;
+      SDL_GetTextureSize(atlas, &aw, &ah);
+      constexpr float cell = moderngekko::frontend::kColosseumIconCell;
+      const float cx = (index % moderngekko::frontend::kColosseumIconColumns) * cell,
+                  cy = (index / moderngekko::frontend::kColosseumIconColumns) * cell;
+      uv0 = {cx / aw, cy / ah};
+      uv1 = {(cx + cell) / aw, (cy + cell) / ah};
+    }
+    theme::Portrait(dl, cv, fonts,
+                    ImTextureRef(static_cast<ImTextureID>(reinterpret_cast<intptr_t>(atlas))),
+                    atlas && index >= 0, uv0, uv1, x, y, size, active, fallback);
+  };
+  // Draws a thumbnail into a box, cropped to the box's shape.
+  const auto draw_thumbnail = [&](ImDrawList* dl, const theme::Canvas& cv, const fs::path& state,
+                                  float x0, float y0, float x1, float y1)
+  {
+    SDL_Texture* texture = thumbnail(state);
+    if (!texture)
+      return false;
+    float tw = 0, th = 0;
+    SDL_GetTextureSize(texture, &tw, &th);
+    const float box = (x1 - x0) / (y1 - y0), image = tw / th;
+    ImVec2 uv0{0, 0}, uv1{1, 1};
+    if (image > box)
+      uv0.x = (1 - box / image) / 2, uv1.x = 1 - uv0.x;
+    else
+      uv0.y = (1 - image / box) / 2, uv1.y = 1 - uv0.y;
+    dl->AddImage(ImTextureRef(static_cast<ImTextureID>(reinterpret_cast<intptr_t>(texture))),
+                 cv.P(x0, y0), cv.P(x1, y1), uv0, uv1);
+    return true;
+  };
+  // The backdrop: the newest save state's picture, blurred (two box passes
+  // each way) so it reads as atmosphere rather than detail.
+  SDL_Texture* backdrop = nullptr;
+  float backdrop_w = 0, backdrop_h = 0;
+  for (const StateEntry& entry : state_entries)
+  {
+    std::string png;
+    std::vector<u8> rgba;
+    u32 w = 0, h = 0;
+    if (!File::ReadFileToString(entry.path.string() + ".png", png) ||
+        !Common::LoadPNG(std::span(reinterpret_cast<const u8*>(png.data()), png.size()), &rgba, &w,
+                         &h) ||
+        w < 8 || h < 8)
+      continue;
+    const int radius = static_cast<int>(std::max(2u, h / 60));
+    std::vector<float> a(rgba.begin(), rgba.end()), b(a.size());
+    for (int pass = 0; pass < 4; ++pass)
+    {
+      const bool horizontal = pass % 2 == 0;
+      const int n = static_cast<int>(horizontal ? w : h), lines = static_cast<int>(horizontal ? h : w);
+      for (int line = 0; line < lines; ++line)
+        for (int c = 0; c < 4; ++c)
+        {
+          const auto at = [&](int i) -> std::size_t {
+            const int x = horizontal ? i : line, y = horizontal ? line : i;
+            return (static_cast<std::size_t>(y) * w + x) * 4 + c;
+          };
+          float sum = 0;
+          for (int i = -radius; i <= radius; ++i)
+            sum += a[at(std::clamp(i, 0, n - 1))];
+          for (int i = 0; i < n; ++i)
+          {
+            b[at(i)] = sum / (2 * radius + 1);
+            sum += a[at(std::min(i + radius + 1, n - 1))] - a[at(std::max(i - radius, 0))];
+          }
+        }
+      std::swap(a, b);
+    }
+    for (std::size_t i = 0; i < rgba.size(); ++i)
+      rgba[i] = static_cast<u8>(std::clamp(a[i], 0.0f, 255.0f));
+    backdrop = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+                                 static_cast<int>(w), static_cast<int>(h));
+    if (backdrop)
+    {
+      SDL_UpdateTexture(backdrop, nullptr, rgba.data(), static_cast<int>(w * 4));
+      SDL_SetTextureScaleMode(backdrop, SDL_SCALEMODE_LINEAR);
+      backdrop_w = static_cast<float>(w);
+      backdrop_h = static_cast<float>(h);
+    }
+    break;
+  }
+  bool carousel_open = false;
+  float carousel_t = 0, carousel_pos = 0;
+  int carousel_focus = 0;
+  Naming naming;
+
+  const auto persist = [&]
+  {
+    std::string error;
+    if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
+      return true;
+    std::lock_guard lock(dialog.mutex);
+    dialog.error = std::move(error);
+    return false;
+  };
+  const auto info = [](std::string text)
+  {
+    theme::Row row;
+    row.kind = theme::Row::Kind::Info;
+    row.label = std::move(text);
+    row.text_color = theme::color::kGrey;
+    return row;
+  };
+  const auto toggle = [&](const char* label, bool* value, const char* help,
+                          bool save = true)
+  {
+    theme::Row row;
+    row.kind = theme::Row::Kind::Toggle;
+    row.label = label;
+    row.help = help;
+    row.on = *value;
+    row.changed = [&, value, save](const theme::Row& changed)
+    {
+      const bool previous = *value;
+      *value = changed.on;
+      if (!save || persist())
+        return true;
+      *value = previous;
+      return false;
+    };
+    return row;
+  };
+  const auto slider = [&](const char* label, int* value, int min, int max, int step,
+                          const char* suffix, const char* help, bool enabled = true,
+                          bool save = true)
+  {
+    theme::Row row;
+    row.kind = theme::Row::Kind::Slider;
+    row.label = label;
+    row.help = help;
+    row.enabled = enabled;
+    row.value = *value;
+    row.min = min;
+    row.max = max;
+    row.step = step;
+    row.value_text = std::to_string(*value) + suffix;
+    row.changed = [&, value, save](const theme::Row& changed)
+    {
+      const int previous = *value;
+      *value = changed.value;
+      if (!save || persist())
+        return true;
+      *value = previous;
+      return false;
+    };
+    return row;
+  };
+  const auto choice = [](const char* label, std::vector<std::string> options, int index,
+                         const char* help, std::function<bool(int)> apply)
+  {
+    theme::Row row;
+    row.kind = theme::Row::Kind::Choice;
+    row.label = label;
+    row.help = help;
+    row.options = std::move(options);
+    row.index = index;
+    row.changed = [apply = std::move(apply)](const theme::Row& changed)
+    { return apply(changed.index); };
+    return row;
+  };
+  const auto action = [](const char* label, const char* button, const char* help,
+                         std::function<void()> run, bool enabled = true)
+  {
+    theme::Row row;
+    row.kind = theme::Row::Kind::Action;
+    row.label = label;
+    row.options = {button};
+    row.help = help;
+    row.enabled = enabled;
+    row.activated = std::move(run);
+    return row;
+  };
+  const auto text_input = [&](const char* label, char* buffer, std::size_t size, bool numeric,
+                              const char* help)
+  {
+    theme::Row row;
+    row.kind = theme::Row::Kind::TextInput;
+    row.label = label;
+    row.help = help;
+    row.buffer = buffer;
+    row.buffer_size = size;
+    row.numeric = numeric;
+    if (numeric)
+      row.changed = [&](const theme::Row&)
+      {
+        netplay_port = std::clamp(std::atoi(netplay_port_text.data()), 1, 65535);
+        std::snprintf(netplay_port_text.data(), netplay_port_text.size(), "%d", netplay_port);
+        return true;
+      };
+    return row;
+  };
+  const auto set_community_pack = [&](bool enabled)
+  {
+    std::string error;
+    if (moderngekko::SetCommunityHdTexturePackEnabled(user_directory, enabled, &error))
+    {
+      const bool previous_hires = config.hires_textures;
+      config.community_hd_texture_pack = enabled;
+      if (enabled)
+        config.hires_textures = true;
+      if (persist())
+      {
+        community_pack_status = moderngekko::GetCommunityHdTexturePackStatus(user_directory);
+        community_pack_message = enabled ? "Community pack installed and enabled." :
+                                           "Community pack removed from the active textures.";
+        return true;
+      }
+      std::string rollback_error;
+      moderngekko::SetCommunityHdTexturePackEnabled(user_directory, !enabled, &rollback_error);
+      config.community_hd_texture_pack = !enabled;
+      config.hires_textures = previous_hires;
+      return false;
+    }
+    std::lock_guard lock(dialog.mutex);
+    dialog.error = std::move(error);
+    return false;
+  };
+  const auto card_failed = [&](std::string error)
+  {
+    std::lock_guard lock(dialog.mutex);
+    dialog.error = "Memory cards: " + std::move(error);
+  };
+  const auto insert_card = [&](int index)
+  {
+    std::string error;
+    if (!card_library.Insert(index, &error))
+      card_failed(error);
+  };
+  const auto open_naming = [&](Naming::Mode mode, int index)
+  {
+    naming.mode = mode;
+    naming.index = index;
+    naming.focus = true;
+    naming.error.clear();
+    const std::string initial = mode == Naming::Mode::Rename ?
+                                    card_library.Cards()[static_cast<std::size_t>(index)].name :
+                                    card_library.SuggestName();
+    std::snprintf(naming.text.data(), naming.text.size(), "%s", initial.c_str());
+  };
+  const auto commit_naming = [&]
+  {
+    std::string name = naming.text.data();
+    while (!name.empty() && name.back() == ' ')
+      name.pop_back();
+    while (!name.empty() && name.front() == ' ')
+      name.erase(name.begin());
+    std::string error;
+    const bool ok = naming.mode == Naming::Mode::New ? card_library.Create(name, &error) :
+                    naming.mode == Naming::Mode::Rename ?
+                                                       card_library.Rename(naming.index, name, &error) :
+                                                       card_library.Duplicate(naming.index, name, &error);
+    if (!ok)
+    {
+      naming.error = error.empty() ? "Use letters, numbers, spaces, - or _." : error;
+      return;
+    }
+    const auto& cards = card_library.Cards();
+    for (std::size_t i = 0; i < cards.size(); ++i)
+      if (cards[i].name == name)
+      {
+        carousel_focus = static_cast<int>(i);
+        row_focus[kCards] = static_cast<int>(i);
+      }
+    naming.mode = Naming::Mode::None;
+  };
+  const auto assign_players = [&](std::vector<std::string> devices)
+  {
+    std::string message;
+    if (!moderngekko::frontend::GenerateControllerConfig(
+            user_directory, std::span<const std::string>(devices), &message))
+    {
+      std::lock_guard lock(dialog.mutex);
+      dialog.error = std::move(message);
+      return;
+    }
+    const std::vector<std::string> previous = config.controllers;
+    config.controllers = devices;
+    config.controller = devices.front();
+    if (!persist())
+    {
+      config.controllers = previous;
+      return;
+    }
+    configured_controllers = devices;
+    selected_controller = devices.front();
+    controller_index = FindController(controllers, selected_controller);
+    controller_profile_exists = true;
+    controller_status = std::move(message);
+  };
+  const auto start_solo = [&](int state)
+  {
+    selected_savestate = state;
+    if (ensure_controller())
+    {
+      launch_mode = LaunchMode::Solo;
+      done = true;
+    }
+  };
+  const auto start_netplay = [&](LaunchMode mode)
+  {
+    if (!ensure_controller())
+      return;
+    config.netplay_nickname = netplay_nickname.data();
+    config.netplay_address = netplay_address.data();
+    config.netplay_port = static_cast<std::uint16_t>(netplay_port);
+    config.netplay_buffer = automatic_buffer ? "auto" : std::to_string(manual_buffer);
+    config.controllers = configured_controllers.empty() ?
+                             std::vector<std::string>{selected_controller} :
+                             configured_controllers;
+    config.controller = config.controllers.front();
+    if (persist())
+    {
+      launch_mode = mode;
+      done = true;
+    }
+  };
+  const auto browse_for_image = [&]
+  {
+    static constexpr SDL_DialogFileFilter filters[] = {
+        {"Disc images", "iso;wbfs;rvz"}, {"ISO", "iso"}, {"WBFS", "wbfs"}, {"RVZ", "rvz"}};
+    const std::string documents = DocumentsDirectory().string();
+    SDL_ShowOpenFileDialog(FileDialogCallback, &dialog, window, filters,
+                           static_cast<int>(std::size(filters)), documents.c_str(), false);
+  };
+  const auto start_extraction = [&]
+  {
+    if (!selected_image || extraction.running)
+      return;
+    extraction.completed = 0;
+    extraction.total = 1;
+    extraction.running = true;
+    {
+      std::lock_guard lock(extraction.mutex);
+      extraction.error.clear();
+      extraction.finished_game.reset();
+    }
+    const fs::path image = *selected_image;
+    extraction_thread = std::jthread(
+        [image, user_directory, release_directory, &extraction]
+        { ExtractDisc(image, user_directory, release_directory, &extraction); });
+  };
   while (!done)
   {
     bool controllers_changed = false;
@@ -885,703 +1500,1084 @@ int main(int argc, char** argv)
       }
     }
 
+    // Capture: four frames per shot (fonts bake on first use), pages in order,
+    // then the help card open on a display setting and the Slot A card.
+    constexpr int kCaptureFrames = 4;
+    const int capture_shot = capture_frame / kCaptureFrames;
+    constexpr int kCaptureShots = kPageCount + 4;
+    if (capture_directory)
+    {
+      in_page = true;
+      help_open = false;
+      page = capture_shot < kPageCount ? capture_shot :
+             capture_shot == kPageCount ? kDisplay : kPlay;
+      if (capture_shot == kPageCount)
+      {
+        help_open = true;
+        row_focus[kDisplay] = 6;
+      }
+      if (capture_shot == kPageCount + 1)
+        row_focus[kPlay] = 1;
+      if (capture_shot >= kPageCount + 2)
+      {
+        if (!carousel_open)
+        {
+          carousel_focus = std::max(card_library.Inserted(), 0);
+          carousel_pos = static_cast<float>(carousel_focus);
+        }
+        carousel_open = true;
+        carousel_t = 1;
+      }
+      if (capture_shot == kPageCount + 3 && naming.mode == Naming::Mode::None)
+        open_naming(Naming::Mode::New, -1);
+    }
+
     ImGui_ImplSDLRenderer3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::SetNextWindowPos(viewport->Pos);
+    ImGui::SetNextWindowSize(viewport->Size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::Begin(MODERNGEKKO_FRONTEND_NAME " Launcher", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextUnformatted(MODERNGEKKO_FRONTEND_NAME);
-    ImGui::Separator();
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar(2);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    theme::Canvas cv;
+    cv.scale = std::min(viewport->Size.x / theme::kCanvasW, viewport->Size.y / theme::kCanvasH);
+    cv.origin = {viewport->Pos.x + (viewport->Size.x - theme::kCanvasW * cv.scale) / 2,
+                 viewport->Pos.y + (viewport->Size.y - theme::kCanvasH * cv.scale) / 2};
+    const theme::Input raw_in = theme::ReadInput(&gamepad_input);
+    // The carousel and the naming dialog sit above the pages and take input.
+    const bool overlay = carousel_open || naming.mode != Naming::Mode::None;
+    const theme::Input in = overlay ? theme::Input{.gamepad = raw_in.gamepad} : raw_in;
+    const bool clicked = !overlay && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    const auto mouse_in = [&](float x0, float y0, float x1, float y1)
+    { return ImGui::IsMouseHoveringRect(cv.P(x0, y0), cv.P(x1, y1), false); };
+    const bool mouse_moved =
+        !overlay && (ImGui::GetIO().MouseDelta.x != 0 || ImGui::GetIO().MouseDelta.y != 0);
+    std::string page_hint;
 
-    if (current_metadata)
-    {
-      ImGui::Text("Ready: %s [%s]", current_metadata.metadata->game_name.c_str(),
-                  current_metadata.metadata->disc_id.c_str());
-      if (!launcher_savestates.empty())
-      {
-        ImGui::TextUnformatted("Start from savestate");
-        const std::string savestate_preview =
-            selected_savestate >= 0 ?
-                moderngekko::frontend::LauncherSavestateLabel(
-                    launcher_savestates[static_cast<std::size_t>(selected_savestate)],
-                    selected_savestate == 0) :
-                "Normal boot (memory card)";
-        if (ImGui::BeginCombo("##launch_savestate", savestate_preview.c_str()))
-        {
-          const bool normal_boot_selected = selected_savestate < 0;
-          if (ImGui::Selectable("Normal boot (memory card)", normal_boot_selected))
-            selected_savestate = -1;
-          if (normal_boot_selected)
-            ImGui::SetItemDefaultFocus();
-
-          for (std::size_t i = 0; i < launcher_savestates.size(); ++i)
-          {
-            const std::string label =
-                moderngekko::frontend::LauncherSavestateLabel(launcher_savestates[i], i == 0);
-            const bool selected = selected_savestate == static_cast<int>(i);
-            if (ImGui::Selectable(label.c_str(), selected))
-              selected_savestate = static_cast<int>(i);
-            if (selected)
-              ImGui::SetItemDefaultFocus();
-          }
-          ImGui::EndCombo();
-        }
-        // Netplay starts every player from the same boot, so a state chosen by
-        // one side would desync the session immediately.
-        ImGui::TextDisabled("Solo play only.");
-        ImGui::Spacing();
-      }
-      if (ImGui::Button("Play", ImVec2(180 * scale, 42 * scale)))
-      {
-        if (ensure_controller())
-        {
-          launch_mode = LaunchMode::Solo;
-          done = true;
-        }
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Host Netplay", ImVec2(180 * scale, 42 * scale)))
-      {
-        if (ensure_controller())
-        {
-          config.netplay_nickname = netplay_nickname.data();
-          config.netplay_address = netplay_address.data();
-          config.netplay_port = static_cast<std::uint16_t>(netplay_port);
-          config.netplay_buffer = automatic_buffer ? "auto" : std::to_string(manual_buffer);
-          config.controllers = configured_controllers.empty()
-                                   ? std::vector<std::string>{selected_controller}
-                                   : configured_controllers;
-          config.controller = config.controllers.front();
-          config.resolution = resolutions[resolution_index].text;
-          config.show_fps_in_title = show_fps_in_title;
-          std::string error;
-          if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
-          {
-            launch_mode = LaunchMode::Host;
-            done = true;
-          }
-          else
-          {
-            std::lock_guard lock(dialog.mutex);
-            dialog.error = std::move(error);
-          }
-        }
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Join Netplay", ImVec2(180 * scale, 42 * scale)))
-      {
-        if (ensure_controller())
-        {
-          config.netplay_nickname = netplay_nickname.data();
-          config.netplay_address = netplay_address.data();
-          config.netplay_port = static_cast<std::uint16_t>(netplay_port);
-          config.netplay_buffer = automatic_buffer ? "auto" : std::to_string(manual_buffer);
-          config.controllers = configured_controllers.empty()
-                                   ? std::vector<std::string>{selected_controller}
-                                   : configured_controllers;
-          config.controller = config.controllers.front();
-          config.resolution = resolutions[resolution_index].text;
-          config.show_fps_in_title = show_fps_in_title;
-          std::string error;
-          if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
-          {
-            launch_mode = LaunchMode::Join;
-            done = true;
-          }
-          else
-          {
-            std::lock_guard lock(dialog.mutex);
-            dialog.error = std::move(error);
-          }
-        }
-      }
-    }
+    // ---- frame: title, navigation, title tab, content panel ----
+    if (backdrop)
+      theme::Backdrop(dl, viewport->Size,
+                      ImTextureRef(static_cast<ImTextureID>(reinterpret_cast<intptr_t>(backdrop))),
+                      backdrop_w, backdrop_h);
     else
+      theme::Background(dl, cv, viewport->Size);
+    theme::Text(dl, cv, fonts.title, 44, 44, 26, kTitle);
+    theme::Text(dl, cv, fonts.menu, 36, 48 + theme::TextWidth(fonts.title, 44, kTitle) + 18, 38,
+                "RECOMP", theme::color::kGold);
     {
-      ImGui::TextUnformatted("No extracted game is configured yet.");
+      const std::string version =
+          (current_metadata ? current_metadata.metadata->disc_id : std::string("NO GAME")) +
+          (release_version.empty() ? "" : "  v" + release_version);
+      theme::Text(dl, cv, fonts.small, 26, 1280 - 44 - theme::TextWidth(fonts.small, 26, version),
+                  40, version, IM_COL32(180, 188, 192, 255));
     }
-
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Graphics backend");
-    if (ImGui::BeginCombo("##graphics_backend",
-                          graphics_backends[graphics_backend_index].text))
+    theme::SteelPanel(dl, cv, 40, 110, 400, 690, 16);
+    for (int i = 0; i < kPageCount; ++i)
     {
-      for (std::size_t i = 0; i < graphics_backends.size(); ++i)
+      const float y = 134 + i * 64;
+      if (mouse_in(48, y - 8, 392, y + 52))
       {
-        const bool selected = graphics_backend_index == static_cast<int>(i);
-        if (ImGui::Selectable(graphics_backends[i].text, selected))
+        if (mouse_moved && !in_page)
+          page = i;
+        if (clicked)
         {
-          const std::string previous = config.graphics_backend;
-          config.graphics_backend = graphics_backends[i].value;
-          config.resolution = resolutions[resolution_index].text;
-          config.show_fps_in_title = show_fps_in_title;
-          config.controller = selected_controller;
-          std::string error;
-          if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
-          {
-            graphics_backend_index = static_cast<int>(i);
-          }
-          else
-          {
-            config.graphics_backend = previous;
-            std::lock_guard lock(dialog.mutex);
-            dialog.error = std::move(error);
-          }
+          page = i;
+          in_page = false;
         }
-        if (selected)
-          ImGui::SetItemDefaultFocus();
       }
-      ImGui::EndCombo();
+      const bool active = page == i;
+      if (active)
+        theme::Chevron(dl, cv, 58, y + 10);
+      const ImU32 col = active ? (in_page ? theme::color::kGrey : theme::color::kWhite) :
+                        i == kNetplay ? theme::color::kDim : theme::color::kText;
+      theme::Text(dl, cv, fonts.menu, 36, 94, y, kPageNames[i], col);
+      if (i == kNetplay)
+        theme::Text(dl, cv, fonts.body, 13, 96, y + 36, "EXPERIMENTAL", theme::color::kWarn, false);
     }
-    ImGui::Spacing();
-    const bool previous_fullscreen = fullscreen;
-    if (ImGui::Checkbox("Start in fullscreen", &fullscreen))
+    theme::SteelPanel(dl, cv, 420, 110, 800, 178, 14);
+    theme::Text(dl, cv, fonts.menu, 36, 444, 128, kPageNames[page]);
+    theme::SteelPanel(dl, cv, 420, 186, 1240, 690, 16);
+    if (clicked && mouse_in(420, 186, 1240, 690))
+      in_page = true;
+
+    if (!in_page)
     {
-      config.fullscreen = fullscreen;
-      config.resolution = resolutions[resolution_index].text;
-      config.show_fps_in_title = show_fps_in_title;
-      config.controller = selected_controller;
-      std::string error;
-      if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
-      {
-        fullscreen = previous_fullscreen;
-        config.fullscreen = previous_fullscreen;
-        std::lock_guard lock(dialog.mutex);
-        dialog.error = std::move(error);
-      }
+      if (in.up)
+        page = (page + kPageCount - 1) % kPageCount;
+      if (in.down)
+        page = (page + 1) % kPageCount;
+      if (in.accept || in.right)
+        in_page = true;
     }
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Internal resolution (Dolphin EFB upscale)");
-    if (ImGui::BeginCombo("##resolution", resolutions[resolution_index].text))
+    else if (in.back)
     {
-      for (std::size_t i = 0; i < resolutions.size(); ++i)
-      {
-        const bool selected = resolution_index == static_cast<int>(i);
-        if (ImGui::Selectable(resolutions[i].text, selected))
-        {
-          std::string error;
-          if (moderngekko::frontend::SaveConfig(user_directory, resolutions[i].text,
-                                                show_fps_in_title, selected_controller, &error))
-          {
-            resolution_index = static_cast<int>(i);
-            config.resolution = resolutions[i].text;
-          }
-          else
-          {
-            std::lock_guard lock(dialog.mutex);
-            dialog.error = std::move(error);
-          }
-        }
-      }
-      ImGui::EndCombo();
+      in_page = false;
     }
-    ImGui::Spacing();
-    if (ImGui::CollapsingHeader("Widescreen, texture, and navigation options",
-                                ImGuiTreeNodeFlags_DefaultOpen))
+    // Input for the page this frame (nothing while the navigation has focus).
+    const theme::Input page_in = in_page && !in.back ? in : theme::Input{};
+    std::string help = kPageHelp[page];
+
+    // ---- pages ----
+    std::vector<theme::Row> rows;
+    float rows_y = 214, rows_step = 50;
+    switch (page)
     {
-      ImGui::TextUnformatted("Aspect ratio");
-      if (ImGui::BeginCombo("##aspect_ratio", aspect_labels[aspect_index]))
-      {
-        for (std::size_t i = 0; i < aspect_labels.size(); ++i)
-        {
-          const bool selected = aspect_index == static_cast<int>(i);
-          if (ImGui::Selectable(aspect_labels[i], selected))
-          {
-            const int previous = config.aspect_ratio;
-            config.aspect_ratio = aspect_values[i];
-            std::string error;
-            if (moderngekko::frontend::SaveConfig(user_directory, config,
-                                                  &error))
-              aspect_index = static_cast<int>(i);
-            else
-            {
-              config.aspect_ratio = previous;
-              std::lock_guard lock(dialog.mutex);
-              dialog.error = std::move(error);
-            }
-          }
-          if (selected)
-            ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-      }
-
-      ImGui::TextDisabled(
-          "32:9 expands Colosseum's camera horizontally without stretching it. "
-          "Auto selects it on an ultrawide display.");
-
-      ImGui::TextUnformatted("Native ultrawide render quality");
-      if (ImGui::BeginCombo(
-              "##ultrawide_render_quality",
-              ultrawide_quality_labels[ultrawide_quality_index]))
-      {
-        for (std::size_t i = 0; i < ultrawide_quality_labels.size(); ++i)
-        {
-          const bool selected =
-              ultrawide_quality_index == static_cast<int>(i);
-          if (ImGui::Selectable(ultrawide_quality_labels[i], selected))
-          {
-            const int previous = config.ultrawide_efb_scale;
-            config.ultrawide_efb_scale = ultrawide_quality_values[i];
-            std::string error;
-            if (moderngekko::frontend::SaveConfig(user_directory, config,
-                                                  &error))
-            {
-              ultrawide_quality_index = static_cast<int>(i);
-            }
-            else
-            {
-              config.ultrawide_efb_scale = previous;
-              std::lock_guard lock(dialog.mutex);
-              dialog.error = std::move(error);
-            }
-          }
-          if (selected)
-            ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-      }
-      ImGui::TextDisabled(
-          "5x Quality targets roughly 4K work at 32:9.");
-
-      ImGui::TextUnformatted("Texture filtering");
-      if (ImGui::BeginCombo("##texture_filter",
-                            texture_filter_labels[texture_filter_index]))
-      {
-        for (std::size_t i = 0; i < texture_filter_labels.size(); ++i)
-        {
-          const bool selected =
-              texture_filter_index == static_cast<int>(i);
-          if (ImGui::Selectable(texture_filter_labels[i], selected))
-          {
-            const int previous = config.force_texture_filtering;
-            config.force_texture_filtering = static_cast<int>(i);
-            std::string error;
-            if (moderngekko::frontend::SaveConfig(user_directory, config,
-                                                  &error))
-              texture_filter_index = static_cast<int>(i);
-            else
-            {
-              config.force_texture_filtering = previous;
-              std::lock_guard lock(dialog.mutex);
-              dialog.error = std::move(error);
-            }
-          }
-          if (selected)
-            ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-      }
-
-      ImGui::TextUnformatted("Anisotropic filtering");
-      if (ImGui::BeginCombo("##anisotropy",
-                            anisotropy_labels[anisotropy_index]))
-      {
-        for (std::size_t i = 0; i < anisotropy_labels.size(); ++i)
-        {
-          const bool selected = anisotropy_index == static_cast<int>(i);
-          if (ImGui::Selectable(anisotropy_labels[i], selected))
-          {
-            const int previous = config.max_anisotropy;
-            config.max_anisotropy = anisotropy_values[i];
-            std::string error;
-            if (moderngekko::frontend::SaveConfig(user_directory, config,
-                                                  &error))
-              anisotropy_index = static_cast<int>(i);
-            else
-            {
-              config.max_anisotropy = previous;
-              std::lock_guard lock(dialog.mutex);
-              dialog.error = std::move(error);
-            }
-          }
-          if (selected)
-            ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-      }
-
-      ImGui::Spacing();
-      ImGui::BeginDisabled(!community_pack_status.available);
-      if (ImGui::Checkbox("Community HD texture pack (Sephie)",
-                          &config.community_hd_texture_pack))
-      {
-        const bool enabled = config.community_hd_texture_pack;
-        std::string error;
-        if (moderngekko::SetCommunityHdTexturePackEnabled(
-                user_directory, enabled, &error))
-        {
-          if (enabled)
-            config.hires_textures = true;
-          if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
-          {
-            community_pack_status =
-                moderngekko::GetCommunityHdTexturePackStatus(user_directory);
-            community_pack_message = enabled ?
-                                         "Installed and enabled. ModernGekko's cleaner UI overrides take priority." :
-                                         "Disabled and removed from the active texture directory.";
-          }
-          else
-          {
-            std::string rollback_error;
-            moderngekko::SetCommunityHdTexturePackEnabled(
-                user_directory, !enabled, &rollback_error);
-            config.community_hd_texture_pack = !enabled;
-            std::lock_guard lock(dialog.mutex);
-            dialog.error = std::move(error);
-          }
-        }
-        else
-        {
-          config.community_hd_texture_pack = !enabled;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
-      }
-      ImGui::EndDisabled();
-      if (community_pack_status.available)
-      {
-        // Say what is actually installed. The override count was a literal 9,
-        // which was only ever true of one packaging configuration and reads as
-        // a plain falsehood when none ship.
-        if (community_pack_status.override_count)
-        {
-          ImGui::TextDisabled(
-              "%zu community textures; %zu curated ModernGekko UI/title overrides.",
-              community_pack_status.texture_count,
-              community_pack_status.override_count);
-        }
-        else
-        {
-          ImGui::TextDisabled("%zu community textures.",
-                              community_pack_status.texture_count);
-        }
-      }
-      else
-      {
-        ImGui::TextDisabled(
-            "Not installed: add Pokemon Colosseum HD Pack.zip to User/ResourcePacks.\n"
-            "Get it from Sephie's post: https://www.reddit.com/r/DolphinEmulator/s/IgXkBDodBC");
-      }
-      if (!community_pack_message.empty())
-        ImGui::TextWrapped("%s", community_pack_message.c_str());
-
-      if (ImGui::Checkbox("Upscale dynamic game text (4x)",
-                          &config.text_upscale))
-      {
-        const bool selected = config.text_upscale;
-        config.text_upscale = selected;
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config,
-                                               &error))
-        {
-          config.text_upscale = !selected;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
-      }
-      ImGui::TextDisabled(
-          "Rebuilds Colosseum's dynamic text surfaces on the GPU.");
-
-      ImGui::TextUnformatted("Navigation overlay");
-      if (ImGui::BeginCombo("##navigation",
-                            navigation_labels[navigation_index]))
-      {
-        for (std::size_t i = 0; i < navigation_labels.size(); ++i)
-        {
-          const bool selected = navigation_index == static_cast<int>(i);
-          if (ImGui::Selectable(navigation_labels[i], selected))
-          {
-            const int previous = config.navigation_overlay;
-            config.navigation_overlay = static_cast<int>(i);
-            std::string error;
-            if (moderngekko::frontend::SaveConfig(user_directory, config,
-                                                  &error))
-              navigation_index = static_cast<int>(i);
-            else
-            {
-              config.navigation_overlay = previous;
-              std::lock_guard lock(dialog.mutex);
-              dialog.error = std::move(error);
-            }
-          }
-          if (selected)
-            ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-      }
-
-      const int previous_font_size = config.osd_font_size;
-      if (ImGui::SliderInt("Overlay text size", &config.osd_font_size, 8, 48))
-      {
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
-        {
-          config.osd_font_size = previous_font_size;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
-      }
-    }
-    if (ImGui::CollapsingHeader("Quality of life and accessibility",
-                                ImGuiTreeNodeFlags_DefaultOpen))
+    case kPlay:
     {
-      const auto save_toggle = [&](bool* value, const char* label)
+      if (!current_metadata)
       {
-        const bool previous = *value;
-        if (!ImGui::Checkbox(label, value))
+        rows.push_back(info("No extracted game is set up yet. Choose your Pokemon Colosseum disc "
+                            "image (ISO, RVZ or WBFS)."));
+        rows.push_back(info(selected_image ? "Disc: " + selected_image->filename().string() :
+                                             std::string("No disc image selected.")));
+        rows.push_back(action("DISC IMAGE", "BROWSE",
+                              "Pick the disc image to extract. It is read once and unpacked "
+                              "next to the launcher; the image itself is not modified.",
+                              [&] { browse_for_image(); }, !extraction.running));
+        rows.push_back(action("SET UP", "EXTRACT AND PLAY",
+                              "Unpacks the game files, checks they match this release, then "
+                              "starts the game.",
+                              [&] { start_extraction(); },
+                              selected_image.has_value() && !extraction.running));
+        if (extraction.running)
+        {
+          const float progress = std::min(
+              1.0f, static_cast<float>(extraction.completed.load()) / extraction.total.load());
+          theme::SliderBar(dl, cv, 454, 430, 760, progress);
+        }
+        help = theme::DrawRows(dl, cv, fonts, rows, &row_focus[page], in_page, page_in, 450,
+                               rows_y, 410, 62);
+        if (help.empty())
+          help = kPageHelp[page];
+        break;
+      }
+      // PLAY, the Slot A card, then up to three states to continue from.
+      const int states_shown = static_cast<int>(std::min<std::size_t>(3, launcher_savestates.size()));
+      const int items = 2 + states_shown;
+      int& focus = row_focus[page];
+      focus = std::clamp(focus, 0, items - 1);
+      if (in_page)
+      {
+        if (page_in.left && focus == 1)
+          focus = 0;
+        else if (page_in.right && focus == 0)
+          focus = 1;
+        else if (page_in.down)
+          focus = focus < 2 ? (states_shown ? 2 : focus) : std::min(focus + 1, items - 1);
+        else if (page_in.up)
+          focus = focus <= 2 ? 0 : focus - 1;
+      }
+      int activated = page_in.accept ? focus : -1;
+      const auto hit = [&](int item, float x0, float y0, float x1, float y1)
+      {
+        if (!mouse_in(x0, y0, x1, y1))
           return;
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
-        {
-          *value = previous;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
+        if (mouse_moved)
+          focus = item;
+        if (clicked)
+          activated = item;
       };
+      hit(0, 450, 220, 820, 330);
+      hit(1, 860, 210, 1024, 400);
+      for (int i = 0; i < states_shown; ++i)
+        hit(2 + i, 450, 460 + i * 64.0f, 1210, 514 + i * 64.0f);
 
-      save_toggle(&config.sixty_fps, "60 FPS gameplay patch");
-      ImGui::TextDisabled(
-          "Presents every video field instead of every other one. 60 FPS is the\n"
-          "ceiling: the console's field rate is 59.94 Hz and this halves the\n"
-          "wait, it does not add frames. Costs roughly twice the emulation\n"
-          "work, so a slower machine will run below full speed.");
-
-      save_toggle(&config.guest_idle_skip, "Guest idle skip");
-      save_toggle(&config.dual_core, "Dual core (render on a second thread)");
-      ImGui::TextDisabled(
-          "Lets the emulated console sleep through the game's idle loop\n"
-          "instead of spinning in it. This is what lets heavy battle scenes\n"
-          "hold 60. It is a trade: in the field the game almost always has\n"
-          "work queued, so the check costs about 8%% there and buys nothing.\n"
-          "Leave it on unless the field runs short of full speed for you.");
-
-      save_toggle(&config.fast_forward, "Hold Space to fast-forward");
-      ImGui::BeginDisabled(!config.fast_forward);
-      const int previous_multiplier = config.fast_forward_multiplier;
-      if (ImGui::SliderInt("Fast-forward multiplier",
-                           &config.fast_forward_multiplier, 2, 4))
+      theme::SteelPanel(dl, cv, 450, 220, 820, 330, 18,
+                        focus == 0 && in_page ? IM_COL32(110, 26, 30, 235) : theme::color::kPlay);
+      theme::Text(dl, cv, fonts.title, 44, 635 - theme::TextWidth(fonts.title, 44, "PLAY") / 2,
+                  250, "PLAY");
+      if (focus == 0 && in_page)
+        theme::Chevron(dl, cv, 540, 258);
       {
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
+        const int inserted = card_library.Inserted();
+        if (inserted >= 0)
         {
-          config.fast_forward_multiplier = previous_multiplier;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
-      }
-      ImGui::EndDisabled();
-
-      save_toggle(&config.autosave, "Rotating room-transition autosaves");
-      ImGui::BeginDisabled(!config.autosave);
-      const int previous_slots = config.autosave_slots;
-      if (ImGui::SliderInt("Autosave slots", &config.autosave_slots, 1, 10))
-      {
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
-        {
-          config.autosave_slots = previous_slots;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
-      }
-      ImGui::EndDisabled();
-      ImGui::TextDisabled(
-          "The newest autosave doubles as the crash-recovery checkpoint.");
-
-      save_toggle(&config.crash_watchdog,
-                  "Restore latest checkpoint after an emulation stall");
-      ImGui::BeginDisabled(!config.crash_watchdog);
-      const int previous_watchdog_seconds = config.crash_watchdog_seconds;
-      if (ImGui::SliderInt("Stall timeout (seconds)",
-                           &config.crash_watchdog_seconds, 10, 60))
-      {
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
-        {
-          config.crash_watchdog_seconds = previous_watchdog_seconds;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
-      }
-      ImGui::EndDisabled();
-
-      save_toggle(&config.input_overlay, "Show controller input overlay");
-      const bool previous_minimap_high_contrast =
-          config.minimap_high_contrast;
-      const int previous_navigation_overlay = config.navigation_overlay;
-      if (ImGui::Checkbox("High-contrast minimap colors",
-                          &config.minimap_high_contrast))
-      {
-        config.navigation_overlay =
-            moderngekko::automation::ResolveColosseumNavigationOverlayMode(
-                config.navigation_overlay, config.minimap_high_contrast);
-        std::string error;
-        if (moderngekko::frontend::SaveConfig(user_directory, config, &error))
-        {
-          navigation_index = config.navigation_overlay;
+          const auto& card = card_library.Cards()[static_cast<std::size_t>(inserted)];
+          theme::MemoryCard(dl, cv, fonts, 860, 210, card.name, theme::CardColor(card.name),
+                            focus == 1 && in_page);
+          theme::Text(dl, cv, fonts.small, 26, 1046, 222, "SLOT A", theme::color::kGold);
+          std::string name = Upper(card.name);
+          const float size = std::min(36.0f, 36 * 176 / std::max(1.0f, theme::TextWidth(fonts.menu, 36, name)));
+          theme::Text(dl, cv, fonts.menu, size, 1046, 254, name);
+          theme::Text(dl, cv, fonts.body, 13, 1046, 298,
+                      card.blank ? std::string("New game") : std::to_string(card.blocks) + " blocks",
+                      theme::color::kGrey, false);
+          theme::Text(dl, cv, fonts.body, 13, 1046, 320, CardWhen(card), theme::color::kGrey,
+                      false);
         }
         else
         {
-          config.minimap_high_contrast = previous_minimap_high_contrast;
-          config.navigation_overlay = previous_navigation_overlay;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
+          theme::NewCardSlot(dl, cv, fonts, 860, 210, focus == 1 && in_page);
+          theme::Text(dl, cv, fonts.small, 26, 1046, 222, "SLOT A", theme::color::kGold);
+          theme::Text(dl, cv, fonts.body, 13, 1046, 260, "No card inserted", theme::color::kGrey,
+                      false);
         }
       }
-      ImGui::TextDisabled(
-          "Enabling this starts the Compact minimap when the overlay is Off.");
-
-      const int previous_ui_scale = config.accessibility_ui_scale;
-      if (ImGui::SliderInt("Overlay UI scale (%)",
-                           &config.accessibility_ui_scale, 75, 200))
+      if (states_shown)
+        theme::Text(dl, cv, fonts.small, 26, 450, 424, "CONTINUE FROM A SAVE STATE",
+                    theme::color::kGold);
+      for (int i = 0; i < states_shown; ++i)
       {
-        std::string error;
-        if (!moderngekko::frontend::SaveConfig(user_directory, config, &error))
-        {
-          config.accessibility_ui_scale = previous_ui_scale;
-          std::lock_guard lock(dialog.mutex);
-          dialog.error = std::move(error);
-        }
+        const float y = 460 + i * 64.0f;
+        const StateEntry& entry = state_entries[static_cast<std::size_t>(i)];
+        theme::SteelPanel(dl, cv, 450, y, 1210, y + 54, 10, theme::color::kPanelDark);
+        if (focus == 2 + i && in_page)
+          theme::Chevron(dl, cv, 456, y + 18);
+        theme::Text(dl, cv, fonts.menu, 36, 478, y + 10, entry.title);
+        const bool pictured = draw_thumbnail(dl, cv, entry.path, 1118, y + 9, 1190, y + 45);
+        const float when_right = pictured ? 1104 : 1190;
+        theme::Text(dl, cv, fonts.small, 26,
+                    when_right - theme::TextWidth(fonts.small, 26, entry.when), y + 14, entry.when,
+                    theme::color::kGrey);
       }
+      if (in_page)
+        help = focus == 0 ? "Start the game from the memory card in Slot A, the way the console "
+                            "boots." :
+               focus == 1 ? "The memory card in Slot A, the one the game loads and saves. "
+                            "Press to pick another card." :
+                            "Skip the boot and pick up exactly where this save state was made. "
+                            "Solo play only.";
+      if (activated == 0)
+        start_solo(-1);
+      else if (activated == 1)
+      {
+        carousel_open = true;
+        carousel_focus = std::max(card_library.Inserted(), 0);
+        carousel_pos = static_cast<float>(carousel_focus);
+      }
+      else if (activated >= 2)
+        start_solo(activated - 2);
+      break;
     }
-    const bool previous_show_fps_in_title = show_fps_in_title;
-    if (ImGui::Checkbox("Show FPS in window title", &show_fps_in_title))
+    case kCards:
     {
-      std::string error;
-      if (!moderngekko::frontend::SaveConfig(user_directory, resolutions[resolution_index].text,
-                                             show_fps_in_title, selected_controller, &error))
+      const auto& cards = card_library.Cards();
+      const int count = static_cast<int>(cards.size()) + 1;  // + NEW
+      int& focus = row_focus[page];
+      focus = std::clamp(focus, 0, count - 1);
+      if (page_in.left)
+        focus = std::max(focus - 1, 0);
+      if (page_in.right)
+        focus = std::min(focus + 1, count - 1);
+      if (page_in.up && focus >= 4)
+        focus -= 4;
+      if (page_in.down)
+        focus = std::min(focus + 4, count - 1);
+      static int first_row = 0;
+      first_row = std::clamp(first_row, std::max(0, focus / 4 - 1), focus / 4);
+      int activated = page_in.accept ? focus : -1;
+      for (int slot = 0; slot < 8; ++slot)
       {
-        show_fps_in_title = previous_show_fps_in_title;
-        std::lock_guard lock(dialog.mutex);
-        dialog.error = std::move(error);
+        const int i = first_row * 4 + slot;
+        if (i >= count)
+          break;
+        const float x = 450 + (slot % 4) * 194.0f, y = 210 + (slot / 4) * 232.0f;
+        if (mouse_in(x, y, x + 164, y + 190))
+        {
+          if (mouse_moved)
+            focus = i;
+          if (clicked)
+            activated = i;
+        }
+        const bool selected = in_page && focus == i;
+        if (i == count - 1)
+        {
+          theme::NewCardSlot(dl, cv, fonts, x, y, selected);
+          continue;
+        }
+        const auto& card = cards[static_cast<std::size_t>(i)];
+        theme::MemoryCard(dl, cv, fonts, x, y, card.name, theme::CardColor(card.name), selected);
+        if (i == card_library.Inserted())
+          theme::Text(dl, cv, fonts.small, 26, x + 82 - theme::TextWidth(fonts.small, 26, "SLOT A") / 2,
+                      y + 202, "SLOT A", theme::color::kGold);
+      }
+      if (focus < count - 1)
+      {
+        const auto& card = cards[static_cast<std::size_t>(focus)];
+        theme::Text(dl, cv, fonts.body, 13, 450, 668,
+                    card.name + ".gci   " +
+                        (card.blank ? std::string("blank") : std::to_string(card.blocks) + " blocks") +
+                        "   " + CardWhen(card),
+                    theme::color::kGrey, false);
       }
       else
       {
-        config.show_fps_in_title = show_fps_in_title;
+        theme::Text(dl, cv, fonts.body, 13, 450, 668,
+                    "Each card is one .gci save (Colosseum keeps one save per card).",
+                    theme::color::kDim, false);
       }
-    }
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Controller profile");
-    const char* controller_preview = controller_index >= 0
-                                         ? controllers[controller_index].label.c_str()
-                                     : selected_controller.empty() ? "No SDL gamepad detected"
-                                                                   : selected_controller.c_str();
-    if (ImGui::BeginCombo("##controller", controller_preview))
-    {
-      for (std::size_t i = 0; i < controllers.size(); ++i)
+      if (in_page)
       {
-        const bool selected = controller_index == static_cast<int>(i);
-        if (ImGui::Selectable(controllers[i].label.c_str(), selected))
+        help = focus == count - 1 ?
+                   "Make a blank card. Insert it and the game starts a new save on it." :
+                   focus == card_library.Inserted() ?
+                   "This card is in Slot A: the game loads and saves it. Rename it, or copy it "
+                   "to branch your playthrough." :
+                   "Insert this card into Slot A. The card that was there keeps its save.";
+        page_hint = gamepad_input ? "A INSERT    X RENAME    Y COPY    B BACK" :
+                                    "ENTER INSERT    R RENAME    D COPY    ESC BACK";
+      }
+      if (activated == count - 1)
+        open_naming(Naming::Mode::New, -1);
+      else if (activated >= 0)
+        insert_card(activated);
+      else if (in_page && focus < count - 1 && page_in.rename)
+        open_naming(Naming::Mode::Rename, focus);
+      else if (in_page && focus < count - 1 && page_in.duplicate)
+        open_naming(Naming::Mode::Duplicate, focus);
+      break;
+    }
+    case kStates:
+    {
+      int& focus = row_focus[page];
+      const int count = static_cast<int>(state_entries.size());
+      if (count == 0)
+      {
+        theme::Text(dl, cv, fonts.menu, 36, 450, 214, "NO SAVE STATES YET", theme::color::kDim);
+        theme::Text(dl, cv, fonts.body, 13, 450, 262,
+                    "Save one from the pause menu in game, or let room autosaves make them.",
+                    theme::color::kDim, false);
+        break;
+      }
+      focus = std::clamp(focus, 0, count - 1);
+      if (page_in.down)
+        focus = std::min(focus + 1, count - 1);
+      if (page_in.up)
+        focus = std::max(focus - 1, 0);
+      static int first = 0;
+      first = std::clamp(first, std::max(0, focus - 4), focus);
+      int activated = page_in.accept ? focus : -1;
+      for (int row = 0; row < 5 && first + row < count; ++row)
+      {
+        const int i = first + row;
+        const float y = 210 + row * 92.0f;
+        if (mouse_in(444, y, 1216, y + 82))
         {
-          controller_index = static_cast<int>(i);
-          selected_controller = controllers[i].device;
-          controller_status =
-              controller_profile_exists
-                  ? "Existing " + std::string(CONTROLLER_PROFILE_NAME) + " unchanged"
-                  : "Ready to generate controller profile";
+          if (mouse_moved)
+            focus = i;
+          if (clicked)
+            activated = i;
         }
-        if (selected)
-          ImGui::SetItemDefaultFocus();
-      }
-      ImGui::EndCombo();
-    }
-    ImGui::BeginDisabled(controller_index < 0);
-    const std::string replace_profile =
-        "Replace with generated " + std::string(GENERATED_PROFILE_LABEL);
-    if (ImGui::Button(replace_profile.c_str()))
-      select_controller(controller_index);
-    ImGui::EndDisabled();
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Netplay");
-    ImGui::SetNextItemWidth(220 * scale);
-    ImGui::InputText("Nickname", netplay_nickname.data(), netplay_nickname.size());
-    ImGui::SetNextItemWidth(220 * scale);
-    ImGui::InputText("Host / IP", netplay_address.data(), netplay_address.size());
-    ImGui::SetNextItemWidth(120 * scale);
-    ImGui::InputInt("UDP port", &netplay_port);
-    netplay_port = std::clamp(netplay_port, 1, 65535);
-    ImGui::Checkbox("Automatic input buffer", &automatic_buffer);
-    if (!automatic_buffer)
-    {
-      ImGui::SetNextItemWidth(180 * scale);
-      ImGui::SliderInt("Buffer frames", &manual_buffer, 1, 20);
-    }
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Game disc image");
-    if (selected_image)
-      ImGui::TextWrapped("%s", selected_image->string().c_str());
-    else
-      ImGui::TextDisabled("No ISO, WBFS, or RVZ selected");
-
-    if (!extraction.running)
-    {
-      if (ImGui::Button("Browse for ISO / WBFS / RVZ"))
-      {
-        static constexpr SDL_DialogFileFilter filters[] = {
-            {"Disc images", "iso;wbfs;rvz"},
-            {"ISO", "iso"},
-            {"WBFS", "wbfs"},
-            {"RVZ", "rvz"}};
-        const std::string documents = DocumentsDirectory().string();
-        SDL_ShowOpenFileDialog(FileDialogCallback, &dialog, window, filters,
-                               static_cast<int>(std::size(filters)), documents.c_str(), false);
-      }
-      if (selected_image)
-      {
-        ImGui::SameLine();
-        if (ImGui::Button("Extract and Play"))
+        const StateEntry& entry = state_entries[static_cast<std::size_t>(i)];
+        theme::SteelPanel(dl, cv, 444, y, 1216, y + 82, 10, theme::color::kPanelDark);
+        dl->AddRectFilled(cv.P(458, y + 10), cv.P(576, y + 72), IM_COL32(30, 40, 46, 255));
+        if (!draw_thumbnail(dl, cv, entry.path, 458, y + 10, 576, y + 72))
+          theme::Text(dl, cv, fonts.body, 13,
+                      517 - theme::TextWidth(fonts.body, 13, "NO PICTURE") / 2, y + 33,
+                      "NO PICTURE", theme::color::kDim, false);
+        dl->AddRect(cv.P(458, y + 10), cv.P(576, y + 72), IM_COL32(150, 156, 162, 255), 0, 0,
+                    cv.S(2));
+        if (i == focus && in_page)
+          theme::Chevron(dl, cv, 584, y + 31);
+        if (entry.title == entry.kind)
         {
-          extraction.completed = 0;
-          extraction.total = 1;
-          extraction.running = true;
+          theme::Text(dl, cv, fonts.menu, 36, 612, y + 20, entry.title);
+        }
+        else
+        {
+          theme::Text(dl, cv, fonts.menu, 36, 612, y + 8, entry.title);
+          theme::Text(dl, cv, fonts.small, 22, 612, y + 50, entry.kind, theme::color::kGold);
+        }
+        theme::Text(dl, cv, fonts.small, 26, 1196 - theme::TextWidth(fonts.small, 26, entry.when),
+                    y + 30, entry.when, theme::color::kGrey);
+      }
+      if (in_page)
+        help = state_entries[static_cast<std::size_t>(focus)].file + ". Loads straight into "
+               "this moment instead of booting from the memory card. Solo play only.";
+      if (activated >= 0)
+        start_solo(activated);
+      break;
+    }
+    case kDisplay:
+    {
+      std::vector<std::string> backend_options;
+      for (const auto& backend : graphics_backends)
+        backend_options.push_back(Upper(backend.text));
+      rows.push_back(choice("BACKEND", backend_options, graphics_backend_index,
+                            "The graphics API. Vulkan is the tested default; switch only if "
+                            "the game fails to start or shows driver problems.",
+                            [&](int i)
+                            {
+                              const std::string previous = config.graphics_backend;
+                              config.graphics_backend = graphics_backends[i].value;
+                              if (persist())
+                              {
+                                graphics_backend_index = i;
+                                return true;
+                              }
+                              config.graphics_backend = previous;
+                              return false;
+                            }));
+      const int display_mode = !config.fullscreen ? 0 : config.exclusive_fullscreen ? 2 : 1;
+      rows.push_back(choice("DISPLAY MODE", {"WINDOWED", "BORDERLESS", "FULLSCREEN"},
+                            display_mode,
+                            "Windowed runs in a resizable window. Borderless fills the screen "
+                            "as a window, so alt-tab is instant. Fullscreen takes the display "
+                            "exclusively at its native refresh rate, which driver frame "
+                            "generation such as AMD Fluid Motion Frames needs.",
+                            [&](int i)
+                            {
+                              const bool previous_full = config.fullscreen;
+                              const bool previous_exclusive = config.exclusive_fullscreen;
+                              config.fullscreen = i > 0;
+                              config.exclusive_fullscreen = i == 2;
+                              if (persist())
+                              {
+                                fullscreen = config.fullscreen;
+                                return true;
+                              }
+                              config.fullscreen = previous_full;
+                              config.exclusive_fullscreen = previous_exclusive;
+                              return false;
+                            }));
+      std::vector<std::string> resolution_options;
+      for (const auto& option : resolutions)
+      {
+        std::string text = option.text;
+        std::ranges::replace(text, 'x', ' ');
+        const std::size_t gap = text.find(' ');
+        resolution_options.push_back(std::to_string(option.dolphin_scale) + "x  (" +
+                                     text.substr(0, gap) + " x " + text.substr(gap + 1) + ")");
+      }
+      rows.push_back(choice("INTERNAL RESOLUTION", resolution_options, resolution_index,
+                            "How many times the console's 640x528 picture is rendered. Higher "
+                            "is sharper and costs more GPU time; match it to your screen.",
+                            [&](int i)
+                            {
+                              const std::string previous = config.resolution;
+                              config.resolution = resolutions[i].text;
+                              if (persist())
+                              {
+                                resolution_index = i;
+                                return true;
+                              }
+                              config.resolution = previous;
+                              return false;
+                            }));
+      rows.push_back(choice("ASPECT RATIO", {"AUTO", "16:9", "4:3", "32:9 ULTRAWIDE"},
+                            aspect_index,
+                            "Auto follows your display: it turns on native 32:9 on an "
+                            "ultrawide screen. 32:9 widens the camera itself (Hor+), so "
+                            "nothing is stretched.",
+                            [&](int i)
+                            {
+                              const int previous = config.aspect_ratio;
+                              config.aspect_ratio = aspect_values[i];
+                              if (persist())
+                              {
+                                aspect_index = i;
+                                return true;
+                              }
+                              config.aspect_ratio = previous;
+                              return false;
+                            }));
+      const bool ultrawide = aspect_index == 3 || (aspect_index == 0 && ultrawide_display);
+      rows.push_back(info(aspect_index == 0 ?
+                              "Your display is " + display_size +
+                                  (ultrawide_display ? ", so native ultrawide is on." :
+                                                       ", so the game picks 4:3 or 16:9.") :
+                              std::string("Aspect is fixed; Auto would follow the display (" +
+                                          display_size + ").")));
+      if (ultrawide)
+      {
+        rows.push_back(choice("ULTRAWIDE QUALITY",
+                              {"3x PERFORMANCE", "4x BALANCED", "5x QUALITY", "6x ULTRA"},
+                              ultrawide_quality_index,
+                              "Render scale used only while native ultrawide is active (it "
+                              "replaces Internal Resolution there). 5x Quality is about 4K "
+                              "of work at 32:9.",
+                              [&](int i)
+                              {
+                                const int previous = config.ultrawide_efb_scale;
+                                config.ultrawide_efb_scale = ultrawide_quality_values[i];
+                                if (persist())
+                                {
+                                  ultrawide_quality_index = i;
+                                  return true;
+                                }
+                                config.ultrawide_efb_scale = previous;
+                                return false;
+                              }));
+      }
+      rows.push_back(choice("TEXTURE FILTERING", {"GAME DEFAULT", "NEAREST (SHARP)", "LINEAR (SMOOTH)"},
+                            texture_filter_index,
+                            "How a texture is sampled when it is drawn bigger or smaller than "
+                            "it is stored. Game default keeps what Colosseum asks for. Nearest "
+                            "keeps hard pixel edges; Linear blends neighbouring pixels so "
+                            "surfaces look smooth.",
+                            [&](int i)
+                            {
+                              const int previous = config.force_texture_filtering;
+                              config.force_texture_filtering = i;
+                              if (persist())
+                              {
+                                texture_filter_index = i;
+                                return true;
+                              }
+                              config.force_texture_filtering = previous;
+                              return false;
+                            }));
+      std::vector<std::string> anisotropy;
+      for (const char* label : anisotropy_labels)
+        anisotropy.push_back(Upper(label));
+      rows.push_back(choice("ANISOTROPIC FILTERING", anisotropy, anisotropy_index,
+                            "Keeps textures sharp when seen at a steep angle: floors, roads "
+                            "and walls running away from the camera. Without it they blur "
+                            "with distance. 16x is cheap on any modern GPU.",
+                            [&](int i)
+                            {
+                              const int previous = config.max_anisotropy;
+                              config.max_anisotropy = anisotropy_values[i];
+                              if (persist())
+                              {
+                                anisotropy_index = i;
+                                return true;
+                              }
+                              config.max_anisotropy = previous;
+                              return false;
+                            }));
+      rows.push_back(toggle("SHOW FPS", &config.show_fps_in_title,
+                            "Shows the frame rate in the window title."));
+      break;
+    }
+    case kGameplay:
+    {
+      rows.push_back(toggle("60 FPS MODE", &config.sixty_fps,
+                            "Presents every video field instead of every other one. 60 is the "
+                            "ceiling; it roughly doubles the emulation work, so a slower "
+                            "machine runs below full speed."));
+      rows.push_back(toggle("GUEST IDLE SKIP", &config.guest_idle_skip,
+                            "Lets the console sleep through the game's idle loop. This is what "
+                            "holds heavy battles at 60; it costs about 8% in the field."));
+      rows.push_back(toggle("DUAL CORE", &config.dual_core,
+                            "Renders on a second CPU thread. Leave on."));
+      rows.push_back(toggle("HOLD SPACE: FAST-FORWARD", &config.fast_forward,
+                            "Hold Space to run the game faster, for grinding and long walks."));
+      rows.push_back(slider("FAST-FORWARD SPEED", &config.fast_forward_multiplier, 2, 4, 1, "x",
+                            "How fast Space runs the game.", config.fast_forward));
+      rows.push_back(toggle("ROOM AUTOSAVES", &config.autosave,
+                            "Makes a save state each time you change rooms, rotating through "
+                            "a few slots. They appear under SAVE STATES."));
+      rows.push_back(slider("AUTOSAVE SLOTS", &config.autosave_slots, 1, 10, 1, "",
+                            "How many room autosaves to keep before the oldest is reused.",
+                            config.autosave));
+      rows.push_back(toggle("RESTORE AFTER A STALL", &config.crash_watchdog,
+                            "If emulation freezes, reload the newest autosave automatically."));
+      rows.push_back(slider("STALL TIMEOUT", &config.crash_watchdog_seconds, 10, 60, 5, " S",
+                            "How long the game must be frozen before it is restored.",
+                            config.crash_watchdog));
+      break;
+    }
+    case kControllers:
+    {
+      const int pad_count = static_cast<int>(controllers.size());
+      const int p1 = FindController(controllers, configured_controllers.empty() ?
+                                                     selected_controller :
+                                                     configured_controllers.front());
+      const int p2 = configured_controllers.size() > 1 ?
+                         FindController(controllers, configured_controllers[1]) :
+                         -1;
+      int& focus = row_focus[page];
+      focus = std::clamp(focus, 0, 2);
+      if (page_in.down)
+        focus = std::min(focus + 1, 2);
+      if (page_in.up)
+        focus = std::max(focus - 1, 0);
+      int dir = page_in.right || page_in.accept ? 1 : page_in.left ? -1 : 0;
+      for (int i = 0; i < 2; ++i)
+      {
+        const float y = 206 + i * 104.0f;
+        if (mouse_in(450, y, 860, y + 90))
+        {
+          if (mouse_moved)
+            focus = i;
+          if (clicked && mouse_in(554, y + 46, 854, y + 86))
           {
-            std::lock_guard lock(extraction.mutex);
-            extraction.error.clear();
-            extraction.finished_game.reset();
+            focus = i;
+            dir = mouse_in(554, y + 46, 704, y + 86) ? -1 : 1;
           }
-          const fs::path image = *selected_image;
-          extraction_thread = std::jthread([image, user_directory, release_directory, &extraction]
-                                           {
-                                             ExtractDisc(image, user_directory,
-                                                         release_directory, &extraction);
-                                           });
         }
       }
+      if (mouse_in(440, 486, 800, 566))
+      {
+        if (mouse_moved)
+          focus = 2;
+        if (clicked)
+        {
+          focus = 2;
+          dir = 1;
+        }
+      }
+      if (dir && focus == 0 && pad_count > 0)
+      {
+        const int next = p1 < 0 ? 0 : ((p1 + dir) % pad_count + pad_count) % pad_count;
+        std::vector<std::string> devices{controllers[static_cast<std::size_t>(next)].device};
+        if (p2 >= 0 && p2 != next)
+          devices.push_back(controllers[static_cast<std::size_t>(p2)].device);
+        assign_players(devices);
+      }
+      else if (dir && focus == 1 && pad_count > 0 && p1 >= 0)
+      {
+        // Options: none, then every pad except player 1's.
+        int option = p2 + 1;
+        do
+          option = ((option + dir) % (pad_count + 1) + pad_count + 1) % (pad_count + 1);
+        while (option - 1 == p1 && pad_count > 1);
+        std::vector<std::string> devices{controllers[static_cast<std::size_t>(p1)].device};
+        if (option > 0 && option - 1 != p1)
+          devices.push_back(controllers[static_cast<std::size_t>(option - 1)].device);
+        assign_players(devices);
+      }
+      else if (dir && focus == 2)
+      {
+        config.input_overlay = !config.input_overlay;
+        if (!persist())
+          config.input_overlay = !config.input_overlay;
+      }
+
+      // Espeon and Umbreon, the two partners the game starts you with.
+      constexpr int kPlayerSpecies[2] = {196, 197};
+      for (int i = 0; i < 2; ++i)
+      {
+        const float y = 206 + i * 104.0f;
+        draw_portrait(dl, cv, kPlayerSpecies[i], 450, y, 64, in_page && focus == i,
+                      "P" + std::to_string(i + 1));
+        theme::Text(dl, cv, fonts.menu, 36, 554, y + 8, "PLAYER " + std::to_string(i + 1));
+        const int assigned = i == 0 ? p1 : p2;
+        // A profile device that is not a connected pad (the keyboard, or a pad
+        // that is unplugged) is shown as the profile has it.
+        const std::string configured =
+            static_cast<std::size_t>(i) < configured_controllers.size() ?
+                configured_controllers[static_cast<std::size_t>(i)] :
+                std::string();
+        std::string device =
+            assigned >= 0 ? Upper(controllers[static_cast<std::size_t>(assigned)].label) :
+            configured.find("Keyboard") != std::string::npos ? std::string("KEYBOARD") :
+            !configured.empty() ? Upper(configured.substr(configured.rfind('/') + 1)) :
+            pad_count == 0 ? std::string("NO GAMEPAD") :
+            i == 0         ? std::string("CHOOSE A PAD") :
+                             std::string("NONE");
+        theme::ValueSelector(dl, cv, fonts, 554, y + 48, device, 300,
+                             pad_count > 0 && (i == 0 || p1 >= 0));
+      }
+      theme::Text(dl, cv, fonts.small, 26, 450, 434, "PORTS 3-4", theme::color::kGold);
+      theme::Text(dl, cv, fonts.small, 26, 590, 434, "NOT CONNECTED", theme::color::kDim);
+      theme::Text(dl, cv, fonts.small, 26, 450, 490, "INPUT OVERLAY", theme::color::kGold);
+      if (in_page && focus == 2)
+        theme::Chevron(dl, cv, 427, 494, 14);
+      theme::PokeBall(dl, cv, 454, 528, config.input_overlay);
+      theme::Text(dl, cv, fonts.menu, 36, 500, 524, config.input_overlay ? "ON" : "OFF",
+                  config.input_overlay ? theme::color::kWhite : theme::color::kDim);
+      theme::Text(dl, cv, fonts.body, 13, 450, 574, "Draws the controller on screen and",
+                  theme::color::kDim, false);
+      theme::Text(dl, cv, fonts.body, 13, 450, 598, "lights each button as it is pressed.",
+                  theme::color::kDim, false);
+      theme::Text(dl, cv, fonts.body, 13, 450, 622, "Made for recordings and streams.",
+                  theme::color::kDim, false);
+      theme::Text(dl, cv, fonts.body, 13, 450, 656, controller_status, theme::color::kGrey,
+                  false);
+
+      theme::SteelPanel(dl, cv, 840, 420, 1220, 676, 14, IM_COL32(8, 10, 12, 230));
+      ImVec2 stick, cstick;
+      unsigned pressed = theme::GamepadButtons(&stick, &cstick);
+      if (capture_directory)
+      {
+        // A sample press, so the captured page shows the lit state.
+        pressed = theme::kGcA | theme::kGcR | theme::kGcUp;
+        stick = {0.7f, -0.4f};
+      }
+      const char* caption = pressed ? "PREVIEW" : "PREVIEW  (PRESS ANY BUTTON)";
+      theme::Text(dl, cv, fonts.body, 13, 1030 - theme::TextWidth(fonts.body, 13, caption) / 2,
+                  434, caption, theme::color::kGrey, false);
+      theme::GcController(dl, cv, 1030, 552, 300, pressed, stick, cstick);
+      if (in_page)
+        help = focus == 0 ? "The gamepad for player 1. Changing it writes a fresh GameCube "
+                            "button layout for the pads in use." :
+               focus == 1 ? "A second gamepad for player 2, for two-player battles. NONE "
+                            "leaves port 2 empty." :
+                            "Draws the controller on screen in game and lights each button as "
+                            "it is pressed.";
+      break;
     }
-    else
+    case kMods:
     {
-      const float progress =
-          std::min(1.0f, static_cast<float>(extraction.completed.load()) / extraction.total.load());
-      ImGui::ProgressBar(progress, ImVec2(-1, 0));
+      rows.push_back(choice("NAVIGATION OVERLAY", {"OFF", "COMPACT MINIMAP", "DEBUG MAP"},
+                            navigation_index,
+                            "A minimap of the current area. Debug map adds room numbers and "
+                            "coordinates.",
+                            [&](int i)
+                            {
+                              const int previous = config.navigation_overlay;
+                              config.navigation_overlay = i;
+                              if (persist())
+                              {
+                                navigation_index = i;
+                                return true;
+                              }
+                              config.navigation_overlay = previous;
+                              return false;
+                            }));
+      {
+        theme::Row contrast = toggle("HIGH-CONTRAST MINIMAP", &config.minimap_high_contrast,
+                                     "Stronger minimap colours. Turning it on also starts the "
+                                     "compact minimap if the overlay is off.");
+        contrast.changed = [&](const theme::Row& row)
+        {
+          const bool previous = config.minimap_high_contrast;
+          const int previous_overlay = config.navigation_overlay;
+          config.minimap_high_contrast = row.on;
+          config.navigation_overlay =
+              moderngekko::automation::ResolveColosseumNavigationOverlayMode(
+                  config.navigation_overlay, config.minimap_high_contrast);
+          if (persist())
+          {
+            navigation_index = config.navigation_overlay;
+            return true;
+          }
+          config.minimap_high_contrast = previous;
+          config.navigation_overlay = previous_overlay;
+          return false;
+        };
+        rows.push_back(contrast);
+      }
+      rows.push_back(slider("OVERLAY TEXT SIZE", &config.osd_font_size, 8, 48, 1, "",
+                            "Text size of on-screen messages and overlays."));
+      rows.push_back(slider("OVERLAY UI SCALE", &config.accessibility_ui_scale, 75, 200, 5, "%",
+                            "Scales the overlays (minimap, input display) for readability."));
+      rows.push_back(toggle("HD TEXTURES", &config.hires_textures,
+                            "Loads replacement textures from Load/Textures."));
+      rows.push_back(toggle("HD DYNAMIC TEXT", &config.text_upscale,
+                            "Rebuilds the game's dialogue and menu text at 4x on the GPU."));
+      {
+        theme::Row pack = toggle("COMMUNITY HD PACK (SEPHIE)", &config.community_hd_texture_pack,
+                                 community_pack_status.available ?
+                                     "Sephie's community texture pack, installed into the "
+                                     "active texture folder. ModernGekko's own UI fixes take "
+                                     "priority over it." :
+                                     "Not installed: put Pokemon Colosseum HD Pack.zip in "
+                                     "User/ResourcePacks, then turn this on.");
+        pack.enabled = community_pack_status.available;
+        pack.changed = [&](const theme::Row& row) { return set_community_pack(row.on); };
+        rows.push_back(pack);
+      }
+      rows.push_back(info(community_pack_message.empty() ?
+                              (community_pack_status.available ?
+                                   std::to_string(community_pack_status.texture_count) +
+                                       " community textures available." :
+                                   std::string("HD textures and HD text are on by default.")) :
+                              community_pack_message));
+      break;
+    }
+    case kNetplay:
+    {
+      rows_y = 250;
+      rows_step = 56;
+      theme::Text(dl, cv, fonts.body, 13, 450, 214,
+                  "Still being tested: expect desyncs. Both players need the same version and "
+                  "the same card.",
+                  theme::color::kWarn, false);
+      rows.push_back(text_input("NICKNAME", netplay_nickname.data(), netplay_nickname.size(),
+                                false, "The name other players see."));
+      rows.push_back(text_input("HOST / IP", netplay_address.data(), netplay_address.size(),
+                                false, "The host's address, for joining. Not needed to host."));
+      rows.push_back(text_input("UDP PORT", netplay_port_text.data(), netplay_port_text.size(),
+                                true, "The UDP port the host listens on (default 2626). The "
+                                      "host must allow it through their firewall."));
+      rows.push_back(toggle("AUTOMATIC INPUT BUFFER", &automatic_buffer,
+                            "Picks the input delay from the measured connection.", false));
+      rows.push_back(slider("BUFFER FRAMES", &manual_buffer, 1, 20, 1, "",
+                            "Fixed input delay in frames. Higher hides more lag.",
+                            !automatic_buffer, false));
+      rows.push_back(action("START", "HOST",
+                            "Open a session on this machine and wait for players to join.",
+                            [&] { start_netplay(LaunchMode::Host); }));
+      rows.push_back(action("CONNECT", "JOIN",
+                            "Connect to the host address above.",
+                            [&] { start_netplay(LaunchMode::Join); }));
+      break;
+    }
+    }
+    if (!rows.empty() && !(page == kPlay && !current_metadata))
+    {
+      const std::string row_help = theme::DrawRows(dl, cv, fonts, rows, &row_focus[page],
+                                                   in_page, page_in, 450, rows_y, 410, rows_step);
+      if (in_page && !row_help.empty())
+        help = row_help;
     }
 
+    // ---- help: the top-right corner, H on a keyboard or Z on a controller ----
+    if (in.help)
+      help_open = !help_open;
     {
-      std::lock_guard lock(extraction.mutex);
-      if (!extraction.status.empty())
-        ImGui::TextWrapped("%s", extraction.status.c_str());
-      if (!extraction.error.empty())
-        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", extraction.error.c_str());
+      const float x0 = 816, y0 = 110, x1 = 1240;
+      const float wrap = x1 - x0 - 36;
+      if (help_open)
+      {
+        const float height = theme::Paragraph(nullptr, cv, fonts.body, 13, 0, 0, wrap, help,
+                                              0, 22);
+        const float y1 = std::max(178.0f, y0 + 50 + height + 12);
+        theme::SteelPanel(dl, cv, x0, y0, x1, y1, 14, IM_COL32(12, 20, 19, 245));
+        theme::Text(dl, cv, fonts.small, 22, x0 + 20, y0 + 16, "ABOUT", theme::color::kGold);
+        theme::Paragraph(dl, cv, fonts.body, 13, x0 + 20, y0 + 50, wrap, help,
+                         theme::color::kText, 22);
+      }
+      else
+      {
+        theme::SteelPanel(dl, cv, x0, y0, x1, 178, 14);
+        const std::string key = in.gamepad ? "Z" : "H";
+        theme::Text(dl, cv, fonts.menu, 36, x0 + 22, 128, key, theme::color::kGold);
+        theme::Text(dl, cv, fonts.small, 26, x0 + 58, 134, "ABOUT THIS OPTION",
+                    theme::color::kText);
+      }
+      if (clicked && mouse_in(x0, y0, x1, 178))
+        help_open = !help_open;
     }
+
+    // ---- status line and button hints ----
     {
-      std::lock_guard lock(dialog.mutex);
-      if (!dialog.error.empty())
-        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "%s", dialog.error.c_str());
+      std::string status;
+      ImU32 status_color = theme::color::kDim;
+      {
+        std::lock_guard lock(extraction.mutex);
+        if (!extraction.error.empty())
+          status = extraction.error, status_color = theme::color::kWarn;
+        else if (extraction.running || !extraction.status.empty())
+          status = extraction.status;
+      }
+      {
+        std::lock_guard lock(dialog.mutex);
+        if (!dialog.error.empty())
+          status = dialog.error, status_color = theme::color::kWarn;
+      }
+      if (!status.empty())
+        theme::Text(dl, cv, fonts.body, 13, 44, 712, status, status_color, false);
+      const std::string hint = !page_hint.empty() ? page_hint :
+                               in.gamepad ? "A SELECT    B BACK    Z HELP" :
+                                            "ENTER SELECT    ESC BACK    H HELP";
+      if (!overlay)
+        theme::Text(dl, cv, fonts.small, 26, 1280 - 60 - theme::TextWidth(fonts.small, 26, hint),
+                    706, hint, theme::color::kText);
     }
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextWrapped("Controller: %s", controller_status.c_str());
+
+    // ---- Slot A carousel: the cards on a ring, the chosen one in front ----
+    {
+      const float dt = ImGui::GetIO().DeltaTime;
+      if (!capture_directory)
+        carousel_t = std::clamp(carousel_t + (carousel_open ? dt : -dt) * 5, 0.0f, 1.0f);
+      if (carousel_t > 0)
+      {
+        const auto& cards = card_library.Cards();
+        const int count = static_cast<int>(cards.size()) + 1;  // + NEW
+        carousel_focus = std::clamp(carousel_focus, 0, count - 1);
+        const bool active = carousel_open && naming.mode == Naming::Mode::None;
+        if (active)
+        {
+          const float wheel = ImGui::GetIO().MouseWheel;
+          if (raw_in.left || wheel > 0)
+            carousel_focus = (carousel_focus + count - 1) % count;
+          if (raw_in.right || wheel < 0)
+            carousel_focus = (carousel_focus + 1) % count;
+          bool accept = raw_in.accept;
+          if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+          {
+            const float mx = (ImGui::GetIO().MousePos.x - cv.origin.x) / cv.scale;
+            const float my = (ImGui::GetIO().MousePos.y - cv.origin.y) / cv.scale;
+            if (std::abs(mx - 640) < 132 && std::abs(my - 330) < 152)
+              accept = true;
+            else if (my < 640)
+              carousel_focus = (carousel_focus + (mx < 640 ? count - 1 : 1)) % count;
+          }
+          if (raw_in.back || ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            carousel_open = false;
+          else if (accept && carousel_focus == count - 1)
+            open_naming(Naming::Mode::New, -1);
+          else if (accept)
+          {
+            insert_card(carousel_focus);
+            carousel_open = false;
+          }
+          else if (raw_in.rename && carousel_focus < count - 1)
+            open_naming(Naming::Mode::Rename, carousel_focus);
+          else if (raw_in.duplicate && carousel_focus < count - 1)
+            open_naming(Naming::Mode::Duplicate, carousel_focus);
+        }
+        // Spin towards the chosen card; the ring wraps when it is full.
+        constexpr float pi = 3.14159265f;
+        const bool ring = count >= 12;
+        const float spacing = ring ? 2 * pi / count : 0.62f;
+        float target = static_cast<float>(carousel_focus);
+        if (ring)
+        {
+          while (target - carousel_pos > count / 2.0f)
+            target -= count;
+          while (carousel_pos - target > count / 2.0f)
+            target += count;
+        }
+        carousel_pos += (target - carousel_pos) * std::min(1.0f, dt * 9);
+        if (capture_directory)
+          carousel_pos = target;
+        if (ring)
+          carousel_pos = std::fmod(std::fmod(carousel_pos, static_cast<float>(count)) + count,
+                                   static_cast<float>(count));
+
+        theme::Starfield(dl, cv, viewport->Size, carousel_t, static_cast<float>(ImGui::GetTime()));
+        const auto fade = [&](ImU32 col)
+        {
+          const ImU32 a = static_cast<ImU32>(((col >> IM_COL32_A_SHIFT) & 0xFF) * carousel_t);
+          return (col & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
+        };
+        const char* heading = "CHOOSE A MEMORY CARD";
+        theme::Text(dl, cv, fonts.title, 44, 640 - theme::TextWidth(fonts.title, 44, heading) / 2,
+                    54, heading, fade(theme::color::kWhite));
+
+        struct Placed
+        {
+          int index;
+          float theta, depth;
+        };
+        std::vector<Placed> placed;
+        for (int i = 0; i < count; ++i)
+        {
+          float theta = (i - carousel_pos) * spacing;
+          if (ring)
+            theta = std::remainder(theta, 2 * pi);
+          if (std::abs(theta) > 2.6f)
+            continue;
+          placed.push_back({i, theta, std::cos(theta)});
+        }
+        std::ranges::sort(placed, {}, &Placed::depth);
+        for (const Placed& item : placed)
+        {
+          const float front = (item.depth + 1) / 2;  // 0 at the back, 1 in front
+          const float s = 0.45f + 1.15f * front * front * front;
+          const float x = 640 + std::sin(item.theta) * 440;
+          const float y = 330 - (1 - item.depth) * 70;
+          theme::Canvas card_canvas;
+          card_canvas.scale = cv.scale * s;
+          card_canvas.origin = cv.P(x - 82 * s, y - 95 * s);
+          const int start = dl->VtxBuffer.Size;
+          const bool chosen = item.index == carousel_focus;
+          if (item.index == count - 1)
+            theme::NewCardSlot(dl, card_canvas, fonts, 0, 0, chosen);
+          else
+          {
+            const auto& card = cards[static_cast<std::size_t>(item.index)];
+            theme::MemoryCard(dl, card_canvas, fonts, 0, 0, card.name, theme::CardColor(card.name),
+                              chosen);
+          }
+          theme::TransformSince(dl, start, cv.P(x, 0).x,
+                                0.35f + 0.65f * std::abs(std::cos(item.theta)),
+                                carousel_t * (0.15f + 0.85f * front * front * front * front),
+                                0.35f + 0.65f * front);
+        }
+
+        // The chosen card's details under the ring.
+        if (carousel_focus == count - 1)
+        {
+          const char* text = "NEW CARD";
+          theme::Text(dl, cv, fonts.title, 44, 640 - theme::TextWidth(fonts.title, 44, text) / 2,
+                      520, text, fade(theme::color::kWhite));
+          const char* sub = "A blank card: the game starts a new save on it.";
+          theme::Text(dl, cv, fonts.body, 13, 640 - theme::TextWidth(fonts.body, 13, sub) / 2, 580,
+                      sub, fade(theme::color::kGrey), false);
+        }
+        else
+        {
+          const auto& card = cards[static_cast<std::size_t>(carousel_focus)];
+          const std::string name = Upper(card.name);
+          theme::Text(dl, cv, fonts.title, 44, 640 - theme::TextWidth(fonts.title, 44, name) / 2,
+                      520, name, fade(theme::color::kWhite));
+          const std::string where =
+              carousel_focus == card_library.Inserted() ? "IN SLOT A" : "IN THE LIBRARY";
+          theme::Text(dl, cv, fonts.small, 26, 640 - theme::TextWidth(fonts.small, 26, where) / 2,
+                      574, where, fade(theme::color::kGold));
+          const std::string detail =
+              (card.blank ? std::string("Blank") : std::to_string(card.blocks) + " blocks") +
+              "     " + CardWhen(card);
+          theme::Text(dl, cv, fonts.body, 13, 640 - theme::TextWidth(fonts.body, 13, detail) / 2,
+                      612, detail, fade(theme::color::kGrey), false);
+        }
+        const std::string hint = gamepad_input ?
+                                     "< > CHOOSE    A INSERT    X RENAME    Y COPY    B BACK" :
+                                     "< > CHOOSE    ENTER INSERT    R RENAME    D COPY    ESC BACK";
+        theme::Text(dl, cv, fonts.small, 26, 640 - theme::TextWidth(fonts.small, 26, hint) / 2, 690,
+                    hint, fade(theme::color::kText));
+      }
+    }
+
+    // ---- naming dialog ----
+    if (naming.mode != Naming::Mode::None)
+    {
+      dl->AddRectFilled({0, 0}, viewport->Size, IM_COL32(0, 0, 0, 150));
+      theme::SteelPanel(dl, cv, 380, 270, 900, 480, 16, IM_COL32(12, 20, 19, 245));
+      const char* title = naming.mode == Naming::Mode::New    ? "NAME THE NEW CARD" :
+                          naming.mode == Naming::Mode::Rename ? "RENAME THE CARD" :
+                                                                "NAME THE COPY";
+      theme::Text(dl, cv, fonts.menu, 36, 412, 294, title, theme::color::kGold);
+      dl->AddRectFilled(cv.P(412, 350), cv.P(868, 394), IM_COL32(8, 12, 12, 230));
+      dl->AddRect(cv.P(412, 350), cv.P(868, 394), IM_COL32(120, 126, 132, 255), 0, 0, cv.S(1));
+      ImGui::SetCursorScreenPos(cv.P(426, 354));
+      const ImGuiStyle& style = ImGui::GetStyle();
+      ImGui::PushFont(fonts.menu ? fonts.menu : ImGui::GetFont(),
+                      cv.S(36) / (style.FontScaleMain * style.FontScaleDpi));
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
+      ImGui::PushStyleColor(ImGuiCol_Text, theme::color::kWhite);
+      ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+      ImGui::SetNextItemWidth(cv.S(430));
+      if (naming.focus)
+      {
+        ImGui::SetKeyboardFocusHere();
+        naming.focus = false;
+      }
+      const bool entered = ImGui::InputText(
+          "##card_name", naming.text.data(), naming.text.size(),
+          ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter,
+          CardNameFilter);
+      ImGui::PopStyleVar();
+      ImGui::PopStyleColor(2);
+      ImGui::PopFont();
+      if (!naming.error.empty())
+        theme::Text(dl, cv, fonts.body, 13, 414, 408, naming.error, theme::color::kWarn, false);
+      const char* hint = gamepad_input ? "A OK    B CANCEL" : "ENTER OK    ESC CANCEL";
+      theme::Text(dl, cv, fonts.small, 26, 868 - theme::TextWidth(fonts.small, 26, hint), 432,
+                  hint, theme::color::kText);
+      if (entered || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false))
+        commit_naming();
+      else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+               ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+        naming.mode = Naming::Mode::None;
+    }
     ImGui::End();
 
     ImGui::Render();
     SDL_SetRenderScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
-    SDL_SetRenderDrawColor(renderer, 18, 20, 28, 255);
+    SDL_SetRenderDrawColor(renderer, 4, 9, 9, 255);
     SDL_RenderClear(renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+    if (capture_directory)
+    {
+      if (capture_frame % kCaptureFrames == kCaptureFrames - 1)
+      {
+        if (SDL_Surface* shot = SDL_RenderReadPixels(renderer, nullptr))
+        {
+          std::error_code ec;
+          fs::create_directories(*capture_directory, ec);
+          const fs::path file = *capture_directory / ("page" + std::to_string(capture_shot) + ".bmp");
+          SDL_SaveBMP(shot, file.string().c_str());
+          SDL_DestroySurface(shot);
+        }
+        if (capture_shot + 1 >= kCaptureShots)
+          done = true;
+      }
+      ++capture_frame;
+    }
     SDL_RenderPresent(renderer);
   }
 
@@ -1690,6 +2686,11 @@ int main(int argc, char** argv)
         int exit_code = 1;
         const bool waited = SDL_WaitProcess(process, true, &exit_code);
         SDL_DestroyProcess(process);
+        {
+          std::string card_error;
+          if (!card_library.CollectSlot(&card_error))
+            SDL_Log("memory card library: %s", card_error.c_str());
+        }
         if (!waited || exit_code != 0)
         {
           SDL_ShowWindow(window);
@@ -1748,6 +2749,11 @@ int main(int argc, char** argv)
     }
   }
 
+  for (const auto& [path, texture] : thumbnails)
+    if (texture)
+      SDL_DestroyTexture(texture);
+  if (backdrop)
+    SDL_DestroyTexture(backdrop);
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();
   ImGui::DestroyContext();

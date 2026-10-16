@@ -3,6 +3,7 @@
 
 #include "automation_protocol.hpp"
 #include "pause_menu_host.hpp"
+#include "gc_controller_art.hpp"
 #include "launcher_savestates.hpp"
 #include "quick_boot.hpp"
 #include "AudioCommon/AudioCommon.h"
@@ -1243,56 +1244,55 @@ void DrawInputOverlay(NavigationOverlayState& state)
           std::memory_order_relaxed)) /
       100.0f;
   const ImVec2 display = ImGui::GetIO().DisplaySize;
-  ImGui::SetNextWindowPos({16.0f, display.y - 112.0f * ui_scale},
-                          ImGuiCond_Always);
-  ImGui::SetNextWindowBgAlpha(0.78f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                      {10.0f * ui_scale, 8.0f * ui_scale});
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * ui_scale);
-  if (ImGui::Begin("Controller Input###ModernGekkoInputOverlay", nullptr,
-                   ImGuiWindowFlags_NoDecoration |
-                       ImGuiWindowFlags_AlwaysAutoResize |
-                       ImGuiWindowFlags_NoInputs |
-                       ImGuiWindowFlags_NoSavedSettings))
+
+  // The controller itself, bottom left, lighting each button as it is
+  // pressed: a picture reads at a glance on a stream where a row of letters
+  // does not.
+  moderngekko::gc_art::State art;
+  const auto bit = [&](PadButton mask, unsigned out) {
+    if (pad.button & mask)
+      art.buttons |= out;
+  };
+  bit(PAD_BUTTON_A, moderngekko::gc_art::kA);
+  bit(PAD_BUTTON_B, moderngekko::gc_art::kB);
+  bit(PAD_BUTTON_X, moderngekko::gc_art::kX);
+  bit(PAD_BUTTON_Y, moderngekko::gc_art::kY);
+  bit(PAD_TRIGGER_Z, moderngekko::gc_art::kZ);
+  bit(PAD_TRIGGER_L, moderngekko::gc_art::kL);
+  bit(PAD_TRIGGER_R, moderngekko::gc_art::kR);
+  bit(PAD_BUTTON_START, moderngekko::gc_art::kStart);
+  bit(PAD_BUTTON_UP, moderngekko::gc_art::kUp);
+  bit(PAD_BUTTON_DOWN, moderngekko::gc_art::kDown);
+  bit(PAD_BUTTON_LEFT, moderngekko::gc_art::kLeft);
+  bit(PAD_BUTTON_RIGHT, moderngekko::gc_art::kRight);
+  // GameCube stick values grow upwards; the drawing's y grows down.
+  art.stick = {(static_cast<float>(pad.stickX) - GCPadStatus::MAIN_STICK_CENTER_X) /
+                   GCPadStatus::MAIN_STICK_RADIUS,
+               -(static_cast<float>(pad.stickY) - GCPadStatus::MAIN_STICK_CENTER_Y) /
+                   GCPadStatus::MAIN_STICK_RADIUS};
+  art.cstick = {(static_cast<float>(pad.substickX) - GCPadStatus::C_STICK_CENTER_X) /
+                    GCPadStatus::C_STICK_RADIUS,
+                -(static_cast<float>(pad.substickY) - GCPadStatus::C_STICK_CENTER_Y) /
+                    GCPadStatus::C_STICK_RADIUS};
+  art.l = pad.triggerLeft / 255.0f;
+  art.r = pad.triggerRight / 255.0f;
+
+  const float width = std::clamp(display.y * 0.2f, 160.0f, 480.0f) * ui_scale;
+  const float height = moderngekko::gc_art::Height(width);
+  const float margin = std::max(16.0f, display.y * 0.025f);
+  ImDrawList* dl = ImGui::GetBackgroundDrawList();
+  moderngekko::gc_art::Draw(dl, {margin + width / 2, display.y - margin - height / 2}, width,
+                            art, 0.92f);
+  if (state.fast_forward_active.load(std::memory_order_relaxed))
   {
-    ImGui::SetWindowFontScale(ui_scale);
-    const auto button = [&](PadButton mask, const char* label,
-                            const ImVec4& active_color) {
-      const bool active = (pad.button & mask) != 0;
-      ImGui::TextColored(active ? active_color :
-                                  ImVec4(0.42f, 0.46f, 0.5f, 1.0f),
-                         "%s", label);
-      ImGui::SameLine();
-    };
-    button(PAD_BUTTON_A, "A", {0.25f, 1.0f, 0.35f, 1.0f});
-    button(PAD_BUTTON_B, "B", {1.0f, 0.25f, 0.25f, 1.0f});
-    button(PAD_BUTTON_X, "X", {0.35f, 0.75f, 1.0f, 1.0f});
-    button(PAD_BUTTON_Y, "Y", {1.0f, 0.85f, 0.2f, 1.0f});
-    button(PAD_TRIGGER_L, "L", {0.95f, 0.95f, 1.0f, 1.0f});
-    button(PAD_TRIGGER_R, "R", {0.95f, 0.95f, 1.0f, 1.0f});
-    button(PAD_TRIGGER_Z, "Z", {0.65f, 0.45f, 1.0f, 1.0f});
-    ImGui::TextColored((pad.button & PAD_BUTTON_START) != 0 ?
-                           ImVec4(1.0f, 1.0f, 1.0f, 1.0f) :
-                           ImVec4(0.42f, 0.46f, 0.5f, 1.0f),
-                       "START");
-    const float stick_x =
-        (static_cast<float>(pad.stickX) - GCPadStatus::MAIN_STICK_CENTER_X) /
-        GCPadStatus::MAIN_STICK_RADIUS;
-    const float stick_y =
-        (static_cast<float>(pad.stickY) - GCPadStatus::MAIN_STICK_CENTER_Y) /
-        GCPadStatus::MAIN_STICK_RADIUS;
-    ImGui::Text("Stick %+0.2f  %+0.2f    Triggers %3u  %3u", stick_x,
-                stick_y, pad.triggerLeft, pad.triggerRight);
-    if (state.fast_forward_active.load(std::memory_order_relaxed))
-    {
-      ImGui::SameLine();
-      ImGui::TextColored({0.3f, 1.0f, 0.9f, 1.0f}, "  FAST %dx",
-                         state.fast_forward_multiplier.load(
-                             std::memory_order_relaxed));
-    }
+    char text[32];
+    std::snprintf(text, sizeof(text), "FAST %dx",
+                  state.fast_forward_multiplier.load(std::memory_order_relaxed));
+    const float size = ImGui::GetFontSize() * ui_scale;
+    const ImVec2 at{margin, display.y - margin - height - size * 1.4f};
+    dl->AddText(ImGui::GetFont(), size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 200), text);
+    dl->AddText(ImGui::GetFont(), size, at, IM_COL32(80, 255, 230, 255), text);
   }
-  ImGui::End();
-  ImGui::PopStyleVar(2);
 }
 
 
@@ -2112,6 +2112,18 @@ void Host_ToggleNavigationOverlay()
       visible ? "Navigation map shown" : "Navigation map hidden";
 }
 
+// The friendly name of the room the player is in ("Pyrite Town"), or empty
+// before the first room has been read. Used to suggest save-state names.
+std::string Host_CurrentLocationName()
+{
+  NavigationOverlayState* const state =
+      s_navigation_overlay_state.load(std::memory_order_acquire);
+  if (!state)
+    return {};
+  std::lock_guard lock(state->mutex);
+  return state->location_name;
+}
+
 bool Host_IsInputOverlayEnabled()
 {
   NavigationOverlayState* const state =
@@ -2501,6 +2513,27 @@ void UpdateNavigationOverlayState(NavigationOverlayState& state, bool valid, flo
       moderngekko::frontend::PruneAutomatic(
           state.savestate_directory,
           static_cast<std::size_t>(std::max(slots - 1, 0)), "recovery-room");
+      // Pruning removes only the .sav; its thumbnail and camera go with it.
+      {
+        std::vector<std::filesystem::path> orphans;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(state.savestate_directory, ec), end;
+             !ec && it != end; it.increment(ec))
+        {
+          const std::string name = it->path().filename().string();
+          if (!name.starts_with("recovery-room"))
+            continue;
+          const std::size_t sav = name.find(".sav.");
+          if (sav == std::string::npos)
+            continue;
+          std::error_code exists_ec;
+          if (!std::filesystem::exists(it->path().parent_path() / name.substr(0, sav + 4),
+                                       exists_ec))
+            orphans.push_back(it->path());
+        }
+        for (const auto& orphan : orphans)
+          std::filesystem::remove(orphan, ec);
+      }
       state.pending_save_state =
           MakeRecoverySavestatePath(state.savestate_directory, room_id);
       state.pending_save_is_recovery = true;

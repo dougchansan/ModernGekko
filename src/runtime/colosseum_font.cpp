@@ -224,7 +224,42 @@ ImFont *s_imgui_font = nullptr;
 ImFontAtlas *s_atlas = nullptr;
 bool s_tried = false;
 
+ImFont *AddToAtlas(ImFontAtlas *atlas, const BitmapFont *font, const char *name) {
+  ImFontConfig config;
+  const BitmapFont *pointer = font;
+  config.FontData = const_cast<BitmapFont **>(&pointer);
+  config.FontDataSize = sizeof(pointer);
+  config.FontDataOwnedByAtlas = false;  // AddFont copies the pointer value
+  config.SizePixels = font->cell_height;
+  config.FontLoader = Loader();
+  std::snprintf(config.Name, sizeof(config.Name), "%s", name);
+  return atlas->AddFont(&config);
+}
+
 }  // namespace
+
+// Any of the extracted Colosseum fonts by file name (colo_font0_22px,
+// colo_font3_18px_condensed, ...) from `directory` (ending in a separator).
+// For the launcher, which has no Dolphin user path to resolve. Added to the
+// current atlas on first use; nullptr when the font's files are missing.
+ImFont *ColosseumFont(const std::string &directory, const std::string &name) {
+  static std::unordered_map<std::string, std::unique_ptr<BitmapFont>> loaded;
+  static std::unordered_map<std::string, ImFont *> added;
+  static ImFontAtlas *added_atlas = nullptr;
+  ImFontAtlas *atlas = ImGui::GetIO().Fonts;
+  if (added_atlas != atlas) {
+    added.clear();
+    added_atlas = atlas;
+  }
+  if (const auto it = added.find(name); it != added.end())
+    return it->second;
+  std::unique_ptr<BitmapFont> &font = loaded[name];
+  if (!font)
+    font = LoadBitmapFont(directory, name);
+  ImFont *result = font ? AddToAtlas(atlas, font.get(), name.c_str()) : nullptr;
+  added[name] = result;
+  return result;
+}
 
 // The pause menu's font: Colosseum's when its files are present, else ImGui's.
 // Added to the atlas on first use (the renderer manages textures, so the atlas

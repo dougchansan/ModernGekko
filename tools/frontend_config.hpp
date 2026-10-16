@@ -74,6 +74,9 @@ struct ConfigResult {
   std::vector<std::string> controllers;
   bool show_fps_in_title = true;
   bool fullscreen = false;
+  // With fullscreen: take the display exclusively (native refresh rate,
+  // needed by driver frame generation) instead of a borderless window.
+  bool exclusive_fullscreen = false;
   std::string netplay_nickname = "Player";
   std::string netplay_address = "127.0.0.1";
   std::uint16_t netplay_port = 2626;

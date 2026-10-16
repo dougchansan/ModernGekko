@@ -4,6 +4,7 @@
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
+#include "Common/Image.h"
 #include "Common/IniFile.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
@@ -22,6 +23,7 @@
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/CameraWarp.h"
 #include "VideoCommon/FrameDumper.h"
+#include "VideoCommon/OnScreenDisplay.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/Present.h"
 #include "VideoCommon/VideoConfig.h"
@@ -45,6 +47,7 @@
 #include <chrono>
 #include <imgui.h>
 #include <memory>
+#include <span>
 #include <mutex>
 #include <string>
 #include <filesystem>
@@ -66,6 +69,7 @@ void Host_ToggleHighResolutionTextures();
 bool Host_IsTextUpscaleEnabled();
 void Host_ToggleTextUpscale();
 bool Host_IsInputOverlayEnabled();
+std::string Host_CurrentLocationName();
 void Host_ToggleInputOverlay();
 bool Host_IsAutosaveEnabled();
 void Host_ToggleAutosave();
@@ -184,6 +188,23 @@ struct Menu {
   int game_speed = 0;
   // The game's own debug displays (Developer page), as last set from here.
   bool game_cpu_meter = false, game_collision = false, game_shadow_debug = false;
+  // Naming a save state: Shift+F1 while playing, or "Save state" in the menu.
+  // The game pauses under a small prompt; typed keys edit the name, Left /
+  // Right pick a suggestion, Enter / A saves, Esc / B cancels. `naming` is set
+  // from the window thread the moment Shift+F1 arrives (so the window does not
+  // also take F1 as a quick save); the next tick sets the prompt up.
+  std::atomic<bool> naming{false}, naming_request{false};
+  std::string naming_text;  // guarded by mutex, as the rest below
+  std::vector<std::string> naming_suggestions;
+  int naming_choice = 0;
+  bool naming_typed = false;   // typed by hand: suggestions no longer replace it
+  bool naming_resume = false;  // the prompt paused the game itself
+  bool naming_swallow = false; // keys/buttons that closed it still held
+  u16 naming_buttons = 0xFFFF;
+  std::mutex naming_input_mutex;
+  std::string naming_input;  // characters from the window thread, '\b' = backspace
+  std::string toast;         // "Saved ..." shown briefly after the prompt closes
+  std::chrono::steady_clock::time_point toast_time{};
 };
 // The live menu, shared across threads. A mutex-guarded slot rather than
 // std::atomic<std::shared_ptr>, which Apple's libc++ does not provide.
@@ -1643,6 +1664,8 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
   }
 }
 
+void BeginNaming(Menu &menu);
+
 void ActionHost(const std::shared_ptr<Menu> &menu, Action action,
                 [[maybe_unused]] int direction = 1) {
   switch (action) {
@@ -1661,23 +1684,9 @@ void ActionHost(const std::shared_ptr<Menu> &menu, Action action,
     menu->photo_saved.clear();
     SetPhoto(menu, true);
     break;
-  case Action::SaveCheckpoint: {
-    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-    const auto path =
-        std::filesystem::path(menu->checkpoint_directory) /
-        State::Layout::TimestampedName(static_cast<std::time_t>(stamp / 1000),
-                                       static_cast<std::size_t>(stamp % 1000),
-                                       State::Layout::MANUAL_PREFIX);
-    if (File::CreateFullPath(path.string())) {
-      State::SaveAs(Core::System::GetInstance(), path.string());
-      Host_SaveCameraForState(path.string());
-      menu->status = "Checkpoint save requested";
-    } else
-      menu->status = "Unable to create checkpoint folder";
+  case Action::SaveCheckpoint:
+    BeginNaming(*menu);
     break;
-  }
   case Action::Restart:
     // What the console's RESET button does: back to the title sequence.
     Core::RunOnCPUThread(Core::System::GetInstance(), [] {
@@ -1693,6 +1702,135 @@ void ActionHost(const std::shared_ptr<Menu> &menu, Action action,
     break;
   default:
     break;
+  }
+}
+
+
+// ---- naming a save state ----
+void BeginNaming(Menu &menu) {
+  menu.naming = true;
+  menu.naming_suggestions.clear();
+  std::string place = Host_CurrentLocationName();
+  const std::time_t now = std::time(nullptr);
+  char clock[16];
+  std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&now));
+  if (!place.empty()) {
+    menu.naming_suggestions.push_back(place);
+    menu.naming_suggestions.push_back(place + " " + clock);
+  }
+  for (const char *generic : {"Before battle", "Checkpoint"})
+    menu.naming_suggestions.push_back(generic);
+  menu.naming_choice = 0;
+  menu.naming_text = menu.naming_suggestions.front();
+  menu.naming_typed = false;
+  menu.naming_buttons = 0xFFFF;  // a button held when it opened is not a press
+  {
+    std::lock_guard lock(menu.naming_input_mutex);
+    menu.naming_input.clear();
+  }
+  for (const int key : {8, 13, 27, 37, 38, 39, 40})
+    menu.pressed_keys[key] = false;
+  auto &system = Core::System::GetInstance();
+  menu.naming_resume =
+      !menu.policy.is_open() && Core::GetState(system) == Core::State::Running;
+  if (menu.naming_resume) {
+    Host_SetFastForwardActive(false);
+    Core::SetState(system, Core::State::Paused);
+  }
+}
+
+void EndNaming(Menu &menu) {
+  menu.naming = false;
+  menu.naming_swallow = true;
+  auto &system = Core::System::GetInstance();
+  if (menu.naming_resume && !menu.policy.is_open() &&
+      Core::GetState(system) == Core::State::Paused)
+    Core::SetState(system, Core::State::Running);
+  menu.naming_resume = false;
+}
+
+// The name goes into the file name, after the timestamp:
+// state-20261015-142233-512-Pyrite_Town.sav. Readers drop the numeric parts
+// and turn '_' back into spaces.
+void SaveNamedState(Menu &menu, std::string name) {
+  while (!name.empty() && name.back() == ' ')
+    name.pop_back();
+  std::string slug;
+  for (const char c : name) {
+    if (std::isalnum(static_cast<unsigned char>(c)))
+      slug += c;
+    else if ((c == ' ' || c == '-' || c == '_') && !slug.empty() && slug.back() != '_')
+      slug += '_';
+  }
+  while (!slug.empty() && slug.back() == '_')
+    slug.pop_back();
+  const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  // StateSaves, beside F1's quick saves, where the launcher lists them (the
+  // checkpoint directory is the automation folder in launcher sessions).
+  auto path = std::filesystem::path(File::GetUserPath(D_STATESAVES_IDX)) /
+              State::Layout::TimestampedName(static_cast<std::time_t>(stamp / 1000),
+                                             static_cast<std::size_t>(stamp % 1000),
+                                             State::Layout::MANUAL_PREFIX);
+  if (!slug.empty()) {
+    std::string file = path.filename().string();
+    file.insert(file.size() - State::Layout::EXTENSION.size(), "-" + slug);
+    path.replace_filename(file);
+  }
+  if (!File::CreateFullPath(path.string())) {
+    menu.status = "Unable to create the save state folder";
+    return;
+  }
+  State::SaveAs(Core::System::GetInstance(), path.string());
+  Host_SaveCameraForState(path.string());
+  menu.status = name.empty() ? "State saved" : "Saved \"" + name + "\"";
+  menu.toast = menu.status;
+  menu.toast_time = std::chrono::steady_clock::now();
+  std::fprintf(stderr, "[state] saved %s\n", path.string().c_str());
+}
+
+void HandleNaming(Menu &menu, const GCPadStatus &pad) {
+  std::string typed;
+  {
+    std::lock_guard lock(menu.naming_input_mutex);
+    typed.swap(menu.naming_input);
+  }
+  for (const char c : typed) {
+    // The first key replaces the suggestion, as typing over a selection does.
+    if (!menu.naming_typed) {
+      menu.naming_text.clear();
+      menu.naming_typed = true;
+      if (c == '\b')
+        continue;
+    }
+    if (c == '\b') {
+      if (!menu.naming_text.empty())
+        menu.naming_text.pop_back();
+    } else if (menu.naming_text.size() < 32) {
+      menu.naming_text += c;
+    }
+  }
+  const u16 pressed = pad.button & ~menu.naming_buttons;
+  menu.naming_buttons = pad.button;
+  const bool save = menu.pressed_keys[13].exchange(false) || (pressed & PAD_BUTTON_A);
+  const bool cancel = menu.pressed_keys[27].exchange(false) || (pressed & PAD_BUTTON_B);
+  const bool left = menu.pressed_keys[37].exchange(false) || (pressed & PAD_BUTTON_LEFT);
+  const bool right = menu.pressed_keys[39].exchange(false) || (pressed & PAD_BUTTON_RIGHT);
+  for (const int key : {8, 38, 40})
+    menu.pressed_keys[key] = false;
+  if ((left || right) && !menu.naming_suggestions.empty()) {
+    const int n = static_cast<int>(menu.naming_suggestions.size());
+    menu.naming_choice = (menu.naming_choice + (right ? 1 : -1) + n) % n;
+    menu.naming_text = menu.naming_suggestions[static_cast<std::size_t>(menu.naming_choice)];
+    menu.naming_typed = false;
+  }
+  if (cancel) {
+    menu.status = "Save cancelled";
+    EndNaming(menu);
+  } else if (save) {
+    SaveNamedState(menu, menu.naming_text);
+    EndNaming(menu);
   }
 }
 
@@ -1720,7 +1858,7 @@ std::vector<std::string> Rows(const Menu &menu) {
   switch (menu.policy.page()) {
   case Page::Home:
     return {"Resume adventure", "Settings", "Controls", "Shadow Pok\xC3\xA9mon",
-            "Photo mode", "Save checkpoint", "Developer", "Restart game", "Quit game"};
+            "Photo mode", "Save state", "Developer", "Restart game", "Quit game"};
   case Page::Shadow: {
     std::vector<std::string> rows;
     for (const auto &entry : menu.shadow.entries) {
@@ -2400,6 +2538,86 @@ void DrawPhotoMode(Menu &menu) {
                  1.5f * s, 1.4f * s);
 }
 
+
+void DrawNaming(Menu &menu) {
+  namespace st = style;
+  namespace col = style::color;
+  std::unique_lock lock(menu.mutex, std::try_to_lock);
+  if (!lock.owns_lock() || menu.naming_suggestions.empty())
+    return;
+  const auto &io = ImGui::GetIO();
+  ImFont *font = MenuFont();
+  const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.6f);
+  ImDrawList *draw = ImGui::GetForegroundDrawList();
+  draw->AddRectFilled(ImVec2(0, 0), io.DisplaySize, st::Rgb(0, 6, 10, 140));
+  const float width = std::min(820 * s, io.DisplaySize.x - 32 * s), height = 300 * s;
+  const ImVec2 o((io.DisplaySize.x - width) * 0.5f, (io.DisplaySize.y - height) * 0.5f);
+  const float header_h = 74 * s;
+  st::ChromePlate(draw, o, ImVec2(o.x + width, o.y + header_h), 18 * s, 8 * s, col::kTealTop,
+                  col::kTealBottom);
+  st::FillChamfer(draw, ImVec2(o.x + 14 * s, o.y + 16 * s), ImVec2(o.x + 24 * s, o.y + header_h - 16 * s),
+                  3 * s, st::Rgb(240, 70, 60), st::Rgb(150, 20, 20));
+  const char *title = "NAME THIS SAVE";
+  const ImVec2 ts = st::TextSize(font, 38 * s, title);
+  st::OutlinedText(draw, font, 38 * s, ImVec2(o.x + 40 * s, o.y + (header_h - ts.y) * 0.5f), col::kWhite,
+                   title, 2.0f * s);
+  const ImVec2 pa(o.x, o.y + header_h + 12 * s), pb(o.x + width, o.y + height);
+  st::Panel(draw, pa, pb, 16 * s, 6 * s, false);
+  // The name in a dark field; a suggestion shows highlighted (typing replaces
+  // it), typed text shows with a blinking caret.
+  const ImVec2 fa(pa.x + 30 * s, pa.y + 24 * s), fb(pb.x - 30 * s, pa.y + 84 * s);
+  st::FillChamfer(draw, fa, fb, 8 * s, st::Rgb(4, 16, 20, 240), st::Rgb(10, 30, 34, 240));
+  st::StrokeChamfer(draw, fa, fb, 8 * s, col::kPanelFrameLight, 2 * s);
+  const float text_size = 32 * s;
+  const std::string &text = menu.naming_text;
+  const ImVec2 size = st::TextSize(font, text_size, text);
+  const ImVec2 at(fa.x + 18 * s, fa.y + (fb.y - fa.y - size.y) * 0.5f);
+  if (!menu.naming_typed && !text.empty())
+    draw->AddRectFilled(ImVec2(at.x - 4 * s, at.y - 2 * s), ImVec2(at.x + size.x + 4 * s, at.y + size.y + 2 * s),
+                        st::Rgb(40, 110, 140, 200), 4 * s);
+  st::OutlinedText(draw, font, text_size, at, col::kWhite, text, 1.5f * s);
+  const double t = ImGui::GetTime();
+  if (menu.naming_typed && std::fmod(t, 1.0) < 0.55)
+    draw->AddRectFilled(ImVec2(at.x + size.x + 3 * s, fa.y + 14 * s), ImVec2(at.x + size.x + 6 * s, fb.y - 14 * s),
+                        col::kWhite);
+  // Suggestions.
+  char which[64];
+  std::snprintf(which, sizeof(which), "<   SUGGESTION %d OF %d   >", menu.naming_choice + 1,
+                static_cast<int>(menu.naming_suggestions.size()));
+  const float small = 20 * s;
+  const ImVec2 ws = st::TextSize(font, small, which);
+  st::OutlinedText(draw, font, small, ImVec2(o.x + (width - ws.x) * 0.5f, fb.y + 16 * s), col::kHeaderGreen,
+                   which, 1.5f * s);
+  const char *hint = "TYPE A NAME     ENTER / A  SAVE     ESC / B  CANCEL";
+  const ImVec2 hs = st::TextSize(font, small, hint);
+  st::OutlinedText(draw, font, small, ImVec2(o.x + (width - hs.x) * 0.5f, pb.y - hs.y - 20 * s), col::kYellow,
+                   hint, 1.5f * s);
+}
+
+void DrawToast(Menu &menu) {
+  namespace st = style;
+  std::unique_lock lock(menu.mutex, std::try_to_lock);
+  if (!lock.owns_lock() || menu.toast.empty())
+    return;
+  const float age = std::chrono::duration<float>(std::chrono::steady_clock::now() - menu.toast_time).count();
+  if (age > 2.5f) {
+    menu.toast.clear();
+    return;
+  }
+  const float fade = std::clamp((2.5f - age) / 0.4f, 0.0f, 1.0f);
+  const auto &io = ImGui::GetIO();
+  ImFont *font = MenuFont();
+  const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.6f), size = 26 * s;
+  const ImVec2 ts = st::TextSize(font, size, menu.toast);
+  const ImVec2 a((io.DisplaySize.x - ts.x) * 0.5f - 24 * s, 28 * s), b(a.x + ts.x + 48 * s, a.y + ts.y + 20 * s);
+  ImDrawList *draw = ImGui::GetForegroundDrawList();
+  st::FillChamfer(draw, a, b, 8 * s, st::Rgb(18, 76, 94, static_cast<int>(220 * fade)),
+                  st::Rgb(8, 40, 54, static_cast<int>(220 * fade)));
+  st::OutlinedText(draw, font, size, ImVec2(a.x + 24 * s, a.y + 10 * s),
+                   st::Rgb(246, 248, 250, static_cast<int>(255 * fade)), menu.toast, 1.5f * s,
+                   st::Rgb(6, 16, 20, static_cast<int>(235 * fade)));
+}
+
 void Draw() {
   namespace st = style;
   namespace col = style::color;
@@ -2411,6 +2629,12 @@ void Draw() {
     DrawPhotoMode(*menu);
     return;
   }
+  if (menu && menu->naming) {
+    DrawNaming(*menu);
+    return;
+  }
+  if (menu)
+    DrawToast(*menu);
   if (menu && menu->motion_test)
     DrawMotionTest();
   if (menu)
@@ -2733,10 +2957,86 @@ void Draw() {
 }
 } // namespace moderngekko::pause_menu
 
+// A small picture of the moment a state was saved, <state>.png, for the
+// launcher's save-state list. Dolphin's screenshot path writes the next
+// presented game frame (no menus or overlays) at full size; a background
+// thread waits for it, shrinks it to a thumbnail and removes the full one.
+// Emulation that is paused when the state is saved takes the picture when it
+// resumes; if the session ends first there is simply no thumbnail.
+static void SaveThumbnailForState(const std::string &state_path) {
+  if (!g_frame_dumper || state_path.empty())
+    return;
+  const std::string full = state_path + ".shot.png";
+  std::error_code ec;
+  std::filesystem::remove(full, ec);
+  // The screenshot is the console's raw frame; the picture on screen is that
+  // frame stretched to the window's draw rectangle (16:9, or 32:9 in native
+  // ultrawide), so the thumbnail takes that shape.
+  float aspect = 0;
+  if (g_presenter) {
+    const auto &target = g_presenter->GetTargetRectangle();
+    if (target.GetWidth() > 0 && target.GetHeight() > 0)
+      aspect = static_cast<float>(target.GetWidth()) / target.GetHeight();
+  }
+  g_frame_dumper->SaveScreenshot(full);
+  std::thread([state_path, full, aspect] {
+    constexpr int kThumbHeight = 216, kMaxWidth = 768;
+    std::vector<u8> rgba;
+    u32 w = 0, h = 0;
+    for (int tries = 0; tries < 1200; ++tries) {  // up to two minutes
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::string png;
+      if (!File::ReadFileToString(full, png) || png.empty())
+        continue;
+      rgba.clear();
+      if (Common::LoadPNG(std::span(reinterpret_cast<const u8 *>(png.data()), png.size()), &rgba,
+                          &w, &h) &&
+          w && h)
+        break;  // a half-written file fails to decode; try again
+      w = h = 0;
+    }
+    std::error_code remove_ec;
+    if (!w || !h) {
+      std::filesystem::remove(full, remove_ec);
+      return;
+    }
+    // The screenshot's own toast (and the state's) would otherwise pile up on
+    // every room autosave.
+    OSD::ClearMessages();
+    const u32 th = std::min<u32>(kThumbHeight, h);
+    const float shape = aspect > 0 ? aspect : static_cast<float>(w) / h;
+    const u32 tw = std::max<u32>(1, std::min<u32>(kMaxWidth, static_cast<u32>(th * shape + 0.5f)));
+    std::vector<u8> thumb(static_cast<std::size_t>(tw) * th * 4);
+    // Box filter: average every source pixel that lands in each target pixel.
+    for (u32 y = 0; y < th; ++y) {
+      const u32 y0 = y * h / th, y1 = std::max(y0 + 1, (y + 1) * h / th);
+      for (u32 x = 0; x < tw; ++x) {
+        const u32 x0 = x * w / tw, x1 = std::max(x0 + 1, (x + 1) * w / tw);
+        u64 sum[3] = {};
+        for (u32 sy = y0; sy < y1; ++sy)
+          for (u32 sx = x0; sx < x1; ++sx)
+            for (int c = 0; c < 3; ++c)
+              sum[c] += rgba[(static_cast<std::size_t>(sy) * w + sx) * 4 + c];
+        const u64 n = static_cast<u64>(y1 - y0) * (x1 - x0);
+        u8 *out = &thumb[(static_cast<std::size_t>(y) * tw + x) * 4];
+        for (int c = 0; c < 3; ++c)
+          out[c] = static_cast<u8>(sum[c] / n);
+        out[3] = 255;
+      }
+    }
+    Common::SavePNG(state_path + ".png", thumb.data(), Common::ImageByteFormat::RGBA, tw, th,
+                    static_cast<int>(tw * 4));
+    std::filesystem::remove(full, remove_ec);
+  }).detach();
+}
+
 // Save states hold guest memory only; the camera mod's angle (orbit yaw,
 // pitch, zoom, free camera) lives in the mod, so a state reloaded with
 // another view. Keep it next to the state as <state>.camera.
 void Host_SaveCameraForState(const std::string &state_path) {
+  // Every state the player can see gets its picture here too: this is called
+  // right after each manual save and room autosave.
+  SaveThumbnailForState(state_path);
   const auto menu = moderngekko::pause_menu::current.load();
   if (!menu || state_path.empty())
     return;
@@ -2758,6 +3058,36 @@ void Host_RestoreCameraForState(const std::string &state_path) {
 
 void Host_PauseMenuKey(int key, bool down) {
   const auto menu = moderngekko::pause_menu::current.load();
+#ifdef _WIN32
+  if (menu && down) {
+    constexpr int kF1 = 0x70;
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) || menu->keys[VK_SHIFT];
+    if (key == kF1 && shift && !menu->naming && !menu->open &&
+        !menu->photo_mode) {
+      // Set now, not on the next tick: the window checks Host_IsPauseMenuOpen
+      // right after this and must not also take F1 as a quick save.
+      menu->naming = true;
+      menu->naming_request = true;
+    } else if (menu->naming && key != VK_RETURN && key != VK_ESCAPE) {
+      if (key == VK_BACK) {
+        std::lock_guard lock(menu->naming_input_mutex);
+        menu->naming_input += '\b';
+      } else {
+        BYTE state[256] = {};
+        wchar_t text[4] = {};
+        if (GetKeyboardState(state) &&
+            ToUnicode(static_cast<UINT>(key), MapVirtualKeyW(static_cast<UINT>(key), MAPVK_VK_TO_VSC),
+                      state, text, 4, 0x4 /* keep dead-key state */) == 1) {
+          const wchar_t c = text[0];
+          if (c < 128 && (std::isalnum(static_cast<int>(c)) || c == L' ' || c == L'-' || c == L'_')) {
+            std::lock_guard lock(menu->naming_input_mutex);
+            menu->naming_input += static_cast<char>(c);
+          }
+        }
+      }
+    }
+  }
+#endif
   if (menu && key >= 0 && key < 256) {
     if (down && !menu->keys[key].exchange(true))
       menu->pressed_keys[key] = true;
@@ -2767,7 +3097,7 @@ void Host_PauseMenuKey(int key, bool down) {
 }
 bool Host_IsPauseMenuOpen() {
   const auto menu = moderngekko::pause_menu::current.load();
-  return menu && menu->open;
+  return menu && (menu->open || menu->naming);
 }
 void Host_PauseMenuFocusLost() {
   if (const auto menu = moderngekko::pause_menu::current.load()) {
@@ -2780,7 +3110,7 @@ void Host_PauseMenuFocusLost() {
 }
 bool Host_IsPauseMenuInputBlocked() {
   const auto menu = moderngekko::pause_menu::current.load();
-  return menu && (menu->blocked || menu->toggle);
+  return menu && (menu->blocked || menu->toggle || menu->naming);
 }
 void Host_RequestPauseMenuToggle() {
   if (const auto menu = moderngekko::pause_menu::current.load())
@@ -2823,6 +3153,12 @@ void Host_PauseMenuTick() {
     HandlePhotoMode(menu, pad);
     return;
   }
+  if (menu->naming_request.exchange(false))
+    BeginNaming(*menu);
+  if (menu->naming) {
+    HandleNaming(*menu, pad);
+    return;
+  }
   Input input;
   Input pressed;
   pressed.escape = menu->pressed_keys[27].exchange(false);
@@ -2841,6 +3177,12 @@ void Host_PauseMenuTick() {
   input.back = menu->keys[8] || pressed.back || (pad.button & PAD_BUTTON_B);
   input.start = pad.button & PAD_BUTTON_START;
   input.select = pad.button & PAD_TRIGGER_Z;
+  if (menu->naming_swallow) {
+    if (!menu->keys[13] && !menu->keys[27] && !menu->keys[8] &&
+        !(pad.button & (PAD_BUTTON_A | PAD_BUTTON_B)))
+      menu->naming_swallow = false;
+    input.accept = input.back = input.escape = false;
+  }
   input.any_game_button =
       menu->keys[37] || menu->keys[39] || pad.button || pad.triggerLeft ||
       pad.triggerRight || std::abs(static_cast<int>(pad.stickX) - 128) > 32 ||
@@ -2924,7 +3266,7 @@ void Host_PauseMenuTick() {
   menu->adjust_direction = direction;
   SyncPause(menu, was_open);
   const auto time = std::chrono::steady_clock::now();
-  if (menu->open &&
+  if ((menu->open || menu->naming) &&
       Core::GetState(Core::System::GetInstance()) == Core::State::Paused &&
       time - menu->last_repaint >= std::chrono::milliseconds(16) &&
       !menu->repaint_pending.exchange(true)) {
@@ -2936,7 +3278,8 @@ void Host_PauseMenuTick() {
                              return;
                            AsyncRequests::GetInstance()->PushEvent([weak] {
                              if (const auto state = weak.lock()) {
-                               if (state->active && state->open && g_presenter)
+                               if (state->active && (state->open || state->naming) &&
+                                   g_presenter)
                                  g_presenter->Present();
                                state->repaint_pending = false;
                              }

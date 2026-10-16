@@ -4,6 +4,8 @@
 #include <cctype>
 #include <charconv>
 #include <fstream>
+#include <set>
+#include <sstream>
 #include <string_view>
 
 namespace fs = std::filesystem;
@@ -254,6 +256,9 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     } else if (key == "fullscreen") {
       if (!ParseBoolean(value, &config.fullscreen))
         return {.error = "fullscreen must be true or false"};
+    } else if (key == "exclusivefullscreen") {
+      if (!ParseBoolean(value, &config.exclusive_fullscreen))
+        return {.error = "ExclusiveFullscreen must be true or false"};
     } else if (key == "nickname")
       config.netplay_nickname = raw_value;
     else if (key == "address")
@@ -369,6 +374,43 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
       *error = "can't create user directory: " + ec.message();
     return false;
   }
+  // config.ini is shared with the in-game pause menu, which keeps its own
+  // keys here (camera, world, vendor features). Carry every key this writer
+  // does not own across the rewrite, under its original section.
+  static const std::set<std::string> owned = {
+      "resolution", "backend", "graphics_backend", "widescreen_hack",
+      "aspect_ratio", "force_texture_filtering", "max_anisotropy",
+      "osd_font_size", "navigation_overlay", "hires_textures",
+      "community_hd_texture_pack", "cache_hires_textures", "dump_textures",
+      "text_upscale", "input_overlay", "minimap_high_contrast",
+      "accessibility_ui_scale", "ultrawide_efb_scale", "fullscreen",
+      "exclusivefullscreen", "show_fps_in_title", "sixty_fps",
+      "guest_idle_skip", "dual_core", "fast_forward",
+      "fast_forward_multiplier", "autosave", "autosave_slots",
+      "crash_watchdog", "crash_watchdog_seconds", "controller",
+      "controller1", "controller2", "controller3", "controller4",
+      "nickname", "address", "port", "buffer"};
+  std::vector<std::pair<std::string, std::string>> kept;  // section, line
+  {
+    std::ifstream existing(user_directory / "config.ini");
+    std::string line, section;
+    while (std::getline(existing, line)) {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      const std::string trimmed = Trim(line);
+      if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';')
+        continue;
+      if (trimmed[0] == '[') {
+        section = trimmed;
+        continue;
+      }
+      const std::size_t separator = trimmed.find('=');
+      if (separator == std::string::npos ||
+          owned.contains(Lower(Trim(trimmed.substr(0, separator)))))
+        continue;
+      kept.emplace_back(section, trimmed);
+    }
+  }
   std::ofstream file(user_directory / "config.ini", std::ios::trunc);
   if (!file) {
     if (error)
@@ -400,6 +442,8 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
         << "accessibility_ui_scale=" << config.accessibility_ui_scale << '\n'
         << "ultrawide_efb_scale=" << config.ultrawide_efb_scale << '\n'
        << "fullscreen=" << (config.fullscreen ? "true" : "false") << '\n'
+       << "ExclusiveFullscreen="
+       << (config.exclusive_fullscreen ? "true" : "false") << '\n'
        << "show_fps_in_title=" << (config.show_fps_in_title ? "true" : "false")
        << '\n'
        << "[QualityOfLife]\n"
@@ -427,6 +471,15 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
        << "address=" << config.netplay_address << '\n'
        << "port=" << config.netplay_port << '\n'
        << "buffer=" << config.netplay_buffer << '\n';
+  std::string section;
+  for (const auto &[kept_section, line] : kept) {
+    if (kept_section != section || &line == &kept.front().second) {
+      section = kept_section;
+      if (!section.empty())
+        file << section << '\n';
+    }
+    file << line << '\n';
+  }
   return true;
 }
 
