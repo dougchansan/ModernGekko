@@ -386,6 +386,8 @@ struct PadState
       controls{};
   // The emulated Game Boy Advance on this port, in kGbaPadButtons order.
   std::array<bool, 10> gba{};
+  // Turns that GBA off and on (gba_reset=1).
+  bool gba_reset = false;
 };
 
 // Game Boy Advance buttons, as pad fields and as (group, control) names on

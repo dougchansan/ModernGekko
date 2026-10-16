@@ -3,6 +3,7 @@
 
 #include "automation_protocol.hpp"
 #include "pause_menu_host.hpp"
+#include "gba_screen.hpp"
 #include "gc_controller_art.hpp"
 #include "launcher_savestates.hpp"
 #include "quick_boot.hpp"
@@ -1498,6 +1499,7 @@ void DrawNavigationOverlay()
 {
   if (!ImGui::GetCurrentContext())
     return;
+  moderngekko::gba_screen::Draw();
   moderngekko::pause_menu::Draw();
   if (Host_IsPauseMenuOpen())
     return;
@@ -2635,10 +2637,6 @@ bool Host_UpdateDiscordPresenceRaw(const std::string &, const std::string &,
                                    std::int64_t, std::int64_t, int, int) {
   return false;
 }
-std::unique_ptr<GBAHostInterface>
-Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core>) {
-  return nullptr;
-}
 
 namespace moderngekko {
 struct Runtime::Impl {
@@ -2795,6 +2793,17 @@ void ApplyAutomationPad(const automation::PadState& pad)
   ClearAutomationPad(pad.port);
   for (std::size_t i = 0; i < pad.gba.size(); ++i)
     s_automation_gba[pad.port][i] = pad.gba[i];
+  // The GBA's power switch: a reset boots it again, through its BIOS. Dolphin's
+  // own reset waits for the game to poll that port as a controller, which a
+  // linked Colosseum only does once a battle starts: the GBA then rebooted
+  // mid-battle and the link dropped. Netplay polls every frame (and must sync
+  // the reset to everyone), so it keeps Dolphin's path.
+  if (pad.gba_reset) {
+    if (NetPlay::IsNetPlayRunning())
+      Pad::SetGBAReset(pad.port, true);
+    else
+      moderngekko::gba_screen::ResetGba(pad.port);
+  }
   for (std::size_t index = 0; index < pad.controls.size(); ++index)
   {
     ciface::Touch::SetControlState(

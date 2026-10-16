@@ -256,6 +256,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
   src/runtime/shadow_tracker.cpp
   src/runtime/quick_boot.cpp
   src/runtime/attract_video.cpp
+  src/runtime/gba_screen.cpp
   src/runtime/pokemon_icons.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
