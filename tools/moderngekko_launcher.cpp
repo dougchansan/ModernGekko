@@ -1178,7 +1178,21 @@ int main(int argc, char** argv)
     if (!moderngekko::frontend::EnsureColosseumFonts(current_game, font_directory, &font_error))
       SDL_Log("Colosseum fonts unavailable: %s", font_error.c_str());
   }
-  const theme::Fonts fonts = theme::LoadFonts(font_directory.string() + "/");
+  const std::string fallback_font =
+      (release_directory / "Sys" / "Resources" / "Roboto-Medium.ttf").string();
+  theme::Fonts fonts = theme::LoadFonts(font_directory.string() + "/", fallback_font);
+  // Until a game is set up the fallback stands in; once one is (browsed to or
+  // extracted), its fonts are rebuilt and the launcher switches over.
+  fs::path fonts_for_game = theme::HasGameFonts(fonts) ? current_game : fs::path();
+  const auto refresh_fonts = [&]
+  {
+    if (theme::HasGameFonts(fonts) || current_game.empty() || current_game == fonts_for_game)
+      return;
+    fonts_for_game = current_game;
+    std::string font_error;
+    if (moderngekko::frontend::EnsureColosseumFonts(current_game, font_directory, &font_error))
+      fonts = theme::LoadFonts(font_directory.string() + "/", fallback_font);
+  };
   // The Pokemon face portraits (also what the pause menu draws).
   const fs::path icon_directory = user_directory / "Load" / "ColosseumIcons";
   {
@@ -1748,6 +1762,7 @@ int main(int argc, char** argv)
         }
       }
     }
+    refresh_fonts();
 
     // Capture: four frames per shot (fonts bake on first use), pages in order,
     // then the help card open on a display setting and the Slot A card.

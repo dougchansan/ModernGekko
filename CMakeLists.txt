@@ -546,7 +546,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     add_custom_command(TARGET moderngekko-run POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Data/Sys"
-                "$<TARGET_FILE_DIR:moderngekko-run>/Sys")
+                "$<TARGET_FILE_DIR:moderngekko-run>/Sys"
+        # The menus' font until Colosseum's own can be read from the player's
+        # game (Roboto Medium, Apache-2.0, from Dear ImGui's misc/fonts).
+        COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Externals/imgui/imgui/misc/fonts/Roboto-Medium.ttf"
+                "$<TARGET_FILE_DIR:moderngekko-run>/Sys/Resources/Roboto-Medium.ttf")
     if(MODERNGEKKO_DOL_PATCH_MANIFEST)
         add_custom_command(TARGET moderngekko-run POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory

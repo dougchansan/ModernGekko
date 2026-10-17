@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -73,7 +74,7 @@ void Selector(ImDrawList* dl, const Canvas& c, const Fonts& f, float x, float y,
 }
 }  // namespace
 
-Fonts LoadFonts(const std::string& directory)
+Fonts LoadFonts(const std::string& directory, const std::string& fallback_ttf)
 {
   using moderngekko::pause_menu::ColosseumFont;
   Fonts fonts;
@@ -81,7 +82,33 @@ Fonts LoadFonts(const std::string& directory)
   fonts.menu = ColosseumFont(directory, "colo_font3_18px_condensed");
   fonts.small = ColosseumFont(directory, "colo_font4_13px_condensed");
   fonts.body = ColosseumFont(directory, "colo_font2_13px");
+  if (!HasGameFonts(fonts) && !fallback_ttf.empty())
+  {
+    // One TrueType font for every role until the game's are available;
+    // ImGui renders it at whatever size each call asks for.
+    static ImFont* fallback = nullptr;
+    static ImFontAtlas* fallback_atlas = nullptr;
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    if (fallback_atlas != atlas)
+    {
+      fallback_atlas = atlas;
+      std::error_code ec;
+      fallback = std::filesystem::is_regular_file(fallback_ttf, ec) ?
+                     atlas->AddFontFromFileTTF(fallback_ttf.c_str(), 20.0f) :
+                     nullptr;
+    }
+    for (ImFont** role : {&fonts.title, &fonts.menu, &fonts.small, &fonts.body})
+      if (!*role)
+        *role = fallback;
+  }
   return fonts;
+}
+
+bool HasGameFonts(const Fonts& fonts)
+{
+  // The game's four are distinct fonts; the fallback fills every role with one.
+  return fonts.title && fonts.menu && fonts.small && fonts.body &&
+         fonts.title != fonts.menu && fonts.menu != fonts.body;
 }
 
 void Background(ImDrawList* dl, const Canvas& c, ImVec2 screen)

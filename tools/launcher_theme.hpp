@@ -30,10 +30,13 @@ struct Fonts
   ImFont* body = nullptr;   // colo_font2_13px, prose
 };
 
-// Loads the game fonts from `directory` (ending in a separator). Missing fonts
-// fall back to ImGui's default, so the launcher still works before a game is
-// set up.
-Fonts LoadFonts(const std::string& directory);
+// Loads the game fonts from `directory` (ending in a separator). Until a game
+// is set up they are not there: `fallback_ttf` (Roboto Medium, shipped in
+// Sys/Resources) stands in, else ImGui's default. Call again once the game
+// fonts have been extracted; the launcher switches to them.
+Fonts LoadFonts(const std::string& directory, const std::string& fallback_ttf = {});
+// True when every font is the game's own.
+bool HasGameFonts(const Fonts& fonts);
 
 namespace color
 {

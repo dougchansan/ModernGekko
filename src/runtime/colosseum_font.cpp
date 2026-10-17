@@ -274,7 +274,9 @@ ImFont *ColosseumFont(const std::string &directory, const std::string &name) {
   std::unique_ptr<BitmapFont> &font = loaded[name];
   if (!font)
     font = LoadBitmapFont(directory, name);
-  ImFont *result = font ? AddToAtlas(atlas, font.get(), name.c_str()) : nullptr;
+  if (!font)
+    return nullptr;  // not remembered: the files may appear once a game is set up
+  ImFont *result = AddToAtlas(atlas, font.get(), name.c_str());
   added[name] = result;
   return result;
 }
