@@ -59,5 +59,17 @@ int main()
           ColosseumTextUpscale::CombineCoverage(1.0f, 0.0f, 0.0f)) != 1.0f)
     return 14;
 
+  // The smooth-field cut is empty well below the edge level, solid well above it, and half
+  // covered exactly at it.
+  constexpr float half = ColosseumTextUpscale::EDGE_HALF_WIDTH;
+  if (ColosseumTextUpscale::SmoothEdge(0.0f, half) != 0.0f ||
+      ColosseumTextUpscale::SmoothEdge(1.0f, half) != 1.0f ||
+      std::abs(ColosseumTextUpscale::SmoothEdge(ColosseumTextUpscale::EDGE_LEVEL, half) - 0.5f) >
+          0.0001f)
+    return 15;
+  if (ColosseumTextUpscale::SmoothEdge(ColosseumTextUpscale::EDGE_LEVEL - half, half) != 0.0f ||
+      ColosseumTextUpscale::SmoothEdge(ColosseumTextUpscale::EDGE_LEVEL + half, half) != 1.0f)
+    return 16;
+
   return 0;
 }

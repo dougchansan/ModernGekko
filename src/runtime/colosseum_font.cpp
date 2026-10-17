@@ -53,6 +53,25 @@ struct BitmapFont {
     const float bottom = at(x0, y0 + 1) * (1 - tx) + at(x0 + 1, y0 + 1) * tx;
     return top * (1 - ty) + bottom * ty;
   }
+
+  // The smooth field the game's HD text is cut from (ColosseumTextUpscale.h,
+  // GenerateTextSharpenPixelShader): Gaussian-weighted 4x4 native texels, 0..1.
+  float Field(float x, float y) const {
+    constexpr float k =
+        1.0f / (2.0f * ColosseumTextUpscale::SMOOTH_SIGMA * ColosseumTextUpscale::SMOOTH_SIGMA);
+    const int bx = static_cast<int>(std::floor(x - 0.5f));
+    const int by = static_cast<int>(std::floor(y - 0.5f));
+    float field = 0, weights = 0;
+    for (int py = by - 1; py <= by + 2; ++py)
+      for (int px = bx - 1; px <= bx + 2; ++px) {
+        const float dx = px + 0.5f - x, dy = py + 0.5f - y;
+        const float w = std::exp(-(dx * dx + dy * dy) * k);
+        if (px >= 0 && py >= 0 && px < width && py < height)
+          field += w * alpha[static_cast<std::size_t>(py) * width + px];
+        weights += w;
+      }
+    return field / (weights * 255.0f);
+  }
 };
 
 std::unique_ptr<BitmapFont> LoadBitmapFont(const std::string &directory, const std::string &name) {
@@ -179,25 +198,19 @@ bool BakedLoadGlyph(ImFontAtlas *atlas, ImFontConfig *src, ImFontBaked *baked, v
   ImTextureRect *r = ImFontAtlasPackGetRect(atlas, pack_id);
 
   // Resample: average the source pixels each target pixel covers (shrinking),
-  // or, growing, rebuild the edges the way the game's HD text does
-  // (VideoCommon/ColosseumTextUpscale.h): a centre-weighted footprint of
-  // bilinear samples half a texel around the point, then a narrow smoothstep,
-  // so enlarged glyphs come out with clean rounded edges instead of blur.
+  // or, growing, cut the glyph from the same smooth field as the game's HD
+  // text, with an edge about one target pixel wide, so enlarged glyphs have
+  // clean straight and curved edges instead of the bitmap's steps.
   std::vector<unsigned char> pixels(static_cast<std::size_t>(w) * h);
   const float step = 1.0f / raster;  // source pixels per target pixel
   const int taps = std::clamp(static_cast<int>(std::ceil(step)), 1, 4);
+  // The field changes about 0.5 per source pixel across an edge.
+  const float edge = std::min(0.25f, 0.48f / raster);
   for (int py = 0; py < h; ++py) {
     for (int px = 0; px < w; ++px) {
       if (raster > 1.0f) {
-        namespace hd = ColosseumTextUpscale;
-        const float x = g.x + (px + 0.5f) * step, y = g.y + (py + 0.5f) * step;
-        const float r = hd::RECONSTRUCTION_RADIUS;
-        const auto cov = [&](float sx, float sy) { return font->Coverage(sx, sy) / 255.0f; };
-        const float axial = cov(x + r, y) + cov(x - r, y) + cov(x, y + r) + cov(x, y - r);
-        const float diagonal =
-            cov(x + r, y + r) + cov(x - r, y - r) + cov(x + r, y - r) + cov(x - r, y + r);
-        const float coverage =
-            hd::ReconstructCoverage(hd::CombineCoverage(cov(x, y), axial, diagonal));
+        const float coverage = ColosseumTextUpscale::SmoothEdge(
+            font->Field(g.x + (px + 0.5f) * step, g.y + (py + 0.5f) * step), edge);
         pixels[static_cast<std::size_t>(py) * w + px] =
             static_cast<unsigned char>(std::lround(coverage * 255.0f));
         continue;
