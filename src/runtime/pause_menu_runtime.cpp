@@ -2845,7 +2845,15 @@ void Draw() {
   const float max_h = io.DisplaySize.y * 0.92f;
 
   // Row geometry: Start-menu buttons on the short pages, panels in the lists.
-  const float button_h = 68 * s, button_gap = 12 * s;
+  // The buttons shrink (down to 70%) so the Home page's ten fit without
+  // scrolling.
+  float button_h = 68 * s, button_gap = 12 * s;
+  if (!list_page && !rows.empty()) {
+    const float room = max_h - header_h - footer_h - gap * 4 - 8 * s;
+    const float fit = std::clamp(room / (rows.size() * (button_h + button_gap)), 0.7f, 1.0f);
+    button_h *= fit;
+    button_gap *= fit;
+  }
   const float panel_h = (page == Page::Shadow ? 64.0f : 50.0f) * s, panel_gap = 8 * s, section_h = 38 * s;
   float list_content_h = 0;
   if (list_page) {
@@ -3018,13 +3026,15 @@ void Draw() {
       const ImVec2 b(rail_x - shift, child_origin.y + row_bottom);
       st::ChromePlate(rows_draw, a, b, 18 * s, 8 * s, col::kTealTop, col::kTealBottom);
       const std::string label = Upper(rows[row]);
-      const ImVec2 ls = st::TextSize(font, row_size * 1.3f, label);
+      // Text shrinks a little less than smaller buttons do.
+      const float label_size = row_size * 1.3f * std::min(1.0f, button_h / (68 * s) + 0.12f);
+      const ImVec2 ls = st::TextSize(font, label_size, label);
       const ImVec2 tp(a.x + (bw - ls.x) * 0.5f, a.y + (button_h - ls.y) * 0.5f);
       if (focused)
-        st::OutlinedText(rows_draw, font, row_size * 1.3f, tp, col::kFocusGreen, label, 2.0f * s,
+        st::OutlinedText(rows_draw, font, label_size, tp, col::kFocusGreen, label, 2.0f * s,
                          st::Rgb(4, 30, 10, 240));
       else
-        st::EngravedText(rows_draw, font, row_size * 1.3f, tp, col::kDimTeal, label, 1.5f * s);
+        st::EngravedText(rows_draw, font, label_size, tp, col::kDimTeal, label, 1.5f * s);
       y = row_bottom + button_gap;
     }
     // Mouse: the whole row is a button.
