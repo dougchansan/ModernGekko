@@ -5,12 +5,13 @@
 
 namespace moderngekko::pause_menu {
 
-enum class Page { Closed, Home, Settings, Controls, Shadow, Developer, QuitConfirm, RestartConfirm };
+enum class Page { Closed, Home, Settings, Controls, Online, Shadow, Developer, QuitConfirm, RestartConfirm };
 enum class Action {
   None,
   Resume,
   Settings,
   Controls,
+  Online,
   Shadow,
   Developer,
   PhotoMode,
@@ -44,8 +45,8 @@ public:
   bool blocks_game_input() const { return is_open() || release_gate_; }
   // Pages whose row count the runtime supplies.
   bool custom_page() const {
-    return page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Shadow ||
-           page_ == Page::Developer;
+    return page_ == Page::Settings || page_ == Page::Controls || page_ == Page::Online ||
+           page_ == Page::Shadow || page_ == Page::Developer;
   }
   void set_rows(std::size_t rows) {
     if (custom_page())
@@ -67,10 +68,11 @@ public:
       return custom_rows_;
     switch (page_) {
     case Page::Home:
-      return 9;
+      return 10;
     case Page::Settings:
       return 4;
     case Page::Controls:
+    case Page::Online:
     case Page::Shadow:
     case Page::Developer:
       return 1;
@@ -126,23 +128,27 @@ public:
         focus_ = 0;
         return Action::Controls;
       case 3:
+        page_ = Page::Online;
+        focus_ = 0;
+        return Action::Online;
+      case 4:
         page_ = Page::Shadow;
         focus_ = 0;
         return Action::Shadow;
-      case 4:
+      case 5:
         close();
         return Action::PhotoMode;
-      case 5:
-        return Action::SaveCheckpoint;
       case 6:
+        return Action::SaveCheckpoint;
+      case 7:
         page_ = Page::Developer;
         focus_ = 0;
         return Action::Developer;
-      case 7:
+      case 8:
         page_ = Page::RestartConfirm;
         focus_ = 0;
         return Action::None;
-      case 8:
+      case 9:
         page_ = Page::QuitConfirm;
         focus_ = 0;
         return Action::None;
@@ -151,6 +157,7 @@ public:
     case Page::Settings:
       return row + 1 == row_count() ? back() : Action::AdjustSetting;
     case Page::Controls:
+    case Page::Online:
       return row + 1 == row_count() ? back() : Action::AdjustSetting;
     case Page::Shadow:
       return row + 1 == row_count() ? back() : Action::None;

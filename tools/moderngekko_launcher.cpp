@@ -555,6 +555,49 @@ void WriteGbaSettings(const fs::path& user_directory, const GbaSettings& setting
   ini.Save(path);
 }
 
+// Colosseum Battle online ([OnlineBattle] in config.ini). The online battle
+// mod reads turn_seconds / auto_choose; the address and port reach it as
+// --env COLO_ONLINE_* when the launcher starts a battle. The keys avoid the
+// names the frontend config writer owns in every section (address, port).
+struct OnlineBattleSettings
+{
+  std::string address = "127.0.0.1";
+  int port = 27100;
+  int seat = 1;  // the host's seat; the joining player takes the other
+  int turn_seconds = 0;
+  bool auto_choose = true;
+};
+
+OnlineBattleSettings ReadOnlineBattleSettings(const fs::path& user_directory)
+{
+  Common::IniFile ini;
+  ini.Load((user_directory / "config.ini").string());
+  auto* section = ini.GetOrCreateSection("OnlineBattle");
+  OnlineBattleSettings settings;
+  section->Get("battle_address", &settings.address, settings.address);
+  section->Get("battle_port", &settings.port, settings.port);
+  section->Get("seat", &settings.seat, settings.seat);
+  section->Get("turn_seconds", &settings.turn_seconds, settings.turn_seconds);
+  section->Get("auto_choose", &settings.auto_choose, settings.auto_choose);
+  settings.port = std::clamp(settings.port, 1, 65535);
+  settings.seat = settings.seat == 2 ? 2 : 1;
+  return settings;
+}
+
+void WriteOnlineBattleSettings(const fs::path& user_directory, const OnlineBattleSettings& settings)
+{
+  const std::string path = (user_directory / "config.ini").string();
+  Common::IniFile ini;
+  ini.Load(path);
+  auto* section = ini.GetOrCreateSection("OnlineBattle");
+  section->Set("battle_address", settings.address);
+  section->Set("battle_port", settings.port);
+  section->Set("seat", settings.seat);
+  section->Set("turn_seconds", settings.turn_seconds);
+  section->Set("auto_choose", settings.auto_choose);
+  ini.Save(path);
+}
+
 // The pad that plays player 2's GBA: the first gamepad that is not player
 // 1's, or player 1's own when it is the only one. Buttons sit where a
 // handheld has them (A on the right face button, B below it).
@@ -613,11 +656,12 @@ enum Page
   kControllers,
   kMods,
   kNetplay,
+  kOnlineBattle,
   kPageCount,
 };
 constexpr std::array<const char*, kPageCount> kPageNames = {
-    "PLAY",     "MEMORY CARDS", "SAVE STATES",     "DISPLAY",
-    "GAMEPLAY", "CONTROLLERS",  "MODS & OVERLAYS", "NETPLAY"};
+    "PLAY",     "MEMORY CARDS", "SAVE STATES",     "DISPLAY",      "GAMEPLAY",
+    "CONTROLLERS",  "MODS & OVERLAYS", "NETPLAY", "ONLINE BATTLE"};
 constexpr std::array<const char*, kPageCount> kPageHelp = {
     "Start the game, from the memory card or from a save state.",
     "Your memory cards. Each card is one Colosseum save; the one in Slot A is played.",
@@ -626,7 +670,8 @@ constexpr std::array<const char*, kPageCount> kPageHelp = {
     "Frame rate, speed and the safety nets: autosaves and stall recovery.",
     "Which gamepad plays, and the on-screen input display.",
     "Minimap, overlays, and the HD texture and text upgrades.",
-    "Play with a friend over the internet. Still experimental."};
+    "Play with a friend over the internet. Still experimental.",
+    "Colosseum Battle against a friend's own save, each on their own game."};
 
 std::string Upper(std::string text)
 {
@@ -952,6 +997,11 @@ int main(int argc, char** argv)
   std::snprintf(netplay_address.data(), netplay_address.size(), "%s",
                 config.netplay_address.c_str());
   int netplay_port = config.netplay_port;
+  OnlineBattleSettings battle = ReadOnlineBattleSettings(user_directory);
+  std::array<char, 256> battle_address{};
+  std::snprintf(battle_address.data(), battle_address.size(), "%s", battle.address.c_str());
+  std::array<char, 8> battle_port_text{};
+  std::snprintf(battle_port_text.data(), battle_port_text.size(), "%d", battle.port);
   bool automatic_buffer = config.netplay_buffer == "auto";
   int manual_buffer = automatic_buffer ? 5 : std::stoi(config.netplay_buffer);
   int resolution_index = 0;
@@ -1113,6 +1163,8 @@ int main(int argc, char** argv)
     Solo,
     Host,
     Join,
+    BattleHost,  // Colosseum Battle online: an ordinary game plus the link
+    BattleJoin,
   };
   bool done = false;
   LaunchMode launch_mode = LaunchMode::None;
@@ -1602,6 +1654,22 @@ int main(int argc, char** argv)
       done = true;
     }
   };
+  const auto save_battle = [&]
+  {
+    battle.address = battle_address.data();
+    battle.port = std::clamp(std::atoi(battle_port_text.data()), 1, 65535);
+    std::snprintf(battle_port_text.data(), battle_port_text.size(), "%d", battle.port);
+    WriteOnlineBattleSettings(user_directory, battle);
+    return true;
+  };
+  const auto start_battle = [&](LaunchMode mode)
+  {
+    if (!ensure_controller() || !save_battle())
+      return;
+    selected_savestate = -1;  // a battle starts from the memory card
+    launch_mode = mode;
+    done = true;
+  };
   const auto browse_for_image = [&]
   {
     static constexpr SDL_DialogFileFilter filters[] = {
@@ -1780,7 +1848,7 @@ int main(int argc, char** argv)
     theme::SteelPanel(dl, cv, 40, 110, 400, 690, 16);
     for (int i = 0; i < kPageCount; ++i)
     {
-      const float y = 134 + i * 64;
+      const float y = 134 + i * 60;
       if (mouse_in(48, y - 8, 392, y + 52))
       {
         if (mouse_moved && !in_page)
@@ -2576,6 +2644,56 @@ int main(int argc, char** argv)
                             [&] { start_netplay(LaunchMode::Join); }));
       break;
     }
+    case kOnlineBattle:
+    {
+      rows_y = 250;
+      rows_step = 56;
+      theme::Text(dl, cv, fonts.body, 13, 450, 214,
+                  "Each player uses their own save. In the game: Colosseum Battle, Gang Battle, "
+                  "two controllers.",
+                  theme::color::kGrey, false);
+      theme::Row address = text_input("HOST / IP", battle_address.data(), battle_address.size(),
+                                      false, "The host's address, for joining.");
+      address.changed = [&](const theme::Row&) { return save_battle(); };
+      rows.push_back(std::move(address));
+      theme::Row port = text_input("TCP PORT", battle_port_text.data(), battle_port_text.size(),
+                                   false, "The TCP port the host listens on (default 27100). The "
+                                          "host must allow it through their firewall.");
+      port.changed = [&](const theme::Row&) { return save_battle(); };
+      rows.push_back(std::move(port));
+      rows.push_back(choice("HOST PLAYS AS", {"PLAYER 1", "PLAYER 2"}, battle.seat - 1,
+                            "Which player the host is. The joining player is the other.",
+                            [&](int index)
+                            {
+                              battle.seat = index + 1;
+                              return save_battle();
+                            }));
+      static constexpr std::array<int, 4> kTimers{0, 30, 60, 120};
+      const auto timer = std::find(kTimers.begin(), kTimers.end(), battle.turn_seconds);
+      rows.push_back(choice("TURN TIMER", {"OFF", "30 SECONDS", "1 MINUTE", "2 MINUTES"},
+                            timer == kTimers.end() ? 0 : static_cast<int>(timer - kTimers.begin()),
+                            "Time for each turn's choice. Player 1's setting applies to both.",
+                            [&](int index)
+                            {
+                              battle.turn_seconds = kTimers[static_cast<std::size_t>(index)];
+                              return save_battle();
+                            }));
+      rows.push_back(choice("WHEN TIME RUNS OUT", {"CHOOSE FOR ME", "GIVE UP"},
+                            battle.auto_choose ? 0 : 1,
+                            "What happens to a player whose turn timer runs out.",
+                            [&](int index)
+                            {
+                              battle.auto_choose = index == 0;
+                              return save_battle();
+                            }));
+      rows.push_back(action("START", "HOST BATTLE",
+                            "Start the game and wait for the other player to connect.",
+                            [&] { start_battle(LaunchMode::BattleHost); }));
+      rows.push_back(action("CONNECT", "JOIN BATTLE",
+                            "Start the game and connect to the host address above.",
+                            [&] { start_battle(LaunchMode::BattleJoin); }));
+      break;
+    }
     }
     if (!rows.empty() && !(page == kPlay && !current_metadata))
     {
@@ -3077,6 +3195,19 @@ int main(int argc, char** argv)
         argument_storage.emplace_back("--load-state");
         argument_storage.emplace_back(
             launcher_savestates[static_cast<std::size_t>(selected_savestate)].string());
+      }
+      if (launch_mode == LaunchMode::BattleHost || launch_mode == LaunchMode::BattleJoin)
+      {
+        argument_storage.emplace_back("--env");
+        argument_storage.emplace_back(
+            launch_mode == LaunchMode::BattleHost ?
+                "COLO_ONLINE_HOST=" + std::to_string(battle.port) :
+                "COLO_ONLINE_JOIN=" + battle.address + ":" + std::to_string(battle.port));
+        if (launch_mode == LaunchMode::BattleHost)
+        {
+          argument_storage.emplace_back("--env");
+          argument_storage.emplace_back("COLO_ONLINE_PLAYER=" + std::to_string(battle.seat));
+        }
       }
       if (launch_mode == LaunchMode::Host)
         argument_storage.emplace_back("--netplay-host");

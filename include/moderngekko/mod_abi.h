@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 #define MODERNGEKKO_MOD_ABI_VERSION 1u
-#define MODERNGEKKO_MOD_HOST_ABI_VERSION 1u
+#define MODERNGEKKO_MOD_HOST_ABI_VERSION 2u
 #define MODERNGEKKO_GET_MOD_SYMBOL "moderngekko_get_mod"
 
 #if defined(_WIN32)
@@ -101,6 +101,15 @@ typedef struct ModernGekkoModHostApi
        Plain, non-yielding guest functions only, from a hook. May be null
        (older hosts, or a runtime that cannot call guest code). */
     int (*call_guest)(void* user_data, CPUState* state, uint32_t address);
+    /* Host ABI 2 and later (check abi_version first; older hosts pass a
+       shorter struct). */
+    /* Reads `key` in `[section]` of the user's config.ini into `out` (always
+       NUL-terminated); nonzero if the key exists. Any thread. */
+    int (*get_setting)(void* user_data, const char* section, const char* key,
+                       char* out, uint32_t out_size);
+    /* Shows `text` on screen until replaced or cleared (NULL or ""), one
+       line per `key` (use the mod id). Any thread. */
+    void (*set_status)(void* user_data, const char* key, const char* text);
 } ModernGekkoModHostApi;
 
 typedef struct ModernGekkoModDesc

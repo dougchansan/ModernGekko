@@ -9,7 +9,9 @@
 #include <atomic>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -168,6 +170,9 @@ struct ModManager::Impl {
   }
 
   static int CallGuestThunk(void *, CPUState *state, std::uint32_t address);
+  static int GetSettingThunk(void *, const char *section, const char *key,
+                             char *out, std::uint32_t out_size);
+  static void SetStatusThunk(void *, const char *key, const char *text);
   static ModernGekkoModFunction FindExportThunk(void *user_data,
                                                 const char *provider_id,
                                                 const char *export_name) {
@@ -200,6 +205,8 @@ ModManager::ModManager() : m_impl(std::make_unique<Impl>()) {
   m_impl->host_api.trigger_event = Impl::TriggerEventThunk;
   m_impl->host_api.find_export = Impl::FindExportThunk;
   m_impl->host_api.call_guest = Impl::CallGuestThunk;
+  m_impl->host_api.get_setting = Impl::GetSettingThunk;
+  m_impl->host_api.set_status = Impl::SetStatusThunk;
 }
 
 ModManager::~ModManager() { Unload(); }
@@ -589,6 +596,91 @@ void ModManager::SetGuestCaller(GuestCaller caller) { s_guest_caller.store(calle
 int ModManager::Impl::CallGuestThunk(void *, CPUState *state, std::uint32_t address) {
   const GuestCaller caller = s_guest_caller.load();
   return caller && state && caller(state, address) ? 1 : 0;
+}
+
+namespace {
+std::mutex s_host_mutex;
+std::filesystem::path s_config_path;
+std::vector<std::pair<std::string, std::string>> s_status_lines;
+
+std::string Trim(const std::string &text) {
+  const auto first = text.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos)
+    return {};
+  const auto last = text.find_last_not_of(" \t\r\n");
+  return text.substr(first, last - first + 1);
+}
+
+bool EqualsNoCase(const std::string &a, const std::string &b) {
+  return a.size() == b.size() &&
+         std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+           return std::tolower(static_cast<unsigned char>(x)) ==
+                  std::tolower(static_cast<unsigned char>(y));
+         });
+}
+}
+
+void ModManager::SetConfigPath(std::filesystem::path path) {
+  std::lock_guard lock(s_host_mutex);
+  s_config_path = std::move(path);
+}
+
+std::vector<std::string> ModManager::StatusLines() {
+  std::lock_guard lock(s_host_mutex);
+  std::vector<std::string> lines;
+  for (const auto &[key, text] : s_status_lines)
+    lines.push_back(text);
+  return lines;
+}
+
+int ModManager::Impl::GetSettingThunk(void *, const char *section, const char *key,
+                                      char *out, std::uint32_t out_size) {
+  if (!section || !key || !out || out_size == 0)
+    return 0;
+  out[0] = '\0';
+  std::filesystem::path path;
+  {
+    std::lock_guard lock(s_host_mutex);
+    path = s_config_path;
+  }
+  std::ifstream file(path);
+  std::string line;
+  bool in_section = false;
+  while (std::getline(file, line)) {
+    line = Trim(line);
+    if (line.empty() || line[0] == ';' || line[0] == '#')
+      continue;
+    if (line.front() == '[' && line.back() == ']') {
+      in_section = EqualsNoCase(Trim(line.substr(1, line.size() - 2)), section);
+      continue;
+    }
+    const auto equals = line.find('=');
+    if (!in_section || equals == std::string::npos ||
+        !EqualsNoCase(Trim(line.substr(0, equals)), key))
+      continue;
+    const std::string value = Trim(line.substr(equals + 1));
+    const std::size_t size = std::min<std::size_t>(value.size(), out_size - 1);
+    std::memcpy(out, value.data(), size);
+    out[size] = '\0';
+    return 1;
+  }
+  return 0;
+}
+
+void ModManager::Impl::SetStatusThunk(void *, const char *key, const char *text) {
+  if (!key)
+    return;
+  std::lock_guard lock(s_host_mutex);
+  const auto found = std::find_if(s_status_lines.begin(), s_status_lines.end(),
+                                  [&](const auto &line) { return line.first == key; });
+  if (!text || !*text) {
+    if (found != s_status_lines.end())
+      s_status_lines.erase(found);
+  } else if (found != s_status_lines.end()) {
+    found->second = text;
+  } else {
+    s_status_lines.emplace_back(key, text);
+  }
 }
 
 bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {

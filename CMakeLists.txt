@@ -56,6 +56,8 @@ set(MODERNGEKKO_TEXT_UPSCALE_MOD_PACKAGE "" CACHE STRING
     "Optional mod package loaded when text upscaling is enabled")
 set(MODERNGEKKO_MINIMAP_MOD_PACKAGE "" CACHE STRING
     "Optional mod package loaded when the high-contrast minimap is enabled")
+set(MODERNGEKKO_ONLINE_BATTLE_MOD_PACKAGE "" CACHE STRING
+    "Optional mod package loaded for an online Colosseum Battle (COLO_ONLINE_HOST/JOIN)")
 set(MODERNGEKKO_DISC_PREPARER_OUTPUT_NAME "" CACHE STRING
     "Optional adjacent disc preparation executable")
 set(MODERNGEKKO_DOL_PATCH_MANIFEST "" CACHE FILEPATH
@@ -526,6 +528,10 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     if(MODERNGEKKO_MINIMAP_MOD_PACKAGE)
         target_compile_definitions(moderngekko-run PRIVATE
             MODERNGEKKO_MINIMAP_MOD_PACKAGE="${MODERNGEKKO_MINIMAP_MOD_PACKAGE}")
+    endif()
+    if(MODERNGEKKO_ONLINE_BATTLE_MOD_PACKAGE)
+        target_compile_definitions(moderngekko-run PRIVATE
+            MODERNGEKKO_ONLINE_BATTLE_MOD_PACKAGE="${MODERNGEKKO_ONLINE_BATTLE_MOD_PACKAGE}")
     endif()
     if(MODERNGEKKO_USER_DIRECTORY_IN_DOCUMENTS)
         target_compile_definitions(moderngekko-run PRIVATE

@@ -59,6 +59,7 @@ void Usage() {
                "       [--nickname <name>] [--buffer <auto|1-20>] "
                "[--controller <device>]...\n"
                "       [--gba-port <1-4> --gba-rom <rom.gba>] [--gba-bios <bios.bin>]\n"
+               "       [--env <NAME=value>]... (for mods, e.g. COLO_ONLINE_HOST=27100)\n"
                "       Automation protocol: drop key=value command files into "
                "<automation-dir>/commands.\n"
                "       Supported commands: pause, resume, stop, clear_pad, "
@@ -306,7 +307,20 @@ int RunMain(int argc, char **argv) {
       netplay_buffer = value("--buffer");
     else if (arg == "--controller")
       netplay_controllers.emplace_back(value("--controller"));
-    else if (arg == "--help" || arg == "-h") {
+    else if (arg == "--env") {
+      // An environment variable for mods, set before they load.
+      const std::string assignment = value("--env");
+      const auto equals = assignment.find('=');
+      if (equals == 0 || equals == std::string::npos) {
+        std::cerr << "--env needs NAME=value\n";
+        return 2;
+      }
+#if defined(_WIN32)
+      _putenv_s(assignment.substr(0, equals).c_str(), assignment.c_str() + equals + 1);
+#else
+      setenv(assignment.substr(0, equals).c_str(), assignment.c_str() + equals + 1, 1);
+#endif
+    } else if (arg == "--help" || arg == "-h") {
       Usage();
       return 0;
     } else {
@@ -411,6 +425,15 @@ int RunMain(int argc, char **argv) {
     AddOptionalMod(&config.mod_directories, executable_directory,
                    MODERNGEKKO_MINIMAP_MOD_PACKAGE,
                    frontend_config.minimap_high_contrast);
+#endif
+#ifdef MODERNGEKKO_ONLINE_BATTLE_MOD_PACKAGE
+    // Colosseum Battle online: the launcher passes --env COLO_ONLINE_HOST or
+    // COLO_ONLINE_JOIN.
+    const char *online_host = std::getenv("COLO_ONLINE_HOST");
+    const char *online_join = std::getenv("COLO_ONLINE_JOIN");
+    AddOptionalMod(&config.mod_directories, executable_directory,
+                   MODERNGEKKO_ONLINE_BATTLE_MOD_PACKAGE,
+                   (online_host && *online_host) || (online_join && *online_join));
 #endif
   }
 

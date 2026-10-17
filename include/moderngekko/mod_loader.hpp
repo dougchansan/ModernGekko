@@ -62,6 +62,12 @@ public:
   using GuestCaller = bool (*)(CPUState *state, std::uint32_t address);
   static void SetGuestCaller(GuestCaller caller);
 
+  // The config.ini mods read through ModernGekkoModHostApi::get_setting.
+  static void SetConfigPath(std::filesystem::path path);
+  // Status lines mods set through ModernGekkoModHostApi::set_status, in the
+  // order they were first set; the overlay draws them.
+  static std::vector<std::string> StatusLines();
+
   ModLoadReport Load(const std::vector<ModSource> &sources,
                      const std::string &game_id);
   ModLoadReport

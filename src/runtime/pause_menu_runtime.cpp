@@ -163,6 +163,10 @@ struct Menu {
   bool boot_uncapped = false;  // config.ini [Gameplay] EnemyLevels: +percent (0, 10, 25, 50)
   int battle_speed = 1;
   bool skip_intro = false;
+  // Online battle ([OnlineBattle] in config.ini; read by the online battle
+  // mod, player 1's apply to both players).
+  int online_turn_seconds = 0;  // 0 = no timer, else 30 / 60 / 120
+  bool online_auto_choose = true;
   std::atomic<bool> first_person_active{false};
   // Radeon settings (config.ini [AMD]): -1 leave the driver's value, 0 off,
   // 1 on; and the driver's reported state (-1 unsupported), refreshed when the
@@ -1277,6 +1281,36 @@ std::string GameSpeedLabel(int index) {
   return kLabels[static_cast<std::size_t>(std::clamp(index, 0, 4))];
 }
 
+// Online battle page: the turn timer and what a timeout does. The online
+// battle mod reads [OnlineBattle] when a battle starts.
+constexpr std::array<int, 4> kOnlineTimers{0, 30, 60, 120};
+
+std::string OnlineTimerLabel(int seconds) {
+  return seconds <= 0 ? "Off" : seconds < 60 ? std::to_string(seconds) + " seconds"
+                     : seconds == 60       ? "1 minute"
+                                           : std::to_string(seconds / 60) + " minutes";
+}
+
+void AdjustOnline(const std::shared_ptr<Menu> &menu, int direction) {
+  if (menu->policy.focus() == 0) {
+    const auto found = std::find(kOnlineTimers.begin(), kOnlineTimers.end(), menu->online_turn_seconds);
+    const int index = found == kOnlineTimers.end() ? 0 : static_cast<int>(found - kOnlineTimers.begin());
+    const int count = static_cast<int>(kOnlineTimers.size());
+    menu->online_turn_seconds = kOnlineTimers[static_cast<std::size_t>((index + count + direction) % count)];
+  } else if (menu->policy.focus() == 1) {
+    menu->online_auto_choose = !menu->online_auto_choose;
+  } else {
+    return;
+  }
+  Common::IniFile ini;
+  ini.Load(menu->config_path);
+  auto *section = ini.GetOrCreateSection("OnlineBattle");
+  section->Set("turn_seconds", menu->online_turn_seconds);
+  section->Set("auto_choose", menu->online_auto_choose);
+  ini.Save(menu->config_path);
+  menu->status = "Player 1's online settings apply to both players.";
+}
+
 void AdjustDeveloper(const std::shared_ptr<Menu> &menu, int direction, bool accept) {
   switch (static_cast<int>(menu->policy.focus())) {
   case kDebugViewRow:
@@ -1391,6 +1425,10 @@ void Adjust(const std::shared_ptr<Menu> &menu, int direction) {
     direction = 1;  // other rows treat Enter / A like Right
   if (menu->policy.page() == Page::Controls) {
     CycleDevice(direction);
+    return;
+  }
+  if (menu->policy.page() == Page::Online) {
+    AdjustOnline(menu, direction);
     return;
   }
   if (menu->policy.page() == Page::Developer) {
@@ -1898,8 +1936,13 @@ std::vector<std::string> Rows(const Menu &menu) {
   };
   switch (menu.policy.page()) {
   case Page::Home:
-    return {"Resume adventure", "Settings", "Controls", "Shadow Pok\xC3\xA9mon",
+    return {"Resume adventure", "Settings", "Controls", "Online battle", "Shadow Pok\xC3\xA9mon",
             "Photo mode", "Save state", "Developer", "Restart game", "Quit game"};
+  case Page::Online:
+    return {std::string("Turn timer   ") + OnlineTimerLabel(menu.online_turn_seconds),
+            std::string("When time runs out   ") +
+                (menu.online_auto_choose ? "Choose for me" : "Give up"),
+            "Back"};
   case Page::Shadow: {
     std::vector<std::string> rows;
     for (const auto &entry : menu.shadow.entries) {
@@ -2058,6 +2101,11 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
   section->Get("FirstPersonSensitivity", &menu->first_person_sensitivity, 0);
   section->Get("LookAcceleration", &menu->look_acceleration, 1);
   menu->look_acceleration = std::clamp(menu->look_acceleration, 0, 2);
+  {
+    auto *online = ini.GetOrCreateSection("OnlineBattle");
+    online->Get("turn_seconds", &menu->online_turn_seconds, 0);
+    online->Get("auto_choose", &menu->online_auto_choose, true);
+  }
   {
     auto *gameplay = ini.GetOrCreateSection("Gameplay");
     ini.GetOrCreateSection("World")->Get("TimeOfDay", &menu->time_of_day, 0);
@@ -2227,14 +2275,16 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
         menu->policy.activate(1);
       else if (target == "controls")
         menu->policy.activate(2);
+      else if (target == "online")
+        menu->policy.activate(3);
       else if (target == "quit")
-        menu->policy.activate(8);
+        menu->policy.activate(9);
       else if (target == "developer")
-        menu->policy.activate(6);
+        menu->policy.activate(7);
       else if (target == "photo")
-        ActionHost(menu, menu->policy.activate(4));
+        ActionHost(menu, menu->policy.activate(5));
       else if (target == "shadow")
-        ActionHost(menu, menu->policy.activate(3));
+        ActionHost(menu, menu->policy.activate(4));
       SyncPause(menu, was_open);
     }).detach();
   }
@@ -2252,7 +2302,7 @@ void Initialize(const RuntimeConfig &config, ModManager *mods) {
       std::lock_guard lock(menu->mutex);
       const bool was_open = menu->policy.is_open();
       menu->policy.open();
-      ActionHost(menu, menu->policy.activate(6));
+      ActionHost(menu, menu->policy.activate(7));
       menu->policy.set_rows(kDeveloperRows);
       for (std::size_t start = 0; start < spec.size();) {
         auto end = spec.find(',', start);
@@ -2706,11 +2756,35 @@ void DrawToast(Menu &menu) {
                    st::Rgb(6, 16, 20, static_cast<int>(235 * fade)));
 }
 
+// Status lines mods set (ModernGekkoModHostApi::set_status), e.g. an online
+// battle's "Waiting for the other player": small panels along the top edge.
+void DrawModStatus() {
+  namespace st = style;
+  const std::vector<std::string> lines = moderngekko::ModManager::StatusLines();
+  if (lines.empty())
+    return;
+  const auto &io = ImGui::GetIO();
+  ImFont *font = MenuFont();
+  const float s = std::clamp(io.DisplaySize.y / 900.0f, 0.65f, 1.6f), size = 20 * s;
+  ImDrawList *draw = ImGui::GetForegroundDrawList();
+  float y = 6 * s;
+  for (const std::string &line : lines) {
+    const ImVec2 ts = st::TextSize(font, size, line);
+    const ImVec2 a((io.DisplaySize.x - ts.x) * 0.5f - 16 * s, y),
+        b(a.x + ts.x + 32 * s, y + ts.y + 12 * s);
+    st::FillChamfer(draw, a, b, 6 * s, st::Rgb(18, 76, 94, 200), st::Rgb(8, 40, 54, 200));
+    st::OutlinedText(draw, font, size, ImVec2(a.x + 16 * s, a.y + 6 * s), st::Rgb(246, 248, 250, 255),
+                     line, 1.2f * s, st::Rgb(6, 16, 20, 235));
+    y = b.y + 4 * s;
+  }
+}
+
 void Draw() {
   namespace st = style;
   namespace col = style::color;
   const auto menu = current.load();
   attract::Draw();  // under everything else this overlay draws
+  DrawModStatus();
   if (menu && DrawBootCover(*menu))
     return;
   if (menu && menu->photo_mode) {
@@ -2747,8 +2821,8 @@ void Draw() {
   menu->policy.set_rows(rows.size());
   const Page page = menu->policy.page();
   const bool list_page =
-      page == Page::Settings || page == Page::Controls || page == Page::Shadow ||
-      page == Page::Developer;
+      page == Page::Settings || page == Page::Controls || page == Page::Online ||
+      page == Page::Shadow || page == Page::Developer;
 
   const auto &io = ImGui::GetIO();
   ImFont *font = MenuFont();
@@ -2808,6 +2882,7 @@ void Draw() {
                         : page == Page::RestartConfirm ? "RESTART THE GAME?"
                         : page == Page::Settings       ? "SETTINGS"
                         : page == Page::Controls       ? "CONTROLS"
+                        : page == Page::Online         ? "ONLINE BATTLE"
                         : page == Page::Shadow         ? "SHADOW POK\xC3\xA9MON"
                         : page == Page::Developer      ? "DEVELOPER"
                                                        : "PAUSE";
@@ -3351,6 +3426,7 @@ void Host_PauseMenuTick() {
   }
   const std::size_t rows = page == Page::Settings   ? kSettingsRows
                            : page == Page::Controls ? 2
+                           : page == Page::Online   ? 3
                            : page == Page::Shadow   ? menu->shadow.entries.size() + 1
                            : page == Page::Developer ? kDeveloperRows
                                                     : 0;
@@ -3376,6 +3452,7 @@ void Host_PauseMenuTick() {
       (direction != menu->adjust_direction || now >= menu->next_adjust) &&
       (menu->policy.page() == Page::Settings ||
        menu->policy.page() == Page::Controls ||
+       menu->policy.page() == Page::Online ||
        menu->policy.page() == Page::Developer) &&
       menu->policy.focus() + 1 < menu->policy.row_count()) {
     Adjust(menu, direction);

@@ -3555,6 +3555,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
       "ModernGekko - " + impl->metadata.game_name + " [" +
       impl->metadata.disc_id + "]");
   impl->mods = std::make_unique<ModManager>();
+  ModManager::SetConfigPath(impl->config.user_directory / "config.ini");
   const ModLoadReport mod_report = impl->mods->LoadDirectories(
       impl->config.mod_directories, impl->metadata.disc_id);
   for (const ModLoadIssue &issue : mod_report.issues)
