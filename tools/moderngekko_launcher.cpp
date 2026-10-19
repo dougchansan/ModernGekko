@@ -1993,24 +1993,45 @@ int main(int argc, char** argv)
     {
       if (current_metadata && module_missing)
       {
-        rows.push_back(info("One more step before the first play: the game is built from your "
-                            "own disc on this computer."));
-        rows.push_back(info("This downloads a compiler once (about 80 MB) and takes 5 to 15 "
-                            "minutes."));
-        rows.push_back(action("SET UP", "BUILD GAME",
-                              "Converts the game's code from your extracted disc and compiles "
-                              "it. Nothing from the game is downloaded.",
-                              [&] { start_module_build(); }, !extraction.running));
-        if (extraction.running)
+        // One-time build, laid out like the Play page: the big button where PLAY sits, the
+        // explanation where the Slot A card text goes, progress underneath.
+        const bool building = extraction.running;
+        const bool focused = in_page && !building;
+        if (!building && ((in_page && page_in.accept) ||
+                          (clicked && mouse_in(450, 220, 820, 330))))
+          start_module_build();
+        theme::SteelPanel(dl, cv, 450, 220, 820, 330, 18,
+                          focused ? IM_COL32(110, 26, 30, 235) : theme::color::kPlay);
+        const char* label = building ? "BUILDING..." : "BUILD GAME";
+        theme::Text(dl, cv, fonts.title, 40, 635 - theme::TextWidth(fonts.title, 40, label) / 2,
+                    252, label);
+        if (focused)
+          theme::Chevron(dl, cv, 478, 258);
+        theme::Text(dl, cv, fonts.small, 26, 860, 222, "ONE-TIME SETUP", theme::color::kGold);
+        theme::Text(dl, cv, fonts.body, 15, 860, 262, "The game is built from your own disc",
+                    theme::color::kGrey, false);
+        theme::Text(dl, cv, fonts.body, 15, 860, 286, "on this computer before the first play.",
+                    theme::color::kGrey, false);
+        theme::Text(dl, cv, fonts.body, 15, 860, 318, "A compiler is downloaded once (about",
+                    theme::color::kGrey, false);
+        theme::Text(dl, cv, fonts.body, 15, 860, 342, "80 MB); the build takes 5 to 15 minutes.",
+                    theme::color::kGrey, false);
+        if (building)
         {
           const float progress = std::min(
               1.0f, static_cast<float>(extraction.completed.load()) / extraction.total.load());
-          theme::SliderBar(dl, cv, 454, 430, 760, progress);
+          theme::SliderBar(dl, cv, 454, 410, 756, progress);
+          std::string step;
+          {
+            std::lock_guard lock(extraction.mutex);
+            step = extraction.status;
+          }
+          theme::Text(dl, cv, fonts.body, 16, 454, 440, step, theme::color::kGrey, false);
         }
-        help = theme::DrawRows(dl, cv, fonts, rows, &row_focus[page], in_page, page_in, 450,
-                               rows_y, 410, 62);
-        if (help.empty())
-          help = kPageHelp[page];
+        help = building ? std::string("Building the game. You can leave this page; the build "
+                                      "keeps going while the launcher is open.") :
+                          std::string("Converts the game's code from your extracted disc and "
+                                      "compiles it. Nothing from the game is downloaded.");
         break;
       }
       if (!current_metadata)
@@ -2810,7 +2831,8 @@ int main(int argc, char** argv)
       break;
     }
     }
-    if (!rows.empty() && !(page == kPlay && !current_metadata))
+    // The Play page's set-up states draw their own rows.
+    if (!rows.empty() && !(page == kPlay && (!current_metadata || module_missing)))
     {
       const std::string row_help = theme::DrawRows(dl, cv, fonts, rows, &row_focus[page],
                                                    in_page, page_in, 450, rows_y, 410, rows_step);
