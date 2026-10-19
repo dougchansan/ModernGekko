@@ -577,6 +577,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         tools/colosseum_icon_extract.cpp
         tools/launcher_theme.cpp
         tools/memory_card_library.cpp
+        tools/module_setup.cpp
         vendor/dolphin/Externals/imgui/imgui/backends/imgui_impl_sdl3.cpp
         vendor/dolphin/Externals/imgui/imgui/backends/imgui_impl_sdlrenderer3.cpp)
     target_include_directories(moderngekko-launcher PRIVATE
@@ -690,7 +691,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
         endif()
     endif()
 
-    add_executable(moderngekko-port tools/moderngekko_port.cpp)
+    add_executable(moderngekko-port tools/moderngekko_port.cpp tools/module_direct_build.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
     target_compile_definitions(moderngekko-port PRIVATE
         MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
