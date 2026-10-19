@@ -693,8 +693,18 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
 
     add_executable(moderngekko-port tools/moderngekko_port.cpp tools/module_direct_build.cpp)
     target_link_libraries(moderngekko-port PRIVATE ModernGekko::Runtime)
+    # A release ships moderngekko-port so the launcher can build the module on the player's
+    # machine; it is told where the bundled sources are, and must not carry the build
+    # machine's path.
+    option(MODERNGEKKO_PORT_RELOCATABLE
+        "Do not bake this source directory into moderngekko-port (release packages)" OFF)
+    if(MODERNGEKKO_PORT_RELOCATABLE)
+        set(_moderngekko_port_source_dir "")
+    else()
+        set(_moderngekko_port_source_dir "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
     target_compile_definitions(moderngekko-port PRIVATE
-        MODERNGEKKO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        MODERNGEKKO_SOURCE_DIR="${_moderngekko_port_source_dir}"
         MODERNGEKKO_RECOMPCORE_REVISION="${_moderngekko_recompcore_revision}"
         MODERNGEKKO_DOLRECOMP_REVISION="${_moderngekko_dolrecomp_revision}")
     if(DOLRECOMP_ENABLE_LLVM)
