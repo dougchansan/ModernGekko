@@ -1247,7 +1247,9 @@ int main(int argc, char** argv)
   bool in_page = true;
   std::array<int, kPageCount> row_focus{};
   bool help_open = false;
-  bool gamepad_input = false;
+  // Button hints follow the last input; with a controller connected they start as the
+  // mockups show them (A SELECT, B BACK) until the keyboard or mouse is used.
+  bool gamepad_input = SDL_HasGamepad();
   std::array<char, 8> netplay_port_text{};
   std::snprintf(netplay_port_text.data(), netplay_port_text.size(), "%d", netplay_port);
   std::vector<StateEntry> state_entries;
