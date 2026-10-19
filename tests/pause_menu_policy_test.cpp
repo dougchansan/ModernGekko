@@ -57,6 +57,7 @@ int main() {
   menu.activate(2);
   CHECK(menu.page() == Page::Controls);
   menu.back();
+  CHECK(menu.page() == Page::Home && menu.focus() == 2);
   CHECK(menu.activate(6) == Action::SaveCheckpoint);
   CHECK(menu.is_open());
   input.escape = true;

@@ -103,10 +103,24 @@ public:
       close();
       return Action::Resume;
     }
+    focus_ = home_row(page_);  // the cursor goes back to the row that opened it
     page_ = Page::Home;
-    focus_ = 0;
     custom_rows_ = 0;
     return Action::None;
+  }
+
+  // The Home row that opens `page`.
+  static std::size_t home_row(Page page) {
+    switch (page) {
+    case Page::Settings: return 1;
+    case Page::Controls: return 2;
+    case Page::Online: return 3;
+    case Page::Shadow: return 4;
+    case Page::Developer: return 7;
+    case Page::RestartConfirm: return 8;
+    case Page::QuitConfirm: return 9;
+    default: return 0;
+    }
   }
 
   Action activate(std::size_t row) {
