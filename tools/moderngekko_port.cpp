@@ -1,5 +1,6 @@
 #include "moderngekko/game.hpp"
 #include "moderngekko/module_abi.h"
+#include "module_direct_build.hpp"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +97,16 @@ struct BuildOptions
   // be told where clang's profiling runtime is or the link fails on
   // undefined __llvm_profile_*. Discovered from the compiler when not given.
   std::string profile_runtime;
+  // Build with Zig's clang directly, without CMake, Ninja or Python: what the launcher uses to
+  // build a player's module from their own disc with a downloaded compiler.
+  fs::path zig;
+  // Hook-aware module: "ADDRESS SIZE [r]" per line (see module_direct_build.hpp), and the
+  // return addresses of idle-loop calls. Zig builds only.
+  fs::path hook_list;
+  std::vector<std::uint32_t> idle_continuations;
+  std::vector<std::string> defines;  // NAME=VALUE for every module translation unit
+  // Print "progress <done> <total> <stage>" lines for a front end.
+  bool progress = false;
   std::vector<std::string> runner_arguments;
 };
 
@@ -677,7 +688,10 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   RefreshDolPatchFingerprint(&patches);
 
   std::string compiler;
-  if (options.toolchain == "auto")
+  const bool zig = !options.zig.empty();
+  if (zig)
+    compiler = options.zig.string();
+  else if (options.toolchain == "auto")
 #if defined(_MSC_VER)
     compiler = FindClangCommand().value_or("cl");
 #elif defined(__clang__)
@@ -710,7 +724,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   }
 
   const std::string compiler_identity =
-      ReadCommand(Quote(fs::path(compiler)) + " --version 2>&1");
+      zig ? "zig " + Trim(ReadCommand(Quote(fs::path(compiler)) + " version 2>&1")) :
+            ReadCommand(Quote(fs::path(compiler)) + " --version 2>&1");
   if (compiler_identity.empty())
   {
     std::cerr << "compiler is unavailable: " << compiler << '\n';
@@ -735,7 +750,33 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   // per-translation-unit compiles.
   const std::string opt = options.opt_level.empty() ? std::string("2") : options.opt_level;
   std::string flags;
-  if (IsClangCommand(compiler))
+  if (zig)
+  {
+    const std::string zig_target = moderngekko::module_build::HostZigTarget();
+    flags = "zig:" + zig_target + " -O" + opt +
+            (zig_target.find("macos") == std::string::npos ? " -flto=thin" : "") +
+            " -ffp-contract=off -fno-fast-math";
+    for (const std::string& define : options.defines)
+      flags += " -D" + define;
+    // The hook-aware rewrite changes the emitted code, so its inputs are part of the key.
+    if (!options.hook_list.empty())
+    {
+      const auto hooks_hash = moderngekko::HashFileSha256(options.hook_list);
+      if (!hooks_hash)
+      {
+        std::cerr << "cannot read hook list: " << options.hook_list << '\n';
+        return std::nullopt;
+      }
+      flags += " hooks:" + *hooks_hash;
+      for (const std::uint32_t idle : options.idle_continuations)
+      {
+        std::ostringstream hex;
+        hex << std::hex << idle;
+        flags += " idle:" + hex.str();
+      }
+    }
+  }
+  else if (IsClangCommand(compiler))
   {
     flags = "compile:-O" + opt +
             " -flto=thin -fvisibility=hidden -ffp-contract=off -fno-fast-math "
@@ -892,6 +933,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   else
     generate += "--cpu broadway " + Quote(recomp_dol) + " " + game.disc_id + " " +
                 Quote(generated_parent);
+  if (options.progress)
+    std::cout << "progress 0 0 converting" << std::endl;
   if (!RunCommand(generate))
     return std::nullopt;
 
@@ -925,6 +968,48 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   }
   else
     std::ofstream{normalized_smc};
+
+  if (zig)
+  {
+    namespace mb = moderngekko::module_build;
+    std::string error;
+    if (!options.hook_list.empty())
+    {
+      std::vector<mb::Hook> hooks;
+      if (!mb::ReadHookList(options.hook_list, &hooks, &error) ||
+          !mb::MakeHookAware(generated, hooks, options.idle_continuations, &error))
+      {
+        std::cerr << error << '\n';
+        return std::nullopt;
+      }
+      std::cout << "hook-aware: " << hooks.size() << " hooks\n";
+    }
+    mb::CompileJob job;
+    job.zig = options.zig;
+    job.template_dir = source_root / "vendor/dolphin/module-template";
+    job.gxruntime_dir = source_root / "vendor/dolphin/GXRuntime";
+    job.chassis_abi_dir = source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp";
+    job.generated_dir = generated;
+    job.work_dir = module_build;
+    job.output = built;
+    job.game_id = game.disc_id;
+    job.opt_level = opt;
+    job.extra_defines = options.defines;
+    job.jobs = build_jobs;
+    if (options.progress)
+    {
+      job.progress = [](unsigned done, unsigned total, const std::string& stage) {
+        std::cout << "progress " << done << ' ' << total << ' ' << stage << std::endl;
+      };
+    }
+    fs::create_directories(module_build);
+    if (!mb::CompileModule(job, &error))
+    {
+      std::cerr << error << '\n';
+      return std::nullopt;
+    }
+    return publish_module();
+  }
 
   const std::string compiler_arg = IsClangCommand(compiler) || compiler.find('\\') != std::string::npos ||
                                            compiler.find('/') != std::string::npos
@@ -996,6 +1081,7 @@ void Usage()
   std::cerr << "usage: moderngekko-port inspect <game-root>\n"
                "       moderngekko-port build <game-root> [--backend c|llvm] [--state-in-memory] [--toolchain auto|clang|gcc|msvc] [--opt-level 0-3] [--arch-flags \"flags\"] [--output path] [--dol-patch address=value] [--native-subst address:symbol]\n"
                "              [--pgo-generate dir | --pgo-use profile.profdata] [--profile-runtime path]\n"
+               "              [--zig path [--hook-list file] [--idle-continuation address] [--define NAME=VALUE] [--progress]]\n"
                "       moderngekko-port run <game-root> [build options] [-- runner options]\n";
 }
 }  // namespace
@@ -1042,6 +1128,24 @@ int main(int argc, char** argv)
       options.pgo_use = argv[++i];
     else if (arg == "--profile-runtime" && i + 1 < argc)
       options.profile_runtime = argv[++i];
+    else if (arg == "--zig" && i + 1 < argc)
+      options.zig = argv[++i];
+    else if (arg == "--hook-list" && i + 1 < argc)
+      options.hook_list = argv[++i];
+    else if (arg == "--idle-continuation" && i + 1 < argc)
+    {
+      std::uint32_t address = 0;
+      if (!ParseHex32(argv[++i], &address))
+      {
+        std::cerr << "invalid --idle-continuation address: " << argv[i] << '\n';
+        return 2;
+      }
+      options.idle_continuations.push_back(address);
+    }
+    else if (arg == "--define" && i + 1 < argc)
+      options.defines.emplace_back(argv[++i]);
+    else if (arg == "--progress")
+      options.progress = true;
     else if (command == "run")
       options.runner_arguments.push_back(arg);
     else

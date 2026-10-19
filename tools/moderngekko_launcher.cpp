@@ -8,6 +8,7 @@
 #include "dol_patch.hpp"
 #include "launcher_theme.hpp"
 #include "memory_card_library.hpp"
+#include "module_setup.hpp"
 #include "onscreen_keyboard.hpp"
 #include "moderngekko/game.hpp"
 #include "moderngekko/hd_texture_pack.hpp"
@@ -88,6 +89,7 @@ struct ExtractionState
   std::string status;
   std::string error;
   std::optional<fs::path> finished_game;
+  std::atomic<bool> module_ready{false};  // a module build (without extraction) finished
 };
 
 struct DialogState
@@ -389,6 +391,35 @@ std::optional<fs::path> PrepareDisc(const fs::path& image, const fs::path& user_
 #endif
 }
 
+// Builds the native game module from the extracted game if the runner would not find one
+// (release packages carry no game-derived code). Progress goes to `state`.
+bool EnsureGameModule(const fs::path& game, const fs::path& user_directory,
+                      const fs::path& release_directory, ExtractionState* state,
+                      std::string* error)
+{
+  const auto inspected = moderngekko::InspectGame(game);
+  if (!inspected)
+    return true;  // the caller reports an invalid game
+  const std::string& disc_id = inspected.metadata->disc_id;
+  if (moderngekko::frontend::HasGameModule(release_directory, user_directory, disc_id))
+    return true;
+  if (!moderngekko::frontend::CanBuildGameModule(release_directory))
+  {
+    *error = "The game module is missing and this release cannot build it.";
+    return false;
+  }
+  return moderngekko::frontend::BuildGameModule(
+      game, disc_id, release_directory, user_directory,
+      [state](const std::string& status, unsigned done, unsigned total)
+      {
+        state->total = std::max(1u, total);
+        state->completed = total ? done : 0;
+        std::lock_guard lock(state->mutex);
+        state->status = status;
+      },
+      error);
+}
+
 bool ExtractDisc(const fs::path& image, const fs::path& user_directory,
                  const fs::path& release_directory, ExtractionState* state)
 {
@@ -446,6 +477,8 @@ bool ExtractDisc(const fs::path& image, const fs::path& user_directory,
   {
     std::string error;
     if (!WriteDefaultGame(user_directory, release_directory, output, &error))
+      return fail(error);
+    if (!EnsureGameModule(output, user_directory, release_directory, state, &error))
       return fail(error);
     std::lock_guard lock(state->mutex);
     state->finished_game = output;
@@ -513,6 +546,8 @@ bool ExtractDisc(const fs::path& image, const fs::path& user_directory,
     return fail("can't publish extracted game: " + ec.message());
   std::string error;
   if (!WriteDefaultGame(user_directory, release_directory, output, &error))
+    return fail(error);
+  if (!EnsureGameModule(output, user_directory, release_directory, state, &error))
     return fail(error);
 
   {
@@ -1258,7 +1293,9 @@ int main(int argc, char** argv)
   bool in_page = true;
   std::array<int, kPageCount> row_focus{};
   bool help_open = false;
-  bool gamepad_input = false;
+  // Button hints follow the last input; with a controller connected they start as the
+  // mockups show them (A SELECT, B BACK) until the keyboard or mouse is used.
+  bool gamepad_input = SDL_HasGamepad();
   std::array<char, 8> netplay_port_text{};
   std::snprintf(netplay_port_text.data(), netplay_port_text.size(), "%d", netplay_port);
   std::vector<StateEntry> state_entries;
@@ -1756,6 +1793,46 @@ int main(int argc, char** argv)
         [image, user_directory, release_directory, &extraction]
         { ExtractDisc(image, user_directory, release_directory, &extraction); });
   };
+  // A game extracted without its native module (by an older release, or the module was
+  // removed) is built from the extracted game, once, before it can be played.
+  const auto module_missing_for = [&](const moderngekko::GameInspectResult& metadata)
+  {
+    return metadata && !moderngekko::frontend::HasGameModule(release_directory, user_directory,
+                                                              metadata.metadata->disc_id);
+  };
+  bool module_missing = module_missing_for(current_metadata);
+  const auto start_module_build = [&]
+  {
+    if (!current_metadata || extraction.running)
+      return;
+    extraction.completed = 0;
+    extraction.total = 1;
+    extraction.running = true;
+    extraction.module_ready = false;
+    {
+      std::lock_guard lock(extraction.mutex);
+      extraction.error.clear();
+      extraction.status = "Preparing to build the game";
+    }
+    const fs::path game = current_game;
+    extraction_thread = std::jthread(
+        [game, user_directory, release_directory, &extraction]
+        {
+          std::string error;
+          if (EnsureGameModule(game, user_directory, release_directory, &extraction, &error))
+          {
+            extraction.module_ready = true;
+          }
+          else
+          {
+            std::lock_guard lock(extraction.mutex);
+            extraction.error = error;
+          }
+          extraction.running = false;
+        });
+  };
+  if (module_missing && moderngekko::frontend::CanBuildGameModule(release_directory))
+    start_module_build();
   while (!done)
   {
     bool controllers_changed = false;
@@ -1802,6 +1879,7 @@ int main(int argc, char** argv)
         if (current_metadata && !RequiredGameError(*current_metadata.metadata).empty())
           current_metadata = {{}, RequiredGameError(*current_metadata.metadata)};
         extraction.finished_game.reset();
+        module_missing = module_missing_for(current_metadata);
         if (ensure_controller())
         {
           launch_mode = LaunchMode::Solo;
@@ -1809,6 +1887,8 @@ int main(int argc, char** argv)
         }
       }
     }
+    if (extraction.module_ready.exchange(false))
+      module_missing = module_missing_for(current_metadata);
     refresh_fonts();
 
     // Capture: four frames per shot (fonts bake on first use), pages in order,
@@ -1984,6 +2064,49 @@ int main(int argc, char** argv)
     {
     case kPlay:
     {
+      if (current_metadata && module_missing)
+      {
+        // One-time build, laid out like the Play page: the big button where PLAY sits, the
+        // explanation where the Slot A card text goes, progress underneath.
+        const bool building = extraction.running;
+        const bool focused = in_page && !building;
+        if (!building && ((in_page && page_in.accept) ||
+                          (clicked && mouse_in(450, 220, 820, 330))))
+          start_module_build();
+        theme::SteelPanel(dl, cv, 450, 220, 820, 330, 18,
+                          focused ? IM_COL32(110, 26, 30, 235) : theme::color::kPlay);
+        const char* label = building ? "BUILDING..." : "BUILD GAME";
+        theme::Text(dl, cv, fonts.title, 40, 635 - theme::TextWidth(fonts.title, 40, label) / 2,
+                    252, label);
+        if (focused)
+          theme::Chevron(dl, cv, 478, 258);
+        theme::Text(dl, cv, fonts.small, 26, 860, 222, "ONE-TIME SETUP", theme::color::kGold);
+        theme::Text(dl, cv, fonts.body, 15, 860, 262, "The game is built from your own disc",
+                    theme::color::kGrey, false);
+        theme::Text(dl, cv, fonts.body, 15, 860, 286, "on this computer before the first play.",
+                    theme::color::kGrey, false);
+        theme::Text(dl, cv, fonts.body, 15, 860, 318, "A compiler is downloaded once (about",
+                    theme::color::kGrey, false);
+        theme::Text(dl, cv, fonts.body, 15, 860, 342, "80 MB); the build takes 5 to 15 minutes.",
+                    theme::color::kGrey, false);
+        if (building)
+        {
+          const float progress = std::min(
+              1.0f, static_cast<float>(extraction.completed.load()) / extraction.total.load());
+          theme::SliderBar(dl, cv, 454, 410, 756, progress);
+          std::string step;
+          {
+            std::lock_guard lock(extraction.mutex);
+            step = extraction.status;
+          }
+          theme::Text(dl, cv, fonts.body, 16, 454, 440, step, theme::color::kGrey, false);
+        }
+        help = building ? std::string("Building the game. You can leave this page; the build "
+                                      "keeps going while the launcher is open.") :
+                          std::string("Converts the game's code from your extracted disc and "
+                                      "compiles it. Nothing from the game is downloaded.");
+        break;
+      }
       if (!current_metadata)
       {
         rows.push_back(info("No extracted game is set up yet. Choose your Pokemon Colosseum disc "
@@ -3057,7 +3180,8 @@ int main(int argc, char** argv)
       break;
     }
     }
-    if (!rows.empty() && !(page == kPlay && !current_metadata))
+    // The Play page's set-up states draw their own rows.
+    if (!rows.empty() && !(page == kPlay && (!current_metadata || module_missing)))
     {
       const std::string row_help = theme::DrawRows(dl, cv, fonts, rows, &row_focus[page],
                                                    in_page, page_in, 450, rows_y, 410, rows_step);

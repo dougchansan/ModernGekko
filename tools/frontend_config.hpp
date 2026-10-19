@@ -71,7 +71,12 @@ struct ConfigResult {
   bool crash_watchdog = true;
   int crash_watchdog_seconds = 15;
   std::string resolution;
+#ifdef __APPLE__
+  // macOS packages carry no Vulkan loader (MoltenVK); Metal is native.
+  std::string graphics_backend = "Metal";
+#else
   std::string graphics_backend = "Vulkan";
+#endif
   std::string controller;
   std::vector<std::string> controllers;
   bool show_fps_in_title = true;

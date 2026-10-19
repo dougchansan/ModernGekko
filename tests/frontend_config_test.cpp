@@ -32,7 +32,11 @@ int main() {
   const auto loaded = moderngekko::frontend::LoadConfig(directory, false);
   if (!loaded || loaded.dolphin_scale != 3 || loaded.show_fps_in_title ||
       loaded.controller != controller ||
+#ifdef __APPLE__
+      loaded.graphics_backend != "Metal" || loaded.hires_textures ||
+#else
       loaded.graphics_backend != "Vulkan" || loaded.hires_textures ||
+#endif
       loaded.community_hd_texture_pack ||
       loaded.text_upscale || loaded.sixty_fps ||
       loaded.aspect_ratio != moderngekko::frontend::kFrontendAspectAuto ||
