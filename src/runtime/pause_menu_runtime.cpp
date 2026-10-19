@@ -36,6 +36,7 @@
 #include "onscreen_keyboard.hpp"
 #include "pause_menu_policy.hpp"
 #include "colosseum_menu_style.hpp"
+#include "controller_bindings.hpp"
 #include "shadow_tracker.hpp"
 #include <cmath>
 #include <cstdio>
@@ -802,22 +803,45 @@ std::string Device() {
 
 void CycleDevice(int direction) {
   auto devices = g_controller_interface.GetAllDeviceStrings();
+  // Gamepads, then the keyboard (one entry: the first keyboard device).
+  std::vector<std::string> keyboards;
+  for (const std::string &name : devices)
+    if (moderngekko::frontend::IsKeyboardDevice(name))
+      keyboards.push_back(name);
   std::erase_if(devices, [](const std::string &name) {
-    return !name.starts_with("SDL/") && !name.starts_with("XInput/");
+    return !moderngekko::frontend::IsGamepadDevice(name);
   });
+  if (!keyboards.empty())
+    devices.push_back(keyboards.front());
   if (devices.empty() || !Pad::IsInitialized() || !Pad::GetConfig() ||
       !Pad::GetConfig()->GetControllerCount())
     return;
   auto *config = Pad::GetConfig();
   auto lock = ControllerEmu::EmulatedController::GetStateLock();
   auto *controller = config->GetController(0);
-  const auto found = std::find(devices.begin(), devices.end(),
-                               controller->GetDefaultDevice().ToString());
+  const std::string current = controller->GetDefaultDevice().ToString();
+  auto found = std::find(devices.begin(), devices.end(), current);
+  if (found == devices.end() && moderngekko::frontend::IsKeyboardDevice(current) &&
+      !keyboards.empty())
+    found = devices.end() - 1;
   const int index = found == devices.end()
                         ? (direction > 0 ? -1 : 0)
                         : static_cast<int>(found - devices.begin());
   const int count = static_cast<int>(devices.size());
-  controller->SetDefaultDevice(devices[(index + direction + count) % count]);
+  const std::string &next = devices[(index + direction + count) % count];
+  if (moderngekko::frontend::IsKeyboardDevice(next) !=
+      moderngekko::frontend::IsKeyboardDevice(current)) {
+    // Gamepad names mean nothing on a keyboard and the other way round:
+    // switching between the two loads the new device's default layout.
+    Common::IniFile ini;
+    auto *map = ini.GetOrCreateSection("pad");
+    map->Set("Device", next);
+    for (const auto &[key, value] : moderngekko::frontend::DefaultBindings(next))
+      map->Set(key, value);
+    controller->LoadConfig(map);
+  } else {
+    controller->SetDefaultDevice(next);
+  }
   controller->UpdateReferences(g_controller_interface);
   config->SaveConfig();
 }
@@ -2060,7 +2084,9 @@ std::vector<std::string> Rows(const Menu &menu) {
     const auto first = name.find('/');
     const auto second =
         first == std::string::npos ? first : name.find('/', first + 1);
-    if (second != std::string::npos)
+    if (moderngekko::frontend::IsKeyboardDevice(name))
+      name = "Keyboard";
+    else if (second != std::string::npos)
       name = name.substr(second + 1);
     return {"Controller   " + name, "Back"};
   }

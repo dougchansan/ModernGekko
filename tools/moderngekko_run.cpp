@@ -1,5 +1,6 @@
 #include "cache_affinity.hpp"
 #include "automation_protocol.hpp"
+#include "controller_bindings.hpp"
 #include "frontend_config.hpp"
 #include "dol_patch.hpp"
 #include "moderngekko/game.hpp"
@@ -8,6 +9,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <csignal>
@@ -192,6 +194,34 @@ bool ResolveNativeUltrawide(int frontend_aspect) {
               << ":1, enabling native ultrawide (Hor+)\n";
   }
   return ultrawide;
+}
+
+// The device a first run without a controller profile plays with: the first
+// connected SDL gamepad, named as Dolphin's SDL backend names it, else this
+// platform's keyboard. Borrows SDL's gamepad subsystem like the display probe.
+std::string FirstRunController() {
+  const bool already_initialised = SDL_WasInit(SDL_INIT_GAMEPAD) != 0;
+  if (!already_initialised && !SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+    return std::string(moderngekko::frontend::KeyboardDevice());
+  std::string device;
+  std::vector<std::string> seen;
+  int count = 0;
+  SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+  for (int i = 0; i < count && device.empty(); ++i) {
+    const bool gamepad = SDL_IsGamepad(ids[i]);
+    const char *value = gamepad ? SDL_GetGamepadNameForID(ids[i])
+                                : SDL_GetJoystickNameForID(ids[i]);
+    const std::string name = value && *value ? value : "Unknown Controller";
+    const auto index = std::count(seen.begin(), seen.end(), name);
+    seen.push_back(name);
+    if (gamepad)
+      device = "SDL/" + std::to_string(index) + "/" + name;
+  }
+  SDL_free(ids);
+  if (!already_initialised)
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+  return device.empty() ? std::string(moderngekko::frontend::KeyboardDevice())
+                        : device;
 }
 } // namespace
 
@@ -446,6 +476,20 @@ int RunMain(int argc, char **argv) {
       return 2;
     }
     std::cout << "controller configuration: " << controller_message << '\n';
+  } else if (!netplay_role &&
+             !moderngekko::frontend::ControllerConfigExists(config.user_directory)) {
+    // No profile and no device chosen: without one Dolphin would fall back
+    // to its own keyboard layout, unlike the documented one. Write ours, for
+    // a gamepad when one is connected and otherwise the keyboard, so a player
+    // with no pad (the macOS and Linux packages ship no profile) can play.
+    std::string controller_message;
+    const std::string device = FirstRunController();
+    if (moderngekko::frontend::GenerateControllerConfig(
+            config.user_directory, device, &controller_message))
+      std::cout << "controller configuration: " << device << ": "
+                << controller_message << '\n';
+    else
+      std::cerr << "controller configuration: " << controller_message << '\n';
   }
 
 #ifdef MODERNGEKKO_DOL_PATCH_MANIFEST

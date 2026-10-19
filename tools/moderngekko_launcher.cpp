@@ -2,6 +2,7 @@
 #include "cache_affinity.hpp"
 #include "colosseum_font_extract.hpp"
 #include "colosseum_icon_extract.hpp"
+#include "controller_bindings.hpp"
 #include "frontend_config.hpp"
 #include "launcher_savestates.hpp"
 #include "dol_patch.hpp"
@@ -147,6 +148,9 @@ std::vector<ControllerOption> EnumerateControllers()
   SDL_free(joystick_ids);
   return result;
 }
+  // The keyboard is always there, after the gamepads, so a player without a
+  // pad can pick it and the first run falls back to it.
+  result.push_back({"Keyboard", std::string(moderngekko::frontend::KeyboardDevice())});
 
 int FindController(const std::vector<ControllerOption>& controllers, std::string_view device)
 {
@@ -668,7 +672,7 @@ constexpr std::array<const char*, kPageCount> kPageHelp = {
     "Save states from the pause menu and the room autosaves, newest first.",
     "Window mode, render resolution, aspect ratio and texture filtering.",
     "Frame rate, speed and the safety nets: autosaves and stall recovery.",
-    "Which gamepad plays, and the on-screen input display.",
+    "Which gamepad or keyboard plays, its button mapping, and the on-screen input display.",
     "Minimap, overlays, and the HD texture and text upgrades.",
     "Play with a friend over the internet. Still experimental.",
     "Colosseum Battle against a friend's own save, each on their own game."};
@@ -812,6 +816,48 @@ std::string CardPlayTime(const moderngekko::frontend::LibraryCard& card)
                 card.playtime / 60 % 60);
   return text;
 }
+// The BUTTON MAPPING screen, opened from the Controllers page: every
+// GameCube input of one player with its binding, rebound by pressing the
+// key or button to use.
+struct Mapping
+{
+  bool open = false;
+  int port = 0;
+  // 0 the player row; 1-12 the left column (kGcInputs 0-11); 13-20 the right
+  // column (kGcInputs 12-19); 21 RESET TO DEFAULTS; 22 BACK.
+  int focus = 1;
+  int capturing = -1;  // the kGcInputs index waiting for input, or -1
+  std::chrono::steady_clock::time_point deadline;
+  std::vector<bool> keys_down;  // keyboard state when the wait began
+  std::string status;
+};
+constexpr auto kMappingWait = std::chrono::seconds(5);
+
+// The gamepad input ImGui saw pressed this frame, under the name Dolphin's
+// SDL backend gives it (face buttons positionally, as the generated profile
+// writes them), or empty.
+std::string PressedGamepadInput()
+{
+  static constexpr std::pair<ImGuiKey, const char*> kInputs[] = {
+      {ImGuiKey_GamepadFaceDown, "Button A"},   {ImGuiKey_GamepadFaceRight, "Button B"},
+      {ImGuiKey_GamepadFaceLeft, "Button X"},   {ImGuiKey_GamepadFaceUp, "Button Y"},
+      {ImGuiKey_GamepadStart, "Start"},         {ImGuiKey_GamepadBack, "Back"},
+      {ImGuiKey_GamepadL1, "Shoulder L"},       {ImGuiKey_GamepadR1, "Shoulder R"},
+      {ImGuiKey_GamepadL2, "Trigger L"},        {ImGuiKey_GamepadR2, "Trigger R"},
+      {ImGuiKey_GamepadL3, "Thumb L"},          {ImGuiKey_GamepadR3, "Thumb R"},
+      {ImGuiKey_GamepadDpadUp, "Pad N"},        {ImGuiKey_GamepadDpadDown, "Pad S"},
+      {ImGuiKey_GamepadDpadLeft, "Pad W"},      {ImGuiKey_GamepadDpadRight, "Pad E"},
+      {ImGuiKey_GamepadLStickUp, "Left Y+"},    {ImGuiKey_GamepadLStickDown, "Left Y-"},
+      {ImGuiKey_GamepadLStickLeft, "Left X-"},  {ImGuiKey_GamepadLStickRight, "Left X+"},
+      {ImGuiKey_GamepadRStickUp, "Right Y+"},   {ImGuiKey_GamepadRStickDown, "Right Y-"},
+      {ImGuiKey_GamepadRStickLeft, "Right X-"}, {ImGuiKey_GamepadRStickRight, "Right X+"},
+  };
+  for (const auto& [key, name] : kInputs)
+    if (ImGui::IsKeyPressed(key, false))
+      return name;
+  return {};
+}
+
 
 std::string CardWhen(const moderngekko::frontend::LibraryCard& card)
 {
@@ -1404,6 +1450,7 @@ int main(int argc, char** argv)
       *value = previous;
       return false;
     };
+  Mapping mapping;
     return row;
   };
   const auto slider = [&](const char* label, int* value, int min, int max, int step,
@@ -1768,7 +1815,7 @@ int main(int argc, char** argv)
     // then the help card open on a display setting and the Slot A card.
     constexpr int kCaptureFrames = 4;
     const int capture_shot = capture_frame / kCaptureFrames;
-    constexpr int kCaptureShots = kPageCount + 6;
+    constexpr int kCaptureShots = kPageCount + 8;
     if (capture_directory)
     {
       in_page = true;
@@ -1794,7 +1841,7 @@ int main(int argc, char** argv)
       }
       if (capture_shot == kPageCount + 3 && naming.mode == Naming::Mode::None)
         open_naming(Naming::Mode::New, -1);
-      if (capture_shot >= kPageCount + 4)
+      if (capture_shot >= kPageCount + 4 && capture_shot < kPageCount + 6)
       {
         carousel_open = false;
         carousel_t = 0;
@@ -1834,7 +1881,7 @@ int main(int argc, char** argv)
     const theme::Input raw_in = theme::ReadInput(&gamepad_input);
     // The carousel and the naming dialog sit above the pages and take input.
     const bool overlay = carousel_open || naming.mode != Naming::Mode::None || confirm.open ||
-                         card_menu.open;
+                         card_menu.open || mapping.capturing >= 0;
     const theme::Input in = overlay ? theme::Input{.gamepad = raw_in.gamepad} : raw_in;
     const bool clicked = !overlay && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
     const auto mouse_in = [&](float x0, float y0, float x1, float y1)
@@ -1884,11 +1931,26 @@ int main(int argc, char** argv)
         theme::Text(dl, cv, fonts.body, 13, 96, y + 36, "EXPERIMENTAL", theme::color::kWarn, false);
     }
     theme::SteelPanel(dl, cv, 420, 110, 800, 178, 14);
-    theme::Text(dl, cv, fonts.menu, 36, 444, 128, kPageNames[page]);
+    theme::Text(dl, cv, fonts.menu, 36, 444, 128,
+                page == kControllers && mapping.open ? "BUTTON MAPPING" : kPageNames[page]);
     theme::SteelPanel(dl, cv, 420, 186, 1240, 690, 16);
     if (clicked && mouse_in(420, 186, 1240, 690))
       in_page = true;
 
+      // The button mapping screen, then the same screen waiting for a key.
+      if (capture_shot >= kPageCount + 6)
+      {
+        confirm.open = false;
+        card_menu.open = false;
+        carousel_open = false;
+        carousel_t = 0;
+        page = kControllers;
+        mapping.open = true;
+        mapping.port = 0;
+        mapping.focus = capture_shot == kPageCount + 6 ? 1 : 5;
+        mapping.capturing = capture_shot == kPageCount + 6 ? -1 : 4;
+        mapping.deadline = std::chrono::steady_clock::now() + kMappingWait;
+      }
     if (!in_page)
     {
       if (in.up)
@@ -1900,7 +1962,16 @@ int main(int argc, char** argv)
     }
     else if (in.back)
     {
-      in_page = false;
+      // Back on the mapping screen returns to the Controllers page.
+      if (page == kControllers && mapping.open)
+        mapping.open = false;
+      else
+        in_page = false;
+    }
+    if (!in_page || page != kControllers)
+    {
+      mapping.open = false;
+      mapping.capturing = -1;
     }
     // Input for the page this frame (nothing while the navigation has focus).
     const theme::Input page_in = in_page && !in.back ? in : theme::Input{};
@@ -2381,11 +2452,15 @@ int main(int argc, char** argv)
       const int p1 = FindController(controllers, ports[0].empty() ? selected_controller : ports[0]);
       const int p2 = FindController(controllers, ports[1]);
       int& focus = row_focus[page];
-      focus = std::clamp(focus, 0, 4);
-      if (page_in.down)
-        focus = std::min(focus + 1, 4);
-      if (page_in.up)
-        focus = std::max(focus - 1, 0);
+      focus = std::clamp(focus, 0, 5);
+      {
+        const int at = static_cast<int>(std::ranges::find(kFocusOrder, focus) -
+                                        std::begin(kFocusOrder));
+        if (page_in.down)
+          focus = kFocusOrder[std::min(at + 1, 5)];
+        if (page_in.up)
+          focus = kFocusOrder[std::max(at - 1, 0)];
+      }
       int dir = page_in.right || page_in.accept ? 1 : page_in.left ? -1 : 0;
       for (int i = 0; i < 2; ++i)
       {
@@ -2452,9 +2527,12 @@ int main(int argc, char** argv)
           // The GBA is played on the first pad that is not player 1's.
           std::string pad;
           for (int i = 0; i < pad_count && pad.empty(); ++i)
-            if (i != p1)
+            if (i != p1 && !moderngekko::frontend::IsKeyboardDevice(
+                               controllers[static_cast<std::size_t>(i)].device))
               pad = controllers[static_cast<std::size_t>(i)].device;
-          if (pad.empty() && p1 >= 0)
+          if (pad.empty() && p1 >= 0 &&
+              !moderngekko::frontend::IsKeyboardDevice(
+                  controllers[static_cast<std::size_t>(p1)].device))
             pad = controllers[static_cast<std::size_t>(p1)].device;
           if (!pad.empty())
             MapGbaPad(user_directory, pad);
@@ -2480,6 +2558,244 @@ int main(int argc, char** argv)
       }
       else if (dir && focus == 4)
       {
+      // What plays each player, as the selectors and the mapping screen show it.
+      const auto device_label = [&](int i)
+      {
+        const int assigned = i == 0 ? p1 : p2;
+        // A profile device that is not a connected pad (a pad that is
+        // unplugged) is shown as the profile has it.
+        const std::string& configured = ports[static_cast<std::size_t>(i)];
+        return i == 1 && gba.player2 ? std::string("GAME BOY ADVANCE") :
+               assigned >= 0 ? Upper(controllers[static_cast<std::size_t>(assigned)].label) :
+               moderngekko::frontend::IsKeyboardDevice(configured) ? std::string("KEYBOARD") :
+               !configured.empty() ? Upper(configured.substr(configured.rfind('/') + 1)) :
+               i == 0 ? std::string("CHOOSE A DEVICE") :
+                        std::string("NONE");
+      };
+
+      // ---- BUTTON MAPPING: one player's inputs and their bindings ----
+      if (mapping.open)
+      {
+        namespace fe = moderngekko::frontend;
+        static_assert(SDL_SCANCODE_A == 4 && SDL_SCANCODE_RETURN == 40 &&
+                          SDL_SCANCODE_LSHIFT == 225 && SDL_SCANCODE_UP == 82,
+                      "kKeyNames is keyed by HID usage, which SDL scancodes are");
+        const int port = std::clamp(mapping.port, 0, 1);
+        const std::string device = ports[static_cast<std::size_t>(port)];
+        const bool keyboard = fe::IsKeyboardDevice(device);
+        const auto bindings = fe::ReadControllerBindings(user_directory, port);
+        const auto binding_of = [&](std::string_view key)
+        {
+          for (const auto& [k, v] : bindings)
+            if (k == key)
+              return v;
+          return std::string();
+        };
+        const auto bind = [&](int input, const std::string& name)
+        {
+          const std::string key(fe::kGcInputs[static_cast<std::size_t>(input)].key);
+          std::vector<std::pair<std::string, std::string>> changes{{key, fe::QuoteInput(name)}};
+          // The analog half of a trigger follows its button.
+          if (key == "Triggers/L" || key == "Triggers/R")
+            changes.emplace_back(key + "-Analog", fe::QuoteInput(name));
+          std::string message;
+          if (fe::SetControllerBindings(user_directory, port, changes, &message))
+            mapping.status = std::string(fe::kGcInputs[static_cast<std::size_t>(input)].label) +
+                             " IS NOW " + fe::ReadableBinding(fe::QuoteInput(name));
+          else
+            mapping.status = Upper(message);
+        };
+        const auto now = std::chrono::steady_clock::now();
+
+        // Waiting for the key or button: before the page's own input, so the
+        // press that started the wait is not taken as the answer.
+        if (mapping.capturing >= 0 && !capture_directory)
+        {
+          const int input = mapping.capturing;
+          const std::string label(fe::kGcInputs[static_cast<std::size_t>(input)].label);
+          int count = 0;
+          const bool* state = SDL_GetKeyboardState(&count);
+          mapping.keys_down.resize(static_cast<std::size_t>(count));
+          int pressed_key = -1;
+          for (int sc = 0; sc < count; ++sc)
+          {
+            // Only a key that goes down now: one held when the wait began
+            // (Enter) counts once released and pressed again.
+            if (state[sc] && !mapping.keys_down[static_cast<std::size_t>(sc)] && pressed_key < 0)
+              pressed_key = sc;
+            mapping.keys_down[static_cast<std::size_t>(sc)] = state[sc];
+          }
+          const std::string pad = PressedGamepadInput();
+          if (pressed_key == SDL_SCANCODE_ESCAPE || (keyboard && pad == "Button B"))
+          {
+            mapping.capturing = -1;
+            mapping.status = label + " UNCHANGED";
+          }
+          else if (keyboard && pressed_key >= 0)
+          {
+            const std::string name = fe::KeyNameForHid(pressed_key, fe::KeyboardBackendOf(device));
+            if (name.empty())
+            {
+              mapping.status = "THAT KEY CANNOT BE BOUND";
+            }
+            else
+            {
+              mapping.capturing = -1;
+              bind(input, name);
+            }
+          }
+          else if (!keyboard && !pad.empty())
+          {
+            mapping.capturing = -1;
+            bind(input, pad);
+          }
+          else if (now >= mapping.deadline)
+          {
+            mapping.capturing = -1;
+            mapping.status = "NOTHING PRESSED: " + label + " UNCHANGED";
+          }
+        }
+
+        int& f = mapping.focus;
+        f = std::clamp(f, 0, 22);
+        // The right column's rows: eight inputs, a gap, RESET, BACK.
+        const auto right_row = [](int item) { return item <= 20 ? item - 13 : item == 21 ? 9 : 10; };
+        const auto right_item = [](int row) { return row <= 7 ? 13 + row : row <= 9 ? 21 : 22; };
+        if (page_in.up)
+          f = f == 0 || f == 1 || f == 13 ? 0 : f - 1;
+        else if (page_in.down)
+          f = f == 0 ? 1 : f == 12 || f == 22 ? f : f + 1;
+        else if (page_in.right && f >= 1 && f <= 12)
+          f = right_item(f - 1);
+        else if (page_in.left && f >= 13)
+          f = 1 + std::min(right_row(f), 11);
+        int activate = page_in.accept || (f == 0 && (page_in.left || page_in.right)) ? f : -1;
+        const auto hit = [&](int item, float x0, float y0, float x1, float y1)
+        {
+          if (!mouse_in(x0, y0, x1, y1))
+            return;
+          if (mouse_moved)
+            f = item;
+          if (clicked)
+            activate = f = item;
+        };
+        hit(0, 440, 200, 1230, 244);
+        for (int i = 0; i < 12; ++i)
+          hit(1 + i, 440, 262 + i * 34.0f, 840, 294 + i * 34.0f);
+        for (int r = 0; r < 11; ++r)
+          if (r != 8)
+            hit(right_item(r), 840, 262 + r * 34.0f, 1230, 294 + r * 34.0f);
+
+        if (activate == 0)
+        {
+          mapping.port = 1 - port;
+          mapping.status.clear();
+        }
+        else if (activate >= 1 && activate <= 20)
+        {
+          if (device.empty())
+          {
+            mapping.status = "CHOOSE A DEVICE FOR PLAYER " + std::to_string(port + 1) + " FIRST";
+          }
+          else
+          {
+            int count = 0;
+            const bool* state = SDL_GetKeyboardState(&count);
+            mapping.keys_down.assign(state, state + count);
+            mapping.capturing = activate - 1;
+            mapping.deadline = now + kMappingWait;
+            mapping.status.clear();
+          }
+        }
+        else if (activate == 21 && !device.empty())
+        {
+          std::string message;
+          mapping.status =
+              moderngekko::frontend::SetControllerPort(user_directory, port, device, &message) ?
+                  std::string("PLAYER ") + std::to_string(port + 1) + " RESET TO THE " +
+                      (keyboard ? "KEYBOARD" : "GAMEPAD") + " LAYOUT" :
+                  Upper(message);
+        }
+        else if (activate == 22)
+        {
+          mapping.open = false;
+        }
+
+        // The player, and what they play with.
+        if (in_page && f == 0)
+          theme::Chevron(dl, cv, 427, 212, 14);
+        theme::Text(dl, cv, fonts.small, 24, 450, 208, "PLAYER", theme::color::kGold);
+        theme::ValueSelector(dl, cv, fonts, 554, 204, "PLAYER " + std::to_string(port + 1), 220);
+        theme::Text(dl, cv, fonts.small, 24, 800, 208, device_label(port),
+                    device.empty() ? theme::color::kDim : theme::color::kWhite);
+        const auto draw_row = [&](int item, float x, float y)
+        {
+          const bool focused = in_page && f == item;
+          if (focused)
+            theme::Chevron(dl, cv, x - 23, y + 4, 14);
+          if (item >= 21)
+          {
+            theme::Text(dl, cv, fonts.small, 24, x, y, item == 21 ? "RESET TO DEFAULTS" : "BACK",
+                        focused ? theme::color::kWhite : theme::color::kText);
+            return;
+          }
+          const auto& gc = fe::kGcInputs[static_cast<std::size_t>(item - 1)];
+          theme::Text(dl, cv, fonts.small, 24, x, y, std::string(gc.label), theme::color::kGold);
+          std::string value;
+          ImU32 col = theme::color::kWhite;
+          if (mapping.capturing == item - 1)
+          {
+            const auto left = std::chrono::ceil<std::chrono::seconds>(mapping.deadline - now);
+            value = std::string(keyboard ? "PRESS A KEY  " : "PRESS A BUTTON  ") +
+                    std::to_string(std::max<long long>(1, left.count()));
+            col = theme::color::kWarn;
+          }
+          else
+          {
+            value = fe::ReadableBinding(binding_of(gc.key));
+            if (value.empty())
+              value = "NOT SET", col = theme::color::kDim;
+          }
+          // The right column's labels (C-STICK DOWN) are the wider ones.
+          const bool right = x > 800;
+          const float value_x = x + (right ? 166 : 150);
+          const float value_width = (right ? 1226 : 836) - value_x;
+          const float width = theme::TextWidth(fonts.small, 24, value);
+          const float size = width > value_width ? 24 * value_width / width : 24;
+          theme::Text(dl, cv, fonts.small, size, value_x, y + (24 - size) / 2, value, col);
+        };
+        for (int i = 0; i < 12; ++i)
+          draw_row(1 + i, 450, 266 + i * 34.0f);
+        for (int r = 0; r < 11; ++r)
+          if (r != 8)
+            draw_row(right_item(r), 850, 266 + r * 34.0f);
+
+        std::string line = mapping.status;
+        if (mapping.capturing >= 0)
+          line = std::string(keyboard ? "PRESS THE KEY" : "PRESS THE BUTTON") + " FOR " +
+                 std::string(fe::kGcInputs[static_cast<std::size_t>(mapping.capturing)].label) +
+                 (keyboard ? ".  ESC CANCELS." : ".  WAIT TO CANCEL.");
+        theme::Text(dl, cv, fonts.body, 13, 450, 670, line,
+                    mapping.capturing >= 0 ? theme::color::kGold : theme::color::kGrey, false);
+        page_hint = in.gamepad ? "A BIND    B BACK    Z HELP" : "ENTER BIND    ESC BACK    H HELP";
+        if (in_page)
+          help = f == 0 ?
+                     std::string("Whose buttons to change. Left and right switch between "
+                                 "player 1 and player 2.") :
+                 f <= 20 ?
+                     "Press " + std::string(in.gamepad ? "A" : "Enter") +
+                         ", then the key or button to use for " +
+                         std::string(fe::kGcInputs[static_cast<std::size_t>(f - 1)].label) +
+                         ". Nothing pressed within 5 seconds, or Esc, leaves it as it is." :
+                 f == 21 ?
+                     std::string("Puts back the default layout for this player's device: W A S "
+                                 "D, I J K L and the keys listed in the README on a keyboard, "
+                                 "the GameCube positions on a gamepad.") :
+                     std::string("Back to the Controllers page.");
+        break;
+      }
+
+      static constexpr int kFocusOrder[] = {0, 1, 5, 2, 3, 4};
         config.input_overlay = !config.input_overlay;
         if (!persist())
           config.input_overlay = !config.input_overlay;
@@ -2487,25 +2803,23 @@ int main(int argc, char** argv)
 
       // Espeon and Umbreon, the two partners the game starts you with.
       constexpr int kPlayerSpecies[2] = {196, 197};
+      if (mouse_in(880, 206, 1220, 396))
+      {
+        if (mouse_moved)
+          focus = 5;
+        if (clicked)
+        {
+          focus = 5;
+          dir = 1;
+        }
+      }
       for (int i = 0; i < 2; ++i)
       {
         const float y = 206 + i * 104.0f;
         draw_portrait(dl, cv, kPlayerSpecies[i], 450, y, 64, in_page && focus == i,
                       "P" + std::to_string(i + 1));
         theme::Text(dl, cv, fonts.menu, 36, 554, y + 8, "PLAYER " + std::to_string(i + 1));
-        const int assigned = i == 0 ? p1 : p2;
-        // A profile device that is not a connected pad (the keyboard, or a pad
-        // that is unplugged) is shown as the profile has it.
-        const std::string configured = ports[static_cast<std::size_t>(i)];
-        std::string device =
-            i == 1 && gba.player2 ? std::string("GAME BOY ADVANCE") :
-            assigned >= 0 ? Upper(controllers[static_cast<std::size_t>(assigned)].label) :
-            configured.find("Keyboard") != std::string::npos ? std::string("KEYBOARD") :
-            !configured.empty() ? Upper(configured.substr(configured.rfind('/') + 1)) :
-            pad_count == 0 ? std::string("NO GAMEPAD") :
-            i == 0         ? std::string("CHOOSE A PAD") :
-                             std::string("NONE");
-        theme::ValueSelector(dl, cv, fonts, 554, y + 48, device, 300, pad_count > 0);
+        theme::ValueSelector(dl, cv, fonts, 554, y + 48, device_label(i), 300, pad_count > 0);
       }
       for (int i = 0; i < 2; ++i)
       {
@@ -2548,11 +2862,14 @@ int main(int argc, char** argv)
                   434, caption, theme::color::kGrey, false);
       theme::GcController(dl, cv, 1030, 552, 300, pressed, stick, cstick);
       if (in_page)
-        help = focus == 0 ? "The gamepad for player 1. Changing it writes a fresh GameCube "
-                            "button layout for the pads in use." :
-               focus == 1 ? "A second gamepad for player 2, for two-player battles, or a "
-                            "GAME BOY ADVANCE for Colosseum's GBA battles. NONE leaves port "
-                            "2 empty. Player 1's setup is not touched." :
+        help = focus == 0 ? "The gamepad or the keyboard for player 1. Changing it writes "
+                            "that device's default GameCube layout; BUTTON MAPPING changes "
+                            "single buttons." :
+               focus == 1 ? "A second gamepad or the keyboard for player 2, for two-player "
+                            "battles, or a GAME BOY ADVANCE for Colosseum's GBA battles. NONE "
+                            "leaves port 2 empty. Player 1's setup is not touched." :
+               focus == 5 ? "Choose which key or button plays each GameCube button, stick "
+                            "direction and trigger, for player 1 or player 2." :
                focus == 2 ? "The GBA game that Colosseum links with: Pokemon Ruby or "
                             "Sapphire. Each GBA keeps its own save; save at a Pokemon "
                             "Center on it before linking." :
@@ -2584,6 +2901,16 @@ int main(int argc, char** argv)
         theme::Row contrast = toggle("HIGH-CONTRAST MINIMAP", &config.minimap_high_contrast,
                                      "Stronger minimap colours. Turning it on also starts the "
                                      "compact minimap if the overlay is off.");
+      else if (dir > 0 && focus == 5)
+      {
+        mapping.open = true;
+        mapping.focus = 1;
+        mapping.capturing = -1;
+        mapping.status.clear();
+      }
+      // The mapping screen opens on the player last chosen here.
+      if (focus == 0 || focus == 1)
+        mapping.port = focus;
         contrast.changed = [&](const theme::Row& row)
         {
           const bool previous = config.minimap_high_contrast;
@@ -2607,6 +2934,26 @@ int main(int argc, char** argv)
                             "Text size of on-screen messages and overlays."));
       rows.push_back(slider("OVERLAY UI SCALE", &config.accessibility_ui_scale, 75, 200, 5, "%",
                             "Scales the overlays (minimap, input display) for readability."));
+      // The way into BUTTON MAPPING, with what each player has.
+      theme::SteelPanel(dl, cv, 880, 206, 1220, 396, 14, IM_COL32(8, 10, 12, 230));
+      if (in_page && focus == 5)
+        theme::Chevron(dl, cv, 896, 228, 14);
+      theme::Text(dl, cv, fonts.menu, 36, 920, 222, "BUTTON MAPPING",
+                  in_page && focus == 5 ? theme::color::kWhite : theme::color::kText);
+      for (int i = 0; i < 2; ++i)
+      {
+        theme::Text(dl, cv, fonts.small, 24, 920, 280 + i * 34.0f, "P" + std::to_string(i + 1),
+                    theme::color::kGold);
+        std::string label = device_label(i);
+        // Shortened to fit the panel, a letter at a time.
+        while (label.size() > 4 && theme::TextWidth(fonts.small, 24, label) > 236)
+          label = label.substr(0, label.size() - 4) + "...";
+        theme::Text(dl, cv, fonts.small, 24, 964, 280 + i * 34.0f, label, theme::color::kWhite);
+      }
+      theme::Text(dl, cv, fonts.body, 13, 920, 360,
+                  gamepad_input ? "A: CHANGE ANY BUTTON OR STICK" :
+                                  "ENTER: CHANGE ANY KEY OR BUTTON",
+                  theme::color::kDim, false);
       rows.push_back(toggle("HD TEXTURES", &config.hires_textures,
                             "Loads replacement textures from Load/Textures."));
       rows.push_back(toggle("HD DYNAMIC TEXT", &config.text_upscale,

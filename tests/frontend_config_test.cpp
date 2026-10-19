@@ -1,3 +1,4 @@
+#include "controller_bindings.hpp"
 #include "frontend_config.hpp"
 
 #include <chrono>
@@ -5,6 +6,8 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
+#include <vector>
 
 #ifdef MODERNGEKKO_GAMECUBE_CONTROLLERS
 constexpr const char *CONTROLLER_CONFIG_NAME = "GCPadNew.ini";
@@ -287,6 +290,86 @@ int main() {
   if (preserved != custom || moderngekko::frontend::ReadConfiguredController(
                                  directory) != "SDL/9/Custom Controller")
     return 12;
+
+#ifdef MODERNGEKKO_GAMECUBE_CONTROLLERS
+  namespace fe = moderngekko::frontend;
+  // Each keyboard backend gets the documented layout under its own key names.
+  {
+    const auto layout = [](std::string_view device, std::string_view key) {
+      for (const auto &[k, v] : fe::DefaultBindings(device))
+        if (k == key)
+          return v;
+      return std::string();
+    };
+    const std::string dinput = "DInput/0/Keyboard Mouse";
+    const std::string quartz = "Quartz/0/Keyboard & Mouse";
+    const std::string xinput2 = "XInput2/0/Virtual core pointer";
+    if (!fe::IsKeyboardDevice(dinput) || !fe::IsKeyboardDevice(quartz) ||
+        !fe::IsKeyboardDevice(xinput2) || fe::IsKeyboardDevice(controller) ||
+        !fe::IsKeyboardDevice(fe::KeyboardDevice()) ||
+        layout(dinput, "Buttons/Z") != "`LSHIFT`" ||
+        layout(dinput, "Buttons/Start") != "`RETURN`" ||
+        layout(dinput, "D-Pad/Up") != "`UP`" ||
+        layout(quartz, "Buttons/Z") != "`Left Shift`" ||
+        layout(quartz, "Buttons/Start") != "`Return`" ||
+        layout(quartz, "D-Pad/Left") != "`Left Arrow`" ||
+        layout(xinput2, "Buttons/Z") != "`Shift_L`" ||
+        layout(xinput2, "D-Pad/Down") != "`Down`" ||
+        layout(xinput2, "Main Stick/Up") != "`W`" ||
+        layout(quartz, "C-Stick/Left") != "`J`" ||
+        layout(dinput, "Buttons/A") != "`X`" ||
+        layout(dinput, "Triggers/R") != "`E`" ||
+        layout(controller, "Buttons/A") != "`Button A`")
+      return 29;
+    if (fe::ReadableBinding("`LSHIFT`") != "LEFT SHIFT" ||
+        fe::ReadableBinding("`Left Shift`") != "LEFT SHIFT" ||
+        fe::ReadableBinding("`Button A`") != "BUTTON A" ||
+        fe::ReadableBinding("Start") != "START" ||
+        fe::ReadableBinding("`Motor L` | `Motor R`") != "MOTOR L / MOTOR R" ||
+        fe::ReadableBinding("`Left Y+`") != "LEFT STICK UP" ||
+        fe::ReadableBinding("`RETURN`") != "ENTER")
+      return 30;
+    if (fe::KeyNameForHid(225, fe::KeyboardBackend::Quartz) != "Left Shift" ||
+        fe::KeyNameForHid(4, fe::KeyboardBackend::DInput) != "A" ||
+        !fe::KeyNameForHid(73, fe::KeyboardBackend::Quartz).empty())
+      return 31;
+  }
+
+  // Selecting the keyboard writes its layout; rebinding one key keeps the
+  // rest of the profile, and player 2's section, as they are.
+  if (!fe::GenerateControllerConfig(
+          directory, std::vector<std::string>{"DInput/0/Keyboard Mouse", controller},
+          &error))
+    return 32;
+  {
+    const auto bindings = fe::ReadControllerBindings(directory, 0);
+    bool z = false;
+    for (const auto &[k, v] : bindings)
+      z = z || (k == "Buttons/Z" && v == "`LSHIFT`");
+    if (!z || fe::ReadControllerPorts(directory)[0] != "DInput/0/Keyboard Mouse")
+      return 33;
+  }
+  const std::vector<std::pair<std::string, std::string>> rebind = {
+      {"Buttons/Z", "`SPACE`"}, {"Rumble/Motor", "`X`"}};
+  if (!fe::SetControllerBindings(directory, 0, rebind, &error))
+    return 34;
+  {
+    std::string pad1, pad2;
+    for (const auto &[k, v] : fe::ReadControllerBindings(directory, 0))
+      pad1 += k + "=" + v + "\n";
+    for (const auto &[k, v] : fe::ReadControllerBindings(directory, 1))
+      pad2 += k + "=" + v + "\n";
+    if (!pad1.contains("Buttons/Z=`SPACE`\n") || pad1.contains("`LSHIFT`") ||
+        !pad1.contains("Buttons/A=`X`\n") || !pad1.contains("Rumble/Motor=`X`\n") ||
+        !pad2.contains("Device=" + controller + "\n") ||
+        !pad2.contains("Buttons/Z=`Shoulder R`\n") || pad2.contains("SPACE"))
+      return 35;
+  }
+  // A port without a section gets one.
+  if (!fe::SetControllerBindings(directory, 3, rebind, &error) ||
+      fe::ReadControllerBindings(directory, 3).size() != 2)
+    return 36;
+#endif
 
   fs::remove_all(directory);
   return 0;

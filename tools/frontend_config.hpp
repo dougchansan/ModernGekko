@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace moderngekko::frontend {
@@ -107,7 +108,8 @@ bool GenerateControllerConfig(const std::filesystem::path &user_directory,
 bool GenerateControllerConfig(const std::filesystem::path &user_directory,
                               std::string_view controller,
                               std::string *message);
-// Maps one port (0-3) to an SDL gamepad, or leaves it empty for "", and
+// Maps one port (0-3) to a gamepad or the keyboard (each with its default
+// layout), or leaves it empty for "", and
 // keeps every other port's section exactly as it is (a keyboard player 1 or a
 // hand-tuned mapping survives a change to player 2).
 bool SetControllerPort(const std::filesystem::path &user_directory, int port,
@@ -116,6 +118,15 @@ bool SetControllerPort(const std::filesystem::path &user_directory, int port,
 // unlike ReadConfiguredControllers).
 std::array<std::string, 4>
 ReadControllerPorts(const std::filesystem::path &user_directory);
+// One port's section as written (Device included), in file order.
+std::vector<std::pair<std::string, std::string>>
+ReadControllerBindings(const std::filesystem::path &user_directory, int port);
+// Sets keys in one port's section, adding the ones it lacks; every other
+// line of the profile is kept as it is.
+bool SetControllerBindings(
+    const std::filesystem::path &user_directory, int port,
+    std::span<const std::pair<std::string, std::string>> bindings,
+    std::string *message);
 bool EnsureControllerConfig(const std::filesystem::path &user_directory,
                             std::span<const std::string> controllers,
                             std::string *message);

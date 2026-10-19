@@ -1,5 +1,7 @@
 #include "frontend_config.hpp"
 
+#include "controller_bindings.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -581,32 +583,10 @@ bool GenerateControllerConfig(const fs::path &user_directory,
     output << "[GCPad" << i + 1 << "]\n";
     if (i >= controllers.size())
       continue;
-    output << "Device = " << controllers[i] << '\n'
-           << "Buttons/A = `Button A`\n"
-              "Buttons/B = `Button B`\n"
-              "Buttons/X = `Button X`\n"
-              "Buttons/Y = `Button Y`\n"
-              "Buttons/Z = `Shoulder R`\n"
-              "Buttons/Start = Start\n"
-              "Main Stick/Up = `Left Y+`\n"
-              "Main Stick/Down = `Left Y-`\n"
-              "Main Stick/Left = `Left X-`\n"
-              "Main Stick/Right = `Left X+`\n"
-              "Main Stick/Calibration = 100.00\n"
-              "C-Stick/Up = `Right Y+`\n"
-              "C-Stick/Down = `Right Y-`\n"
-              "C-Stick/Left = `Right X-`\n"
-              "C-Stick/Right = `Right X+`\n"
-              "C-Stick/Calibration = 100.00\n"
-              "Triggers/L = `Trigger L`\n"
-              "Triggers/R = `Trigger R`\n"
-              "Triggers/L-Analog = `Trigger L`\n"
-              "Triggers/R-Analog = `Trigger R`\n"
-              "D-Pad/Up = `Pad N`\n"
-              "D-Pad/Down = `Pad S`\n"
-              "D-Pad/Left = `Pad W`\n"
-              "D-Pad/Right = `Pad E`\n"
-              "Rumble/Motor = `Motor L` | `Motor R`\n";
+    output << "Device = " << controllers[i] << '\n';
+    // A keyboard gets the keyboard layout, any other device the gamepad one.
+    for (const auto &[key, value] : DefaultBindings(controllers[i]))
+      output << key << " = " << value << '\n';
 #else
     output << "[Wiimote" << i + 1 << "]\n";
     if (i >= controllers.size())
@@ -782,6 +762,114 @@ bool SetControllerPort(const fs::path &user_directory, int port, std::string_vie
   if (message)
     *message = controller.empty() ? "Player " + std::to_string(port + 1) + " disconnected"
                                   : "Player " + std::to_string(port + 1) + " mapped";
+  return true;
+}
+
+std::vector<std::pair<std::string, std::string>>
+ReadControllerBindings(const fs::path &user_directory, int port) {
+  std::vector<std::pair<std::string, std::string>> bindings;
+  std::ifstream input(ControllerConfigPath(user_directory));
+  const std::string header =
+      std::string(ControllerSectionPrefix()) + std::to_string(port + 1) + "]";
+  std::string line;
+  bool inside = false;
+  while (std::getline(input, line)) {
+    const std::string trimmed = Trim(line);
+    if (trimmed.starts_with('[')) {
+      inside = trimmed == header;
+      continue;
+    }
+    const std::size_t separator = trimmed.find('=');
+    if (inside && separator != std::string::npos)
+      bindings.emplace_back(Trim(trimmed.substr(0, separator)),
+                            Trim(trimmed.substr(separator + 1)));
+  }
+  return bindings;
+}
+
+bool SetControllerBindings(
+    const fs::path &user_directory, int port,
+    std::span<const std::pair<std::string, std::string>> bindings,
+    std::string *message) {
+  if (port < 0 || port > 3) {
+    if (message)
+      *message = "invalid controller port";
+    return false;
+  }
+  for (const auto &[key, value] : bindings) {
+    if (key.empty() || key.find_first_of("=\r\n") != std::string::npos ||
+        value.find_first_of("\r\n") != std::string::npos) {
+      if (message)
+        *message = "invalid controller binding";
+      return false;
+    }
+  }
+  std::vector<std::string> lines;
+  {
+    std::ifstream in(ControllerConfigPath(user_directory));
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      lines.push_back(line);
+    }
+  }
+  const std::string header =
+      std::string(ControllerSectionPrefix()) + std::to_string(port + 1) + "]";
+  std::vector<bool> written(bindings.size(), false);
+  const auto pending = [&] {
+    std::string text;
+    for (std::size_t i = 0; i < bindings.size(); ++i)
+      if (!written[i]) {
+        text += bindings[i].first + " = " + bindings[i].second + '\n';
+        written[i] = true;
+      }
+    return text;
+  };
+  std::string output;
+  bool inside = false, found = false;
+  for (const std::string &line : lines) {
+    const std::string trimmed = Trim(line);
+    if (trimmed.starts_with('[')) {
+      if (inside)
+        output += pending();  // keys the section did not have yet
+      inside = trimmed == header;
+      found = found || inside;
+      output += line + '\n';
+      continue;
+    }
+    const std::size_t separator = trimmed.find('=');
+    if (inside && separator != std::string::npos) {
+      const std::string key = Trim(trimmed.substr(0, separator));
+      bool replaced = false;
+      for (std::size_t i = 0; i < bindings.size(); ++i)
+        if (bindings[i].first == key) {
+          if (!written[i])
+            output += key + " = " + bindings[i].second + '\n';
+          written[i] = true;
+          replaced = true;
+        }
+      if (replaced)
+        continue;
+    }
+    output += line + '\n';
+  }
+  if (inside)
+    output += pending();
+  if (!found)
+    output += header + '\n' + pending();
+  const fs::path destination = ControllerConfigPath(user_directory);
+  std::error_code ec;
+  fs::create_directories(destination.parent_path(), ec);
+  std::ofstream file(destination, std::ios::trunc);
+  file << output;
+  if (!file) {
+    if (message)
+      *message = "can't write " + destination.string();
+    return false;
+  }
+  if (message)
+    *message = "Player " + std::to_string(port + 1) + " binding saved";
   return true;
 }
 

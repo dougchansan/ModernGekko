@@ -1,5 +1,7 @@
 #include "players_ui.hpp"
 
+#include "controller_bindings.hpp"
+
 #include "gba_screen.hpp"
 
 #include <algorithm>
@@ -219,41 +221,19 @@ void Plug(int port, Socket socket)
 
 bool IsGamepad(const std::string& device)
 {
-  return device.starts_with("SDL/") || device.starts_with("XInput/");
+  return moderngekko::frontend::IsGamepadDevice(device);
 }
 
-// A device's buttons in the GameCube controller's places: positional pad
-// names, which Dolphin matches on any gamepad (as the launcher writes them).
+// A device's buttons in the GameCube controller's places, as the launcher
+// writes them: positional pad names, which Dolphin matches on any gamepad,
+// or the documented keyboard layout under that keyboard backend's key names.
 void MapController(ControllerEmu::EmulatedController* pad, const std::string& device)
 {
   Common::IniFile ini;
   auto* map = ini.GetOrCreateSection("pad");
   map->Set("Device", device);
-  map->Set("Buttons/A", std::string("`Button A`"));
-  map->Set("Buttons/B", std::string("`Button B`"));
-  map->Set("Buttons/X", std::string("`Button X`"));
-  map->Set("Buttons/Y", std::string("`Button Y`"));
-  map->Set("Buttons/Z", std::string("`Shoulder R`"));
-  map->Set("Buttons/Start", std::string("Start"));
-  map->Set("Main Stick/Up", std::string("`Left Y+`"));
-  map->Set("Main Stick/Down", std::string("`Left Y-`"));
-  map->Set("Main Stick/Left", std::string("`Left X-`"));
-  map->Set("Main Stick/Right", std::string("`Left X+`"));
-  map->Set("Main Stick/Calibration", std::string("100.00"));
-  map->Set("C-Stick/Up", std::string("`Right Y+`"));
-  map->Set("C-Stick/Down", std::string("`Right Y-`"));
-  map->Set("C-Stick/Left", std::string("`Right X-`"));
-  map->Set("C-Stick/Right", std::string("`Right X+`"));
-  map->Set("C-Stick/Calibration", std::string("100.00"));
-  map->Set("Triggers/L", std::string("`Trigger L`"));
-  map->Set("Triggers/R", std::string("`Trigger R`"));
-  map->Set("Triggers/L-Analog", std::string("`Trigger L`"));
-  map->Set("Triggers/R-Analog", std::string("`Trigger R`"));
-  map->Set("D-Pad/Up", std::string("`Pad N`"));
-  map->Set("D-Pad/Down", std::string("`Pad S`"));
-  map->Set("D-Pad/Left", std::string("`Pad W`"));
-  map->Set("D-Pad/Right", std::string("`Pad E`"));
-  map->Set("Rumble/Motor", std::string("`Motor L` | `Motor R`"));
+  for (const auto& [key, value] : moderngekko::frontend::DefaultBindings(device))
+    map->Set(key, value);
   pad->LoadConfig(map);
 }
 
@@ -301,7 +281,8 @@ void UseDevice(Socket socket, int port, const std::string& device)
   {
     auto lock = ControllerEmu::EmulatedController::GetStateLock();
     ControllerEmu::EmulatedController* pad = config->GetController(port);
-    if (IsGamepad(device))
+    if (IsGamepad(device) ||
+        (socket != Socket::Gba && moderngekko::frontend::IsKeyboardDevice(device)))
     {
       if (socket == Socket::Gba)
         MapGba(pad, device);
@@ -310,7 +291,7 @@ void UseDevice(Socket socket, int port, const std::string& device)
     }
     else
     {
-      // A keyboard (or anything else) gets Dolphin's own layout for it.
+      // A GBA on the keyboard (or anything else) gets Dolphin's own layout.
       pad->LoadDefaults(g_controller_interface);
       pad->SetDefaultDevice(device);
     }
