@@ -146,11 +146,11 @@ std::vector<ControllerOption> EnumerateControllers()
     result.emplace_back(std::move(option));
   }
   SDL_free(joystick_ids);
-  return result;
-}
   // The keyboard is always there, after the gamepads, so a player without a
   // pad can pick it and the first run falls back to it.
   result.push_back({"Keyboard", std::string(moderngekko::frontend::KeyboardDevice())});
+  return result;
+}
 
 int FindController(const std::vector<ControllerOption>& controllers, std::string_view device)
 {
@@ -781,41 +781,6 @@ struct CardMenu
   bool fresh = true;  // opened this frame
 };
 
-// The naming dialog for a new, renamed or copied card.
-struct Naming
-{
-  enum class Mode
-  {
-    None,
-    New,
-    Rename,
-    Duplicate,
-  };
-  Mode mode = Mode::None;
-  int index = -1;
-  std::array<char, 25> text{};  // 24 characters
-  bool focus = false;
-  bool typed = false;  // the suggestion has been replaced
-  moderngekko::onscreen_keyboard::Cursor cursor;
-  std::string error;
-};
-
-int CardNameFilter(ImGuiInputTextCallbackData* data)
-{
-  const ImWchar c = data->EventChar;
-  return c < 128 && (std::isalnum(c) || c == ' ' || c == '-' || c == '_') ? 0 : 1;
-}
-
-// "Play time 42:17" (hours:minutes, as the game shows it), or empty.
-std::string CardPlayTime(const moderngekko::frontend::LibraryCard& card)
-{
-  if (card.playtime < 0)
-    return {};
-  char text[32];
-  std::snprintf(text, sizeof(text), "Play time %d:%02d", card.playtime / 3600,
-                card.playtime / 60 % 60);
-  return text;
-}
 // The BUTTON MAPPING screen, opened from the Controllers page: every
 // GameCube input of one player with its binding, rebound by pressing the
 // key or button to use.
@@ -858,6 +823,41 @@ std::string PressedGamepadInput()
   return {};
 }
 
+// The naming dialog for a new, renamed or copied card.
+struct Naming
+{
+  enum class Mode
+  {
+    None,
+    New,
+    Rename,
+    Duplicate,
+  };
+  Mode mode = Mode::None;
+  int index = -1;
+  std::array<char, 25> text{};  // 24 characters
+  bool focus = false;
+  bool typed = false;  // the suggestion has been replaced
+  moderngekko::onscreen_keyboard::Cursor cursor;
+  std::string error;
+};
+
+int CardNameFilter(ImGuiInputTextCallbackData* data)
+{
+  const ImWchar c = data->EventChar;
+  return c < 128 && (std::isalnum(c) || c == ' ' || c == '-' || c == '_') ? 0 : 1;
+}
+
+// "Play time 42:17" (hours:minutes, as the game shows it), or empty.
+std::string CardPlayTime(const moderngekko::frontend::LibraryCard& card)
+{
+  if (card.playtime < 0)
+    return {};
+  char text[32];
+  std::snprintf(text, sizeof(text), "Play time %d:%02d", card.playtime / 3600,
+                card.playtime / 60 % 60);
+  return text;
+}
 
 std::string CardWhen(const moderngekko::frontend::LibraryCard& card)
 {
@@ -1415,6 +1415,7 @@ int main(int argc, char** argv)
   Naming naming;
   Confirm confirm;
   CardMenu card_menu;
+  Mapping mapping;
 
   const auto persist = [&]
   {
@@ -1450,7 +1451,6 @@ int main(int argc, char** argv)
       *value = previous;
       return false;
     };
-  Mapping mapping;
     return row;
   };
   const auto slider = [&](const char* label, int* value, int min, int max, int step,
@@ -1858,6 +1858,20 @@ int main(int argc, char** argv)
         if (confirm.open)
           confirm.fresh = true;  // stays up for the picture
       }
+      // The button mapping screen, then the same screen waiting for a key.
+      if (capture_shot >= kPageCount + 6)
+      {
+        confirm.open = false;
+        card_menu.open = false;
+        carousel_open = false;
+        carousel_t = 0;
+        page = kControllers;
+        mapping.open = true;
+        mapping.port = 0;
+        mapping.focus = capture_shot == kPageCount + 6 ? 1 : 5;
+        mapping.capturing = capture_shot == kPageCount + 6 ? -1 : 4;
+        mapping.deadline = std::chrono::steady_clock::now() + kMappingWait;
+      }
     }
 
     ImGui_ImplSDLRenderer3_NewFrame();
@@ -1937,20 +1951,6 @@ int main(int argc, char** argv)
     if (clicked && mouse_in(420, 186, 1240, 690))
       in_page = true;
 
-      // The button mapping screen, then the same screen waiting for a key.
-      if (capture_shot >= kPageCount + 6)
-      {
-        confirm.open = false;
-        card_menu.open = false;
-        carousel_open = false;
-        carousel_t = 0;
-        page = kControllers;
-        mapping.open = true;
-        mapping.port = 0;
-        mapping.focus = capture_shot == kPageCount + 6 ? 1 : 5;
-        mapping.capturing = capture_shot == kPageCount + 6 ? -1 : 4;
-        mapping.deadline = std::chrono::steady_clock::now() + kMappingWait;
-      }
     if (!in_page)
     {
       if (in.up)
@@ -2451,113 +2451,6 @@ int main(int argc, char** argv)
       const auto ports = moderngekko::frontend::ReadControllerPorts(user_directory);
       const int p1 = FindController(controllers, ports[0].empty() ? selected_controller : ports[0]);
       const int p2 = FindController(controllers, ports[1]);
-      int& focus = row_focus[page];
-      focus = std::clamp(focus, 0, 5);
-      {
-        const int at = static_cast<int>(std::ranges::find(kFocusOrder, focus) -
-                                        std::begin(kFocusOrder));
-        if (page_in.down)
-          focus = kFocusOrder[std::min(at + 1, 5)];
-        if (page_in.up)
-          focus = kFocusOrder[std::max(at - 1, 0)];
-      }
-      int dir = page_in.right || page_in.accept ? 1 : page_in.left ? -1 : 0;
-      for (int i = 0; i < 2; ++i)
-      {
-        const float y = 206 + i * 104.0f;
-        if (mouse_in(450, y, 860, y + 90))
-        {
-          if (mouse_moved)
-            focus = i;
-          if (clicked && mouse_in(554, y + 46, 854, y + 86))
-          {
-            focus = i;
-            dir = mouse_in(554, y + 46, 704, y + 86) ? -1 : 1;
-          }
-        }
-      }
-      for (int i = 0; i < 2; ++i)
-      {
-        const float y = 426 + i * 34.0f;
-        if (mouse_in(440, y, 830, y + 32))
-        {
-          if (mouse_moved)
-            focus = 2 + i;
-          if (clicked)
-          {
-            focus = 2 + i;
-            dir = 1;
-          }
-        }
-      }
-      if (mouse_in(440, 500, 800, 580))
-      {
-        if (mouse_moved)
-          focus = 4;
-        if (clicked)
-        {
-          focus = 4;
-          dir = 1;
-        }
-      }
-      if (dir && focus == 0 && pad_count > 0)
-      {
-        int next = p1 < 0 ? 0 : ((p1 + dir) % pad_count + pad_count) % pad_count;
-        if (next == p2 && pad_count > 1)
-          next = ((next + dir) % pad_count + pad_count) % pad_count;
-        if (next != p2)
-          assign_port(0, controllers[static_cast<std::size_t>(next)].device);
-      }
-      else if (dir && focus == 1)
-      {
-        // Options: none, every pad except player 1's, then a Game Boy Advance.
-        const int options = pad_count + 2;
-        int option = gba.player2 ? pad_count + 1 : p2 + 1;
-        do
-          option = ((option + dir) % options + options) % options;
-        while (option > 0 && option <= pad_count && option - 1 == p1);
-        const bool to_gba = option == pad_count + 1;
-        if (to_gba != gba.player2)
-        {
-          gba.player2 = to_gba;
-          WriteGbaSettings(user_directory, gba);
-        }
-        if (to_gba)
-        {
-          // The GBA is played on the first pad that is not player 1's.
-          std::string pad;
-          for (int i = 0; i < pad_count && pad.empty(); ++i)
-            if (i != p1 && !moderngekko::frontend::IsKeyboardDevice(
-                               controllers[static_cast<std::size_t>(i)].device))
-              pad = controllers[static_cast<std::size_t>(i)].device;
-          if (pad.empty() && p1 >= 0 &&
-              !moderngekko::frontend::IsKeyboardDevice(
-                  controllers[static_cast<std::size_t>(p1)].device))
-            pad = controllers[static_cast<std::size_t>(p1)].device;
-          if (!pad.empty())
-            MapGbaPad(user_directory, pad);
-          assign_port(1, std::string());
-        }
-        else
-        {
-          assign_port(1, option == 0 ? std::string() :
-                                       controllers[static_cast<std::size_t>(option - 1)].device);
-        }
-      }
-      else if (dir && (focus == 2 || focus == 3))
-      {
-        const bool rom = focus == 2;
-        static constexpr SDL_DialogFileFilter rom_filters[] = {{"Game Boy Advance games", "gba"}};
-        static constexpr SDL_DialogFileFilter bios_filters[] = {{"GBA BIOS", "bin;rom"}};
-        const fs::path& current = rom ? gba.rom : gba.bios;
-        const std::string start = current.empty() ? DocumentsDirectory().string() :
-                                                    current.parent_path().string();
-        SDL_ShowOpenFileDialog(FileDialogCallback, rom ? &gba_rom_dialog : &gba_bios_dialog,
-                               window, rom ? rom_filters : bios_filters, 1, start.c_str(),
-                               false);
-      }
-      else if (dir && focus == 4)
-      {
       // What plays each player, as the selectors and the mapping screen show it.
       const auto device_label = [&](int i)
       {
@@ -2796,13 +2689,17 @@ int main(int argc, char** argv)
       }
 
       static constexpr int kFocusOrder[] = {0, 1, 5, 2, 3, 4};
-        config.input_overlay = !config.input_overlay;
-        if (!persist())
-          config.input_overlay = !config.input_overlay;
+      int& focus = row_focus[page];
+      focus = std::clamp(focus, 0, 5);
+      {
+        const int at = static_cast<int>(std::ranges::find(kFocusOrder, focus) -
+                                        std::begin(kFocusOrder));
+        if (page_in.down)
+          focus = kFocusOrder[std::min(at + 1, 5)];
+        if (page_in.up)
+          focus = kFocusOrder[std::max(at - 1, 0)];
       }
-
-      // Espeon and Umbreon, the two partners the game starts you with.
-      constexpr int kPlayerSpecies[2] = {196, 197};
+      int dir = page_in.right || page_in.accept ? 1 : page_in.left ? -1 : 0;
       if (mouse_in(880, 206, 1220, 396))
       {
         if (mouse_moved)
@@ -2816,11 +2713,144 @@ int main(int argc, char** argv)
       for (int i = 0; i < 2; ++i)
       {
         const float y = 206 + i * 104.0f;
+        if (mouse_in(450, y, 860, y + 90))
+        {
+          if (mouse_moved)
+            focus = i;
+          if (clicked && mouse_in(554, y + 46, 854, y + 86))
+          {
+            focus = i;
+            dir = mouse_in(554, y + 46, 704, y + 86) ? -1 : 1;
+          }
+        }
+      }
+      for (int i = 0; i < 2; ++i)
+      {
+        const float y = 426 + i * 34.0f;
+        if (mouse_in(440, y, 830, y + 32))
+        {
+          if (mouse_moved)
+            focus = 2 + i;
+          if (clicked)
+          {
+            focus = 2 + i;
+            dir = 1;
+          }
+        }
+      }
+      if (mouse_in(440, 500, 800, 580))
+      {
+        if (mouse_moved)
+          focus = 4;
+        if (clicked)
+        {
+          focus = 4;
+          dir = 1;
+        }
+      }
+      if (dir && focus == 0 && pad_count > 0)
+      {
+        int next = p1 < 0 ? 0 : ((p1 + dir) % pad_count + pad_count) % pad_count;
+        if (next == p2 && pad_count > 1)
+          next = ((next + dir) % pad_count + pad_count) % pad_count;
+        if (next != p2)
+          assign_port(0, controllers[static_cast<std::size_t>(next)].device);
+      }
+      else if (dir && focus == 1)
+      {
+        // Options: none, every pad except player 1's, then a Game Boy Advance.
+        const int options = pad_count + 2;
+        int option = gba.player2 ? pad_count + 1 : p2 + 1;
+        do
+          option = ((option + dir) % options + options) % options;
+        while (option > 0 && option <= pad_count && option - 1 == p1);
+        const bool to_gba = option == pad_count + 1;
+        if (to_gba != gba.player2)
+        {
+          gba.player2 = to_gba;
+          WriteGbaSettings(user_directory, gba);
+        }
+        if (to_gba)
+        {
+          // The GBA is played on the first pad that is not player 1's.
+          std::string pad;
+          for (int i = 0; i < pad_count && pad.empty(); ++i)
+            if (i != p1 && !moderngekko::frontend::IsKeyboardDevice(
+                               controllers[static_cast<std::size_t>(i)].device))
+              pad = controllers[static_cast<std::size_t>(i)].device;
+          if (pad.empty() && p1 >= 0 &&
+              !moderngekko::frontend::IsKeyboardDevice(
+                  controllers[static_cast<std::size_t>(p1)].device))
+            pad = controllers[static_cast<std::size_t>(p1)].device;
+          if (!pad.empty())
+            MapGbaPad(user_directory, pad);
+          assign_port(1, std::string());
+        }
+        else
+        {
+          assign_port(1, option == 0 ? std::string() :
+                                       controllers[static_cast<std::size_t>(option - 1)].device);
+        }
+      }
+      else if (dir && (focus == 2 || focus == 3))
+      {
+        const bool rom = focus == 2;
+        static constexpr SDL_DialogFileFilter rom_filters[] = {{"Game Boy Advance games", "gba"}};
+        static constexpr SDL_DialogFileFilter bios_filters[] = {{"GBA BIOS", "bin;rom"}};
+        const fs::path& current = rom ? gba.rom : gba.bios;
+        const std::string start = current.empty() ? DocumentsDirectory().string() :
+                                                    current.parent_path().string();
+        SDL_ShowOpenFileDialog(FileDialogCallback, rom ? &gba_rom_dialog : &gba_bios_dialog,
+                               window, rom ? rom_filters : bios_filters, 1, start.c_str(),
+                               false);
+      }
+      else if (dir && focus == 4)
+      {
+        config.input_overlay = !config.input_overlay;
+        if (!persist())
+          config.input_overlay = !config.input_overlay;
+      }
+      else if (dir > 0 && focus == 5)
+      {
+        mapping.open = true;
+        mapping.focus = 1;
+        mapping.capturing = -1;
+        mapping.status.clear();
+      }
+      // The mapping screen opens on the player last chosen here.
+      if (focus == 0 || focus == 1)
+        mapping.port = focus;
+
+      // Espeon and Umbreon, the two partners the game starts you with.
+      constexpr int kPlayerSpecies[2] = {196, 197};
+      for (int i = 0; i < 2; ++i)
+      {
+        const float y = 206 + i * 104.0f;
         draw_portrait(dl, cv, kPlayerSpecies[i], 450, y, 64, in_page && focus == i,
                       "P" + std::to_string(i + 1));
         theme::Text(dl, cv, fonts.menu, 36, 554, y + 8, "PLAYER " + std::to_string(i + 1));
         theme::ValueSelector(dl, cv, fonts, 554, y + 48, device_label(i), 300, pad_count > 0);
       }
+      // The way into BUTTON MAPPING, with what each player has.
+      theme::SteelPanel(dl, cv, 880, 206, 1220, 396, 14, IM_COL32(8, 10, 12, 230));
+      if (in_page && focus == 5)
+        theme::Chevron(dl, cv, 896, 228, 14);
+      theme::Text(dl, cv, fonts.menu, 36, 920, 222, "BUTTON MAPPING",
+                  in_page && focus == 5 ? theme::color::kWhite : theme::color::kText);
+      for (int i = 0; i < 2; ++i)
+      {
+        theme::Text(dl, cv, fonts.small, 24, 920, 280 + i * 34.0f, "P" + std::to_string(i + 1),
+                    theme::color::kGold);
+        std::string label = device_label(i);
+        // Shortened to fit the panel, a letter at a time.
+        while (label.size() > 4 && theme::TextWidth(fonts.small, 24, label) > 236)
+          label = label.substr(0, label.size() - 4) + "...";
+        theme::Text(dl, cv, fonts.small, 24, 964, 280 + i * 34.0f, label, theme::color::kWhite);
+      }
+      theme::Text(dl, cv, fonts.body, 13, 920, 360,
+                  gamepad_input ? "A: CHANGE ANY BUTTON OR STICK" :
+                                  "ENTER: CHANGE ANY KEY OR BUTTON",
+                  theme::color::kDim, false);
       for (int i = 0; i < 2; ++i)
       {
         const float y = 430 + i * 34.0f;
@@ -2901,16 +2931,6 @@ int main(int argc, char** argv)
         theme::Row contrast = toggle("HIGH-CONTRAST MINIMAP", &config.minimap_high_contrast,
                                      "Stronger minimap colours. Turning it on also starts the "
                                      "compact minimap if the overlay is off.");
-      else if (dir > 0 && focus == 5)
-      {
-        mapping.open = true;
-        mapping.focus = 1;
-        mapping.capturing = -1;
-        mapping.status.clear();
-      }
-      // The mapping screen opens on the player last chosen here.
-      if (focus == 0 || focus == 1)
-        mapping.port = focus;
         contrast.changed = [&](const theme::Row& row)
         {
           const bool previous = config.minimap_high_contrast;
@@ -2934,26 +2954,6 @@ int main(int argc, char** argv)
                             "Text size of on-screen messages and overlays."));
       rows.push_back(slider("OVERLAY UI SCALE", &config.accessibility_ui_scale, 75, 200, 5, "%",
                             "Scales the overlays (minimap, input display) for readability."));
-      // The way into BUTTON MAPPING, with what each player has.
-      theme::SteelPanel(dl, cv, 880, 206, 1220, 396, 14, IM_COL32(8, 10, 12, 230));
-      if (in_page && focus == 5)
-        theme::Chevron(dl, cv, 896, 228, 14);
-      theme::Text(dl, cv, fonts.menu, 36, 920, 222, "BUTTON MAPPING",
-                  in_page && focus == 5 ? theme::color::kWhite : theme::color::kText);
-      for (int i = 0; i < 2; ++i)
-      {
-        theme::Text(dl, cv, fonts.small, 24, 920, 280 + i * 34.0f, "P" + std::to_string(i + 1),
-                    theme::color::kGold);
-        std::string label = device_label(i);
-        // Shortened to fit the panel, a letter at a time.
-        while (label.size() > 4 && theme::TextWidth(fonts.small, 24, label) > 236)
-          label = label.substr(0, label.size() - 4) + "...";
-        theme::Text(dl, cv, fonts.small, 24, 964, 280 + i * 34.0f, label, theme::color::kWhite);
-      }
-      theme::Text(dl, cv, fonts.body, 13, 920, 360,
-                  gamepad_input ? "A: CHANGE ANY BUTTON OR STICK" :
-                                  "ENTER: CHANGE ANY KEY OR BUTTON",
-                  theme::color::kDim, false);
       rows.push_back(toggle("HD TEXTURES", &config.hires_textures,
                             "Loads replacement textures from Load/Textures."));
       rows.push_back(toggle("HD DYNAMIC TEXT", &config.text_upscale,
