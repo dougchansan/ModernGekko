@@ -752,8 +752,10 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   std::string flags;
   if (zig)
   {
-    flags = "zig:" + moderngekko::module_build::HostZigTarget() + " -O" + opt +
-            " -flto=thin -ffp-contract=off -fno-fast-math";
+    const std::string zig_target = moderngekko::module_build::HostZigTarget();
+    flags = "zig:" + zig_target + " -O" + opt +
+            (zig_target.find("macos") == std::string::npos ? " -flto=thin" : "") +
+            " -ffp-contract=off -fno-fast-math";
     for (const std::string& define : options.defines)
       flags += " -D" + define;
     // The hook-aware rewrite changes the emitted code, so its inputs are part of the key.

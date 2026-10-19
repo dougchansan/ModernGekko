@@ -838,10 +838,14 @@ bool CompileModule(const CompileJob& job, std::string* error)
 
   const std::string target = HostZigTarget();
   const bool windows = target.find("windows") != std::string::npos;
+  // ThinLTO needs LLD, which zig uses for ELF and COFF but not for Mach-O.
+  const bool lto = target.find("macos") == std::string::npos;
   std::vector<std::string> common = {job.zig.string(), "cc", "-target", target, "-std=gnu11",
                                      "-O" + job.opt_level, "-ffp-contract=off", "-fno-fast-math",
-                                     "-flto=thin", "-DMODULE_GAME_ID=\"" + job.game_id + "\"",
+                                     "-DMODULE_GAME_ID=\"" + job.game_id + "\"",
                                      "-Dg" + job.game_id + "_recomp_EXPORTS"};
+  if (lto)
+    common.push_back("-flto=thin");
   if (!windows)
   {
     common.push_back("-fvisibility=hidden");
@@ -919,8 +923,10 @@ bool CompileModule(const CompileJob& job, std::string* error)
     }
   }
   std::vector<std::string> link = {job.zig.string(), "cc", "-target", target, "-shared",
-                                   "-O" + job.opt_level, "-flto=thin", "-o", job.output.string(),
+                                   "-O" + job.opt_level, "-o", job.output.string(),
                                    "@" + rsp.string()};
+  if (lto)
+    link.push_back("-flto=thin");
   if (target.find("linux") != std::string::npos)
   {
     link.push_back("-Wl,--version-script=" + (job.template_dir / "module.exports").string());
