@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -296,13 +297,32 @@ fs::path InstalledModule(const fs::path& user_directory, const std::string& disc
          ("g" + disc_id + (sixty_fps ? "_recomp_60fps" : "_recomp") + LibrarySuffix());
 }
 
+// The hook list a module was built with, kept beside it: a release whose mods hook other
+// addresses needs the module built again, or those hooks are silently skipped.
+static fs::path HookStamp(const fs::path& user_directory, const std::string& disc_id)
+{
+  return user_directory / "StaticRecompModules" / (disc_id + "-module-hooks.txt");
+}
+
+static std::string ReadWhole(const fs::path& path)
+{
+  std::ifstream in(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
 bool HasGameModule(const fs::path& release_directory, const fs::path& user_directory,
                    const std::string& disc_id)
 {
   std::error_code ec;
   const std::string name = "g" + disc_id + "_recomp" + LibrarySuffix();
-  return fs::is_regular_file(release_directory / name, ec) ||
-         fs::is_regular_file(InstalledModule(user_directory, disc_id), ec);
+  if (fs::is_regular_file(release_directory / name, ec))
+    return true;
+  if (!fs::is_regular_file(InstalledModule(user_directory, disc_id), ec))
+    return false;
+  const fs::path hooks = ToolsDirectory(release_directory) / (disc_id + "-module-hooks.txt");
+  if (!fs::is_regular_file(hooks, ec))
+    return true;  // a release that does not build modules: take what is there
+  return ReadWhole(hooks) == ReadWhole(HookStamp(user_directory, disc_id));
 }
 
 bool CanBuildGameModule(const fs::path& release_directory)
@@ -416,6 +436,9 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
       return false;
     }
   }
+  if (fs::is_regular_file(hooks, ec))
+    fs::copy_file(hooks, HookStamp(user_directory, disc_id), fs::copy_options::overwrite_existing,
+                  ec);
   progress("Game ready", 1, 1);
   return true;
 }
