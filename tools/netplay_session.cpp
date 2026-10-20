@@ -368,10 +368,69 @@ private:
   bool m_open = false;
 };
 
+// Headless has no window to drive the lobby, and returning "boot" on the
+// first missing frame starts the game before anyone else has connected. Run
+// the same handshake without a window: ready up, wait for the other
+// machines, then start.
+bool RunHeadlessLobby(RuntimeConfig &runtime_config, NetplayOptions &options,
+                      SessionUI &ui, NetPlay::NetPlayClient &client,
+                      NetPlay::NetPlayServer *server) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::minutes(5);
+  bool start_requested = false;
+  bool announced = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+
+    if (server) {
+      const NetPlay::PadMappingArray ports = server->GetWiimoteMapping();
+      if (ports != server->GetPadMapping())
+        server->SetPadMapping(ports);
+    }
+
+    const std::vector<NetPlay::Player> players = client.GetPlayersSnapshot();
+    const auto local =
+        std::ranges::find_if(players, [&](const NetPlay::Player &player) {
+          return client.IsLocalPlayer(player.pid);
+        });
+    if (options.auto_ready && local != players.end() && !local->ready)
+      client.SetReady(true);
+
+    if (server && options.auto_start && !start_requested &&
+        static_cast<int>(players.size()) >= options.auto_start_players &&
+        server->CanStart()) {
+      std::cerr << "netplay: starting with " << players.size()
+                << " players\n";
+      server->RequestStartGame();
+      start_requested = true;
+    } else if (server && !announced &&
+               static_cast<int>(players.size()) < options.auto_start_players) {
+      std::cerr << "netplay: waiting for " << options.auto_start_players
+                << " players\n";
+      announced = true;
+    }
+
+    if (ui.TakeStartRequest())
+      client.StartGame(runtime_config.game_root.string() + "/sys/main.dol");
+    auto boot_data = ui.TakeBootData();
+    if (boot_data) {
+      detail::SetBootSessionData(std::move(boot_data));
+      return true;
+    }
+    if (ui.ConnectionLost())
+      return false;
+  }
+  std::cerr << "netplay: nobody else arrived within five minutes\n";
+  return false;
+}
+
 bool RunLobbyWindow(RuntimeConfig &runtime_config,
                     ConfigResult &frontend_config, NetplayOptions &options,
                     SessionUI &ui, NetPlay::NetPlayClient &client,
                     NetPlay::NetPlayServer *server) {
+  if (runtime_config.headless)
+    return RunHeadlessLobby(runtime_config, options, ui, client, server);
+
   LobbyWindow window;
   if (!window.Open(runtime_config.window_system))
     return false;
