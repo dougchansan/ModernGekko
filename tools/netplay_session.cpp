@@ -517,7 +517,9 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config,
         local_player != players.end() && local_player->ready;
     if (options.auto_ready && local_player != players.end() && !local_ready)
       client.SetReady(true);
-    if (server && options.auto_start && !auto_start_requested && server->CanStart()) {
+    if (server && options.auto_start && !auto_start_requested &&
+        static_cast<int>(players.size()) >= options.auto_start_players &&
+        server->CanStart()) {
       server->RequestStartGame();
       auto_start_requested = true;
     }

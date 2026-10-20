@@ -57,7 +57,8 @@ void Usage() {
                "       [--mods <directory>] [--no-mods]\n"
                "       [--wayland] [-X11] [--headless] [--allow-interpreter]\n"
                "       [--netplay-host | --netplay-join <host>] "
-               "[--netplay-port <port>] [--netplay-ready] [--netplay-autostart]\n"
+               "[--netplay-port <port>] [--netplay-ready]\n"
+               "       [--netplay-autostart] [--netplay-autostart-players <n>]\n"
                "       [--nickname <name>] [--buffer <auto|1-20>] "
                "[--controller <device>]...\n"
                "       [--gba-port <1-4> --gba-rom <rom.gba>] [--gba-bios <bios.bin>]\n"
@@ -248,6 +249,7 @@ int RunMain(int argc, char **argv) {
   std::string netplay_buffer;
   std::vector<std::string> netplay_controllers;
   bool netplay_ready = false, netplay_autostart = false;
+  int netplay_autostart_players = 1;
   std::filesystem::path gba_rom;
   int gba_port = -1;
   for (int i = 1; i < argc; ++i) {
@@ -314,6 +316,14 @@ int RunMain(int argc, char **argv) {
       netplay_ready = true;
     else if (arg == "--netplay-autostart")
       netplay_autostart = true;
+    else if (arg == "--netplay-autostart-players") {
+      netplay_autostart_players =
+          std::atoi(value("--netplay-autostart-players"));
+      if (netplay_autostart_players < 1 || netplay_autostart_players > 4) {
+        std::cerr << "--netplay-autostart-players must be 1 to 4\n";
+        return 2;
+      }
+    }
     else if (arg == "--netplay-host")
       netplay_role = moderngekko::frontend::NetplayRole::Host;
     else if (arg == "--netplay-join") {
@@ -585,6 +595,7 @@ int RunMain(int argc, char **argv) {
     options.role = *netplay_role;
     options.auto_ready = netplay_ready;
     options.auto_start = netplay_autostart;
+    options.auto_start_players = netplay_autostart_players;
     options.gba_rom = gba_rom.string();
     options.gba_port = gba_port;
     options.address = netplay_address.empty() ? frontend_config.netplay_address

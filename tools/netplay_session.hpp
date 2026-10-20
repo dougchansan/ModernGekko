@@ -36,6 +36,11 @@ struct NetplayOptions {
   // player ready on its own, and on the host start once everyone is ready.
   bool auto_ready = false;
   bool auto_start = false;
+  // The host alone can satisfy CanStart(), because it holds both controller
+  // slots until someone else takes one - so an unattended host starts before
+  // the other machine has finished connecting, and the joiner is told the
+  // game is already running. Wait for the lobby to hold this many players.
+  int auto_start_players = 1;
   // Game Boy Advance link: every player runs the GBA in lockstep, so all of
   // them need this ROM. The host also names the port (0-3) that is a GBA and
   // sends its save for that port to the others.
