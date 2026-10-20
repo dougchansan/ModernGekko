@@ -47,6 +47,15 @@ std::vector<ModSource>
 DiscoverModSources(const std::vector<std::filesystem::path> &directories,
                    std::vector<ModLoadIssue> *issues = nullptr);
 
+/* What a mod calls itself, read without loading it: moderngekko_get_mod only
+   returns a static descriptor, so this runs no mod code and has no side
+   effects. Empty id if the library cannot be opened or has no descriptor. */
+struct ModIdentity {
+  std::string id;
+  std::string version;
+};
+ModIdentity PeekModIdentity(const std::filesystem::path &path);
+
 class ModManager final {
 public:
   ModManager();

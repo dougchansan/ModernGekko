@@ -1,5 +1,7 @@
 #include "netplay_compatibility.hpp"
 
+#include <algorithm>
+
 #include "Common/Crypto/SHA1.h"
 #include "Common/Version.h"
 #include "moderngekko/cpu_state.h"
@@ -56,22 +58,25 @@ std::string ModsFingerprint(const RuntimeConfig &config) {
   auto context = Common::SHA1::CreateContext();
   HashU32(*context, MODERNGEKKO_MOD_ABI_VERSION);
   HashU64(*context, sources.size());
-  std::array<u8, 65536> buffer{};
+  // A mod's id and version, not its file. Hashing the library's name and bytes
+  // made mod.dll and mod.dylib permanently incompatible, so a Windows peer and
+  // a macOS peer could never run the same mod together. Identity is what
+  // describes behaviour and is the same on every platform; keeping it honest
+  // across builds is then the mod author's job, via the version.
+  std::vector<std::string> identities;
+  identities.reserve(sources.size());
   for (const ModSource &source : sources) {
     if (source.kind != ModSource::Kind::DynamicPath)
       return "attached";
-    HashString(*context, source.path.filename().string());
-    std::ifstream file(source.path, std::ios::binary);
-    if (!file)
+    const ModIdentity identity = PeekModIdentity(source.path);
+    if (identity.id.empty())
       return "rejected";
-    while (file) {
-      file.read(reinterpret_cast<char *>(buffer.data()), buffer.size());
-      const std::streamsize count = file.gcount();
-      if (count > 0)
-        context->Update(
-            std::span(buffer.data(), static_cast<std::size_t>(count)));
-    }
+    identities.push_back(identity.id + "@" + identity.version);
   }
+  // Load order is a directory-scan artefact and need not match between peers.
+  std::ranges::sort(identities);
+  for (const std::string &identity : identities)
+    HashString(*context, identity);
   return Common::SHA1::DigestToString(context->Finish());
 }
 

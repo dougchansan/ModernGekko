@@ -211,6 +211,24 @@ ModManager::ModManager() : m_impl(std::make_unique<Impl>()) {
 
 ModManager::~ModManager() { Unload(); }
 
+ModIdentity PeekModIdentity(const std::filesystem::path &path) {
+#if defined(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
+  Common::DynamicLibrary library;
+  if (!library.Open(path.string().c_str()))
+    return {};
+  ModernGekkoGetModFn get_mod = nullptr;
+  if (!library.GetSymbol(MODERNGEKKO_GET_MOD_SYMBOL, &get_mod) || !get_mod)
+    return {};
+  const ModernGekkoModDesc *desc = get_mod();
+  if (!desc || !desc->id)
+    return {};
+  return {desc->id, desc->version ? desc->version : ""};
+#else
+  (void)path;
+  return {};
+#endif
+}
+
 ModLoadReport ModManager::Load(const std::vector<ModSource> &sources,
                                const std::string &game_id) {
   Unload();
