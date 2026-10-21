@@ -105,6 +105,11 @@ double s_net_wait_ms_per_second = 0.0;
 std::chrono::steady_clock::time_point s_previous_net_wait_sample;
 std::atomic<int> s_native_ultrawide_width{5120};
 std::atomic<int> s_native_ultrawide_height{1440};
+// Whether the game ini set NativeUltrawideWidth/Height. Only an explicit size
+// applies everywhere; the default follows the window (GetNativeUltrawideTarget).
+std::atomic<bool> s_native_ultrawide_explicit{false};
+// The game's render window, or null when headless.
+std::atomic<void*> s_render_window{nullptr};
 
 struct NavigationPoint
 {
@@ -1164,10 +1169,39 @@ NativeUltrawideTarget GetNativeUltrawideTarget()
   // while an ultrawide window owns the physical display. Keep the requested
   // render target separate from exclusive display-mode selection so headed
   // and automation sessions use the same Hor+ projection.
-  const int requested_width =
-      s_native_ultrawide_width.load(std::memory_order_relaxed);
-  const int requested_height =
-      s_native_ultrawide_height.load(std::memory_order_relaxed);
+  int requested_width = s_native_ultrawide_width.load(std::memory_order_relaxed);
+  int requested_height = s_native_ultrawide_height.load(std::memory_order_relaxed);
+  // Without an explicit size, the request follows the window rather than a
+  // fixed 5120x1440: a request wider than the window lays the authored 4:3
+  // menu canvases (world map, Battle Now team select) out for that width, and
+  // a 16:9 window showed them squeezed to 37.5% of its width.
+  // - windowed: no request; the window's own backbuffer decides;
+  // - fullscreen: the monitor the window is on (5120x1440 on an ultrawide);
+  // - headless (no window): the default, which automation captures rely on.
+  if (!s_native_ultrawide_explicit.load(std::memory_order_relaxed))
+  {
+    if (void* const window = s_render_window.load(std::memory_order_relaxed))
+    {
+      if (!Config::Get(Config::MAIN_FULLSCREEN))
+      {
+        requested_width = 0;
+        requested_height = 0;
+      }
+#ifdef _WIN32
+      else if (const HMONITOR monitor =
+                   MonitorFromWindow(static_cast<HWND>(window), MONITOR_DEFAULTTONEAREST))
+      {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(monitor, &info))
+        {
+          requested_width = info.rcMonitor.right - info.rcMonitor.left;
+          requested_height = info.rcMonitor.bottom - info.rcMonitor.top;
+        }
+      }
+#endif
+    }
+  }
   if (requested_width > 0 && requested_height > 0)
   {
     const float requested_aspect =
@@ -1196,15 +1230,19 @@ bool SetNavigationWidescreenEnabled(bool enabled, std::string* status)
   Common::IniFile local_ini = sconfig.LoadLocalGameIni();
   int requested_width = 5120;
   int requested_height = 1440;
+  bool explicit_size = false;
   const Common::IniFile::Section* const moderngekko_section =
       local_ini.GetSection("ModernGekko");
   if (moderngekko_section)
   {
+    explicit_size = moderngekko_section->Exists("NativeUltrawideWidth") &&
+                    moderngekko_section->Exists("NativeUltrawideHeight");
     moderngekko_section->Get("NativeUltrawideWidth", &requested_width, 0);
     moderngekko_section->Get("NativeUltrawideHeight", &requested_height, 0);
   }
   s_native_ultrawide_width.store(requested_width, std::memory_order_relaxed);
   s_native_ultrawide_height.store(requested_height, std::memory_order_relaxed);
+  s_native_ultrawide_explicit.store(explicit_size, std::memory_order_relaxed);
   std::vector<ActionReplay::ARCode> codes =
       ActionReplay::LoadCodes(global_ini, local_ini);
   const auto stock_code =
@@ -3861,6 +3899,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   }
 
   const WindowSystemInfo wsi = impl->platform->GetWindowSystemInfo();
+  s_render_window.store(impl->config.headless ? nullptr : wsi.render_surface,
+                        std::memory_order_relaxed);
   startup_mark("window created");
   UICommon::InitControllers(wsi);
   impl->controllers_initialized = true;
