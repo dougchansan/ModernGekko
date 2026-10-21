@@ -197,6 +197,7 @@ struct NavigationOverlayState
   std::vector<std::array<float, 9>> collision_floor;
   std::vector<std::array<float, 9>> collision_walls;
   std::vector<std::array<float, 9>> collision_triggers;
+  std::vector<std::array<u32, 3>> collision_trigger_info;
   bool collision_valid = false;
   // Bookkeeping for the player-position fallback used when the field actor
   // table has no player record (interiors). CPU-thread only.
@@ -451,6 +452,9 @@ struct CollisionMapCandidate
   std::vector<CollisionTriangle> floor;
   std::vector<CollisionTriangle> walls;
   std::vector<CollisionTriangle> triggers;
+  // Per trigger triangle: the descriptor's model slot (2 or 3), and the
+  // triangle's own flags and id (GScolsys2Triangle 0x30/0x32).
+  std::vector<std::array<u32, 3>> trigger_info;
   u32 base = 0;
   std::string archive_name;
   float min_x = 0.0f;
@@ -563,7 +567,8 @@ bool AddCollisionTriangleModel(
     std::span<const u8> ram, u32 model_address, const CollisionTransform& transform,
     NavigationSegmentKind kind,
     std::map<CollisionSegmentKey, CollisionSegmentCount>* segment_counts,
-    std::vector<CollisionTriangle>* triangles)
+    std::vector<CollisionTriangle>* triangles,
+    std::vector<std::array<u32, 3>>* info = nullptr, u32 model_index = 0)
 {
   u32 triangle_address;
   u32 triangle_count;
@@ -604,6 +609,9 @@ bool AddCollisionTriangleModel(
       triangles->push_back({vertices[0].x, vertices[0].y, vertices[0].z,
                             vertices[1].x, vertices[1].y, vertices[1].z,
                             vertices[2].x, vertices[2].y, vertices[2].z});
+      u32 flags_id = 0;
+      if (info && ReadCollisionU32(ram, triangle + 0x30, &flags_id))
+        info->push_back({model_index, flags_id >> 16, flags_id & 0xFFFF});
     }
 
     for (std::size_t edge_index = 0; edge_index < vertices.size(); ++edge_index)
@@ -707,9 +715,10 @@ bool BuildCollisionMapCandidate(std::span<const u8> ram, u32 base, float player_
           model_kinds[model_index] == NavigationSegmentKind::Walkable ? &candidate->floor :
           model_kinds[model_index] == NavigationSegmentKind::Trigger  ? &candidate->triggers :
                                                                         &candidate->walls;
-      found_model |= AddCollisionTriangleModel(ram, model_address, transform,
-                                               model_kinds[model_index],
-                                               &segment_counts, triangles);
+      const bool trigger = model_kinds[model_index] == NavigationSegmentKind::Trigger;
+      found_model |= AddCollisionTriangleModel(
+          ram, model_address, transform, model_kinds[model_index], &segment_counts, triangles,
+          trigger ? &candidate->trigger_info : nullptr, static_cast<u32>(model_index));
     }
   }
   if (!found_model)
@@ -1045,6 +1054,7 @@ void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
   state.collision_floor = std::move(best.floor);
   state.collision_walls = std::move(best.walls);
   state.collision_triggers = std::move(best.triggers);
+  state.collision_trigger_info = std::move(best.trigger_info);
   state.collision_valid = !state.collision_segments.empty();
   // Only the first scan of a room arms the retries. Re-arming on every failed
   // retry made the chain endless wherever there is no field collision (every
@@ -2078,6 +2088,41 @@ struct RuntimeAutomationState
 // counted by the present hook for the title's output rate.
 std::atomic<std::uint64_t> s_title_present_count{0};
 
+// MODERNGEKKO_FRAME_LOG=<csv>: one row per present, for benchmarks. Columns:
+// steady-clock time and process CPU time (both ns), then the frame and
+// present counters. Frame times come from rows where frame_count advances.
+void LogPresentedFrame(const PresentInfo& info) {
+  static std::FILE* file = [] {
+    const char* path = std::getenv("MODERNGEKKO_FRAME_LOG");
+    std::FILE* f = path && *path ? std::fopen(path, "w") : nullptr;
+    if (f)
+      std::fputs("t_ns,cpu_ns,frame_count,present_count\n", f);
+    return f;
+  }();
+  if (!file)
+    return;
+  const auto t = std::chrono::steady_clock::now().time_since_epoch();
+  std::uint64_t cpu_ns = 0;
+#ifdef _WIN32
+  FILETIME created, exited, kernel, user;
+  if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+    const auto ticks = [](const FILETIME& ft) {
+      return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    };
+    cpu_ns = (ticks(kernel) + ticks(user)) * 100;
+  }
+#endif
+  std::fprintf(file, "%lld,%llu,%llu,%llu\n",
+               static_cast<long long>(
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(t).count()),
+               static_cast<unsigned long long>(cpu_ns),
+               static_cast<unsigned long long>(info.frame_count),
+               static_cast<unsigned long long>(info.present_count));
+  static unsigned rows = 0;
+  if (++rows % 256 == 0)
+    std::fflush(file);
+}
+
 // Presents per second over the last ~second, sampled by the title update.
 double TitlePresentRate() {
   static std::uint64_t last_count = 0;
@@ -2908,6 +2953,7 @@ void UpdateNavigationOverlayState(NavigationOverlayState& state, bool valid, flo
     state.collision_floor.clear();
     state.collision_walls.clear();
     state.collision_triggers.clear();
+    state.collision_trigger_info.clear();
     state.collision_valid = false;
     state.collision_room_id = std::numeric_limits<unsigned int>::max();
     state.collision_refresh_delay_frames = 30;
@@ -3132,6 +3178,12 @@ std::optional<RuntimeError> DumpAutomationNavigation(const std::filesystem::path
     triangles(state->collision_walls);
     json += "\n],\n\"trigger_triangles\": [";
     triangles(state->collision_triggers);
+    json += "\n],\n\"trigger_info\": [";
+    for (std::size_t i = 0; i < state->collision_trigger_info.size(); ++i)
+    {
+      const auto& t = state->collision_trigger_info[i];
+      json += fmt::format("{}\n [{},{},{}]", i ? "," : "", t[0], t[1], t[2]);
+    }
     json += "\n]\n}\n";
   }
 
@@ -4141,6 +4193,7 @@ RuntimeRunResult Runtime::Run() {
         m_impl->automation_state.present_count.store(info.present_count,
                                                      std::memory_order_relaxed);
         s_title_present_count.store(info.present_count, std::memory_order_relaxed);
+        LogPresentedFrame(info);
       });
   m_impl->navigation_overlay.mode.store(
       m_impl->config.graphics.navigation_overlay, std::memory_order_relaxed);
