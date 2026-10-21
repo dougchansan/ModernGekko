@@ -188,6 +188,10 @@ struct NavigationOverlayState
   std::atomic<int> ultrawide_efb_scale{5};
   std::vector<NavigationActor> npcs;
   std::vector<NavigationSegment> collision_segments;
+  // Floor and trigger triangles in 3D (x, y, z per vertex), for route planning.
+  std::vector<std::array<float, 9>> collision_floor;
+  std::vector<std::array<float, 9>> collision_walls;
+  std::vector<std::array<float, 9>> collision_triggers;
   bool collision_valid = false;
   // Bookkeeping for the player-position fallback used when the field actor
   // table has no player record (interiors). CPU-thread only.
@@ -251,6 +255,8 @@ struct NavigationOverlayState
   unsigned int collision_room_id = std::numeric_limits<unsigned int>::max();
   int collision_refresh_delay_frames = 0;
   int collision_refresh_retries = 0;
+  // The game's active collision mesh when the map was last refreshed.
+  u32 collision_game_mesh = 0;
   u32 collision_base = 0;
   std::string collision_archive_name;
   std::string location_name;
@@ -428,9 +434,18 @@ struct CollisionTransform
   CollisionVec3 scale;
 };
 
+// A collision triangle in world space: x, y, z of each vertex.
+using CollisionTriangle = std::array<float, 9>;
+
 struct CollisionMapCandidate
 {
   std::vector<NavigationSegment> segments;
+  // The floor and trigger triangles in 3D. The 2D segments flatten every level
+  // of a town onto one plane, so an upper floor's edges read as walls on the
+  // floor below; a route planner needs the triangles and their heights.
+  std::vector<CollisionTriangle> floor;
+  std::vector<CollisionTriangle> walls;
+  std::vector<CollisionTriangle> triggers;
   u32 base = 0;
   std::string archive_name;
   float min_x = 0.0f;
@@ -542,7 +557,8 @@ struct CollisionSegmentCount
 bool AddCollisionTriangleModel(
     std::span<const u8> ram, u32 model_address, const CollisionTransform& transform,
     NavigationSegmentKind kind,
-    std::map<CollisionSegmentKey, CollisionSegmentCount>* segment_counts)
+    std::map<CollisionSegmentKey, CollisionSegmentCount>* segment_counts,
+    std::vector<CollisionTriangle>* triangles)
 {
   u32 triangle_address;
   u32 triangle_count;
@@ -578,6 +594,12 @@ bool AddCollisionTriangleModel(
     }
     if (!valid)
       continue;
+    if (triangles)
+    {
+      triangles->push_back({vertices[0].x, vertices[0].y, vertices[0].z,
+                            vertices[1].x, vertices[1].y, vertices[1].z,
+                            vertices[2].x, vertices[2].y, vertices[2].z});
+    }
 
     for (std::size_t edge_index = 0; edge_index < vertices.size(); ++edge_index)
     {
@@ -676,9 +698,13 @@ bool BuildCollisionMapCandidate(std::span<const u8> ram, u32 base, float player_
       {
         return false;
       }
+      std::vector<CollisionTriangle>* triangles =
+          model_kinds[model_index] == NavigationSegmentKind::Walkable ? &candidate->floor :
+          model_kinds[model_index] == NavigationSegmentKind::Trigger  ? &candidate->triggers :
+                                                                        &candidate->walls;
       found_model |= AddCollisionTriangleModel(ram, model_address, transform,
                                                model_kinds[model_index],
-                                               &segment_counts);
+                                               &segment_counts, triangles);
     }
   }
   if (!found_model)
@@ -1011,6 +1037,9 @@ void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
   const bool new_room = state.collision_room_id != room_id;
   state.collision_room_id = room_id;
   state.collision_segments = std::move(best.segments);
+  state.collision_floor = std::move(best.floor);
+  state.collision_walls = std::move(best.walls);
+  state.collision_triggers = std::move(best.triggers);
   state.collision_valid = !state.collision_segments.empty();
   // Only the first scan of a room arms the retries. Re-arming on every failed
   // retry made the chain endless wherever there is no field collision (every
@@ -2838,6 +2867,9 @@ void UpdateNavigationOverlayState(NavigationOverlayState& state, bool valid, flo
       state.ui_status = "Recovery autosave queued";
     }
     state.collision_segments.clear();
+    state.collision_floor.clear();
+    state.collision_walls.clear();
+    state.collision_triggers.clear();
     state.collision_valid = false;
     state.collision_room_id = std::numeric_limits<unsigned int>::max();
     state.collision_refresh_delay_frames = 30;
@@ -3046,6 +3078,22 @@ std::optional<RuntimeError> DumpAutomationNavigation(const std::filesystem::path
       json += fmt::format("{}\n [{}, {}, {}, {}, \"{}\"]", i ? "," : "", segment.from.x,
                           segment.from.z, segment.to.x, segment.to.z, kind);
     }
+    // Triangles as nine numbers: x, y, z of each vertex.
+    const auto triangles = [&json](const std::vector<std::array<float, 9>>& list) {
+      for (std::size_t i = 0; i < list.size(); ++i)
+      {
+        const auto& t = list[i];
+        json += fmt::format("{}\n [{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f},{:.2f}]",
+                            i ? "," : "", t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                            t[8]);
+      }
+    };
+    json += "\n],\n\"floor\": [";
+    triangles(state->collision_floor);
+    json += "\n],\n\"wall_triangles\": [";
+    triangles(state->collision_walls);
+    json += "\n],\n\"trigger_triangles\": [";
+    triangles(state->collision_triggers);
     json += "\n]\n}\n";
   }
 
@@ -4846,6 +4894,17 @@ RuntimeRunResult Runtime::Run() {
             std::lock_guard lock(m_impl->navigation_overlay.mutex);
             needs_collision_refresh =
                 valid && m_impl->navigation_overlay.collision_room_id != room_id;
+            // The game swaps its collision mesh after the room id changes:
+            // leaving Agate's Pokemon Center, the refresh at the room change
+            // still found the Center's mesh, succeeded, and never looked
+            // again. Refresh once more whenever the game's own active mesh
+            // (GSColSysState lbl_80404C68) changes.
+            const u32 game_mesh = memory.Read_U32(0x80404C68);
+            if (valid && game_mesh != m_impl->navigation_overlay.collision_game_mesh)
+            {
+              m_impl->navigation_overlay.collision_game_mesh = game_mesh;
+              needs_collision_refresh = true;
+            }
             if (!needs_collision_refresh && valid &&
                 m_impl->navigation_overlay.collision_refresh_retries > 0)
             {
