@@ -974,8 +974,22 @@ void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
   const std::span<const u8> ram = full_ram.first(ram_size);
   CollisionMapCandidate best;
 
+  // The game's own collision state (decomp: GSColSysState lbl_80404C68) points
+  // at the active WZX mesh. Use it when it is valid: the scan below takes the
+  // largest mesh around the player, and a neighbouring room's mesh can still be
+  // resident -- in Agate's Pokemon Center that picked the whole village.
+  constexpr u32 colsys_state_address = 0x80404C68;
+  const u32 active_mesh = memory.Read_U32(colsys_state_address);
+  if (IsGuestPointer(active_mesh) &&
+      BuildCollisionMapCandidate(ram, active_mesh, player_x, player_z, &best))
+  {
+    best.score = std::numeric_limits<int>::max();
+  }
+
   constexpr u32 scan_start = 0x00010000;
-  for (u32 offset = scan_start; offset + 0x50 <= ram.size(); offset += 4)
+  for (u32 offset = scan_start;
+       best.score != std::numeric_limits<int>::max() && offset + 0x50 <= ram.size();
+       offset += 4)
   {
     const u32 guest_address = Memory::MEM1_BASE_ADDR + offset;
     if (ReadBigEndianU32(ram, offset) != guest_address + 0x10)
