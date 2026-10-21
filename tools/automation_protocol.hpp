@@ -376,6 +376,7 @@ enum class CommandType
   ReadMemory,
   WriteMemory,
   DumpFrames,
+  DumpNavigation,
   Stop,
 };
 

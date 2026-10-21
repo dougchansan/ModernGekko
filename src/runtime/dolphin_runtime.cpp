@@ -112,12 +112,19 @@ struct NavigationPoint
   float z = 0.0f;
 };
 
+// One entry of the game's PeopleEntry array (decomp: src/game/people). Group and
+// index identify the character within the room; the name comes from the room's
+// character record through the name table and the message system.
 struct NavigationActor
 {
   NavigationPoint position;
   u32 slot = 0;
-  u32 archetype = 0;
-  u32 script_state = 0;
+  u32 group = 0;
+  u32 index = 0;
+  u32 object_id = 0;
+  u32 name_message_id = 0;
+  std::string name;
+  // Has a talk script: the character answers when spoken to.
   bool scripted = false;
 };
 
@@ -285,6 +292,76 @@ std::atomic<NavigationOverlayState*> s_navigation_overlay_state{nullptr};
 float ReadGuestFloat(const Memory::MemoryManager& memory, u32 address)
 {
   return std::bit_cast<float>(memory.Read_U32(address));
+}
+
+bool IsGuestPointer(u32 address)
+{
+  return address >= 0x80000000 && address < 0x81800000;
+}
+
+// GSmsgFindMessage: lbl_80478B08 points at the message system, whose +0x08 is a
+// list of loaded groups (id u16 +0, count u16 +4, next +8, sorted entries
+// {key, offset} from +0x10). key >> 20 picks the group and key & 0xFFFFF the
+// entry. Text is big-endian UTF-16 ending at 0; 0xFFFF starts a control code,
+// which a name does not normally contain, so the text stops there. Empty when
+// the group is not loaded.
+std::string ReadColosseumMessage(const Memory::MemoryManager& memory, u32 key)
+{
+  constexpr u32 message_root_address = 0x80478B08;
+  const u32 root = memory.Read_U32(message_root_address);
+  if (key == 0 || !IsGuestPointer(root))
+    return {};
+  const u32 group = key >> 20;
+  const u32 wanted = key & 0xFFFFF;
+  u32 node = memory.Read_U32(root + 0x08);
+  for (int guard = 0; IsGuestPointer(node) && guard < 256; ++guard)
+  {
+    const u32 count = memory.Read_U16(node + 4);
+    if (memory.Read_U16(node) == group)
+    {
+      u32 low = 0;
+      u32 high = count;
+      while (low < high)
+      {
+        const u32 middle = (low + high) / 2;
+        const u32 entry = node + 0x10 + middle * 8;
+        const u32 entry_key = memory.Read_U32(entry);
+        if (entry_key == wanted)
+        {
+          std::string text;
+          const u32 start = node + memory.Read_U32(entry + 4);
+          for (u32 i = 0; i < 64; ++i)
+          {
+            const u16 code = memory.Read_U16(start + i * 2);
+            if (code == 0 || code == 0xFFFF)
+              break;
+            if (code < 0x80)
+            {
+              text.push_back(static_cast<char>(code));
+            }
+            else if (code < 0x800)
+            {
+              text.push_back(static_cast<char>(0xC0 | (code >> 6)));
+              text.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+            }
+            else
+            {
+              text.push_back(static_cast<char>(0xE0 | (code >> 12)));
+              text.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+              text.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+            }
+          }
+          return text;
+        }
+        if (entry_key < wanted)
+          low = middle + 1;
+        else
+          high = middle;
+      }
+    }
+    node = memory.Read_U32(node + 8);
+  }
+  return {};
 }
 
 void UpdateColosseumPyriteSkyCoverage(Memory::MemoryManager& memory,
@@ -1865,9 +1942,13 @@ void DrawNavigationOverlay()
     else if (hovered_actor == HoveredActor::Npc && hovered_npc)
     {
       ImGui::BeginTooltip();
-      ImGui::Text("NPC %u", hovered_npc->slot);
-      ImGui::TextDisabled("Actor type 0x%02X  %s", hovered_npc->archetype,
-                          hovered_npc->scripted ? "scripted" : "idle");
+      if (hovered_npc->name.empty())
+        ImGui::Text("NPC %u", hovered_npc->index);
+      else
+        ImGui::TextUnformatted(hovered_npc->name.c_str());
+      ImGui::TextDisabled("group %u  index %u  %s", hovered_npc->group,
+                          hovered_npc->index,
+                          hovered_npc->scripted ? "talks" : "silent");
       ImGui::EndTooltip();
     }
   }
@@ -2884,6 +2965,88 @@ void SaveAutomationScreenshot(const std::filesystem::path& path)
     g_frame_dumper->SaveScreenshot(path.string());
 }
 
+std::string JsonString(std::string_view text)
+{
+  std::string out = "\"";
+  for (const char c : text)
+  {
+    if (c == '"' || c == '\\')
+      out += fmt::format("\\{}", c);
+    else if (static_cast<unsigned char>(c) < 0x20)
+      out += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
+    else
+      out.push_back(c);
+  }
+  return out + "\"";
+}
+
+// Writes what the minimap knows as JSON: the room, the party, every character
+// with its decomp identity and name, and the collision segments (x/z floor
+// plane). This is the input for the offline pathfinder.
+std::optional<RuntimeError> DumpAutomationNavigation(const std::filesystem::path& path)
+{
+  auto* state = s_navigation_overlay_state.load(std::memory_order_acquire);
+  if (!state)
+    return RuntimeError{RuntimeErrorCode::InvalidState, "navigation overlay is not running"};
+
+  std::string json = "{\n";
+  json += fmt::format("\"valid\": {},\n\"room\": {},\n",
+                      state->valid.load(std::memory_order_acquire) ? "true" : "false",
+                      state->room_id.load(std::memory_order_relaxed));
+  // Non-zero while a conversation window is open; the player cannot move then.
+  json += fmt::format("\"dialogue\": {},\n",
+                      state->dialogue_object.load(std::memory_order_relaxed));
+  json += fmt::format("\"player\": [{}, {}, {}],\n",
+                      state->player_x.load(std::memory_order_relaxed),
+                      state->player_z.load(std::memory_order_relaxed),
+                      state->player_facing.load(std::memory_order_relaxed));
+  if (state->companion_valid.load(std::memory_order_relaxed))
+  {
+    json += fmt::format("\"partner\": [{}, {}],\n",
+                        state->companion_x.load(std::memory_order_relaxed),
+                        state->companion_z.load(std::memory_order_relaxed));
+  }
+  {
+    std::lock_guard lock(state->mutex);
+    json += fmt::format("\"archive\": {},\n\"location\": {},\n",
+                        JsonString(state->collision_archive_name),
+                        JsonString(state->location_name));
+    json += "\"people\": [";
+    for (std::size_t i = 0; i < state->npcs.size(); ++i)
+    {
+      const NavigationActor& npc = state->npcs[i];
+      json += fmt::format(
+          "{}\n {{\"slot\": {}, \"group\": {}, \"index\": {}, \"object_id\": {}, "
+          "\"x\": {}, \"z\": {}, \"talks\": {}, \"name_message_id\": {}, \"name\": {}}}",
+          i ? "," : "", npc.slot, npc.group, npc.index, npc.object_id, npc.position.x,
+          npc.position.z, npc.scripted ? "true" : "false", npc.name_message_id,
+          JsonString(npc.name));
+    }
+    json += "\n],\n\"segments\": [";
+    for (std::size_t i = 0; i < state->collision_segments.size(); ++i)
+    {
+      const NavigationSegment& segment = state->collision_segments[i];
+      const char* kind = segment.kind == NavigationSegmentKind::Walkable ? "walkable" :
+                         segment.kind == NavigationSegmentKind::Trigger  ? "trigger" :
+                                                                           "wall";
+      json += fmt::format("{}\n [{}, {}, {}, {}, \"{}\"]", i ? "," : "", segment.from.x,
+                          segment.from.z, segment.to.x, segment.to.z, kind);
+    }
+    json += "\n]\n}\n";
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output << json;
+  if (!output)
+  {
+    return RuntimeError{RuntimeErrorCode::InitializationFailed,
+                        "could not write navigation output file"};
+  }
+  return {};
+}
+
 std::optional<RuntimeError> ReadAutomationMemory(const std::filesystem::path& path, u32 address,
                                                  u32 size)
 {
@@ -2976,6 +3139,10 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
     Config::SetCurrent(Config::MAIN_MOVIE_DUMP_FRAMES, command.frames != 0);
     std::fprintf(stderr, "[automation] frame dumping %s\n", command.frames ? "on" : "off");
     break;
+  case automation::CommandType::DumpNavigation:
+    if (auto error = DumpAutomationNavigation(command.path))
+      return error;
+    break;
   case automation::CommandType::ReadMemory:
     if (auto error = ReadAutomationMemory(command.path, command.address, command.size))
       return error;
@@ -3002,6 +3169,7 @@ bool AutomationCommandNeedsReadyCore(automation::CommandType type)
   case automation::CommandType::LoadState:
   case automation::CommandType::Screenshot:
   case automation::CommandType::DumpFrames:
+  case automation::CommandType::DumpNavigation:
   case automation::CommandType::ReadMemory:
   case automation::CommandType::WriteMemory:
   case automation::CommandType::PadFrames:
@@ -4036,9 +4204,7 @@ RuntimeRunResult Runtime::Run() {
               }
             }
           }
-          // GC6E01 field actor transforms. Actor slots are reassigned between
-          // rooms, so identify controlled/follower records from their stable
-          // archetype and script-state fields.
+          // GC6E01 field characters, from the decomp's PeopleEntry array.
           constexpr u32 room_id_address = 0x8040837F;
           constexpr u32 menu_active_address = 0x8040836C;
           constexpr u32 field_overlay_mode_address = 0x80402504;
@@ -4050,7 +4216,6 @@ RuntimeRunResult Runtime::Run() {
           constexpr u32 message_window_state_address = 0x80402418;
           constexpr u32 movie_ready_address = 0x8047B440;
           constexpr u32 movie_open_address = 0x8047B441;
-          constexpr u32 actor_table = 0x8050EDF0;
           // Wes's transform, outside the field actor table.
           //
           // Indoors the actor table holds Rui and every NPC but *not* the
@@ -4068,10 +4233,14 @@ RuntimeRunResult Runtime::Run() {
           // addresses (0x80524580, 0x8053D3C4) mirror it identically; this one
           // is used because its Y is the ground plane rather than eye height.
           constexpr u32 player_position_global = 0x80452EE4;
-          constexpr u32 actor_stride = 0x170;
-          constexpr u32 actor_count = 32;
-          constexpr u32 wes_archetype = 0x0B;
-          constexpr u32 rui_archetype = 0x2F;
+          constexpr u32 people_array_address = 0x8047B200;
+          constexpr u32 people_count_address = 0x8047B1F8;
+          constexpr u32 people_stride = 0xDC;
+          constexpr u32 player_index = 0x64;
+          constexpr u32 partner_index = 0x65;
+          constexpr u32 current_floor_address = 0x8047ACC8;
+          constexpr u32 name_table_address = 0x80478F84;
+          constexpr u32 name_count_address = 0x80478F80;
           auto& memory = Core::System::GetInstance().GetMemory();
           // This field reports a complete 4:3 submenu canvas (Pokemon, PDA,
           // and similar screens), not the PDA specifically. Present those
@@ -4237,32 +4406,60 @@ RuntimeRunResult Runtime::Run() {
           bool valid = false;
           bool companion_valid = false;
           std::vector<NavigationActor> npcs;
-          for (u32 actor_index = 0; actor_index < actor_count; ++actor_index)
+          // PeopleEntry array (decomp: lbl_8047B200, count lbl_8047B1F8, 0xDC
+          // bytes): +0x00 active, +0x08 GSmodel*, +0x28 group, +0x2C index,
+          // +0x30 floor object id. Group 0 is the party: index 0x64 the player,
+          // 0x65 the partner. Other groups are the room's characters, and
+          // `index` selects the room's character record (0x24 bytes: +8 name
+          // id, +0x14 talk script). The model holds the pose: position at
+          // +0x18, heading at +0x28.
+          //
+          // This used to scan the GSmodel pool at 0x8050EDF0 and guess identity
+          // from animation fields; it saw models, not characters, so it could
+          // not tell an NPC from scenery or say who anyone was.
+          const u32 people = memory.Read_U32(people_array_address);
+          const u32 people_count = memory.Read_U32(people_count_address);
+          // floorDataBiosGetCharInfo: sub = *(room + 0x14); list = *sub;
+          // count = **list; records = *(list + 4).
+          u32 char_records = 0;
+          u32 char_count = 0;
+          if (const u32 floor = memory.Read_U32(current_floor_address); IsGuestPointer(floor))
           {
-            const u32 actor = actor_table + actor_index * actor_stride;
-            if (memory.Read_U32(actor + 0x40) != actor + 0x2c ||
-                memory.Read_U32(actor + 0x44) != actor + 0x14)
+            const u32 room = memory.Read_U32(floor);
+            const u32 sub = IsGuestPointer(room) ? memory.Read_U32(room + 0x14) : 0;
+            const u32 list = IsGuestPointer(sub) ? memory.Read_U32(sub) : 0;
+            if (IsGuestPointer(list))
             {
-              continue;
+              const u32 count_pointer = memory.Read_U32(list);
+              char_count = IsGuestPointer(count_pointer) ? memory.Read_U32(count_pointer) : 0;
+              char_records = memory.Read_U32(list + 4);
             }
-
-            const u32 archetype = memory.Read_U32(actor + 0x74);
-            const u32 script_state = memory.Read_U32(actor + 0xD4);
-            const u32 script_index = memory.Read_U32(actor + 0xD8);
-            const u32 script_pointer = memory.Read_U32(actor + 0xDC);
-            const float actor_x = ReadGuestFloat(memory, actor + 8);
-            const float actor_z = ReadGuestFloat(memory, actor + 16);
+          }
+          const u32 names = memory.Read_U32(name_table_address);
+          const u32 names_count_pointer = memory.Read_U32(name_count_address);
+          const u32 names_count =
+              IsGuestPointer(names_count_pointer) ? memory.Read_U32(names_count_pointer) : 0;
+          for (u32 slot = 0; IsGuestPointer(people) && slot < people_count && slot < 512; ++slot)
+          {
+            const u32 person = people + slot * people_stride;
+            if (memory.Read_U8(person) == 0)
+              continue;
+            const u32 model = memory.Read_U32(person + 0x08);
+            if (!IsGuestPointer(model))
+              continue;
+            const float actor_x = ReadGuestFloat(memory, model + 0x18);
+            const float actor_z = ReadGuestFloat(memory, model + 0x20);
             const bool finite_pose =
                 std::isfinite(actor_x) && std::isfinite(actor_z) &&
                 std::abs(actor_x) < 100000.0f && std::abs(actor_z) < 100000.0f;
             if (!finite_pose)
               continue;
+            const u32 group = memory.Read_U32(person + 0x28);
+            const u32 index = memory.Read_U32(person + 0x2C);
 
-            if (archetype == wes_archetype && script_state == 0 &&
-                script_index == std::numeric_limits<u32>::max() &&
-                script_pointer == 0)
+            if (group == 0 && index == player_index)
             {
-              const float actor_facing = ReadGuestFloat(memory, actor + 24);
+              const float actor_facing = ReadGuestFloat(memory, model + 0x28);
               if (std::isfinite(actor_facing))
               {
                 player_x = actor_x;
@@ -4272,9 +4469,7 @@ RuntimeRunResult Runtime::Run() {
               }
               continue;
             }
-
-            if (archetype == rui_archetype && script_state == 3 &&
-                script_pointer != 0)
+            if (group == 0 && index == partner_index)
             {
               companion_x = actor_x;
               companion_z = actor_z;
@@ -4282,26 +4477,24 @@ RuntimeRunResult Runtime::Run() {
               continue;
             }
 
-            // Anything the room actually placed is worth reporting. Requiring
-            // script_state 3 dropped nine of the sixteen valid actors in Phenac
-            // City -- including ones standing 29 units from the player, and
-            // three that had a live script pointer -- so the minimap and the
-            // pathfinder simply could not see them.
-            //
-            // An unused slot has a recognisable signature rather than a
-            // position: never scripted, no script pointer, and parked at the
-            // origin. Match that instead of guessing from coordinates alone,
-            // because (0, 0) is a legitimate place to stand in some rooms.
-            const bool never_scripted =
-                script_index == std::numeric_limits<u32>::max() && script_pointer == 0;
-            const bool at_origin = actor_x == 0.0f && actor_z == 0.0f;
-            if (never_scripted && at_origin)
-              continue;
-            npcs.push_back({{actor_x, actor_z},
-                            actor_index,
-                            archetype,
-                            script_state,
-                            script_state == 3 && script_pointer != 0});
+            NavigationActor actor;
+            actor.position = {actor_x, actor_z};
+            actor.slot = slot;
+            actor.group = group;
+            actor.index = index;
+            actor.object_id = memory.Read_U32(person + 0x30);
+            if (group != 0 && IsGuestPointer(char_records) && index < char_count)
+            {
+              const u32 record = char_records + index * 0x24;
+              actor.scripted = memory.Read_U32(record + 0x14) != 0;
+              const u32 name_id = memory.Read_U16(record + 8);
+              if (IsGuestPointer(names) && name_id < names_count)
+              {
+                actor.name_message_id = memory.Read_U32(names + name_id * 8 + 4);
+                actor.name = ReadColosseumMessage(memory, actor.name_message_id);
+              }
+            }
+            npcs.push_back(std::move(actor));
           }
           if (!valid)
           {

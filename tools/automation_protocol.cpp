@@ -158,6 +158,8 @@ std::optional<CommandType> ParseCommandType(std::string_view value)
     return CommandType::WriteMemory;
   if (text == "dump_frames")
     return CommandType::DumpFrames;
+  if (text == "dump_navigation")
+    return CommandType::DumpNavigation;
   if (text == "stop")
     return CommandType::Stop;
   return std::nullopt;
@@ -482,6 +484,7 @@ bool ParseCommandFile(const std::filesystem::path& path, Command* command, std::
   case CommandType::SaveState:
   case CommandType::LoadState:
   case CommandType::Screenshot:
+  case CommandType::DumpNavigation:
   {
     const auto path_it = values.find("path");
     if (path_it == values.end() || Trim(path_it->second).empty())
