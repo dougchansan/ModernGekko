@@ -269,6 +269,34 @@ struct DolPatchSet
   explicit operator bool() const { return error.empty(); }
 };
 
+// The compiler identity is its own --version output, several lines of it, and
+// the manifest is one key per line.
+std::string SingleLine(std::string text)
+{
+  for (char& c : text)
+  {
+    if (c == '\n' || c == '\r' || c == '\t')
+      c = ' ';
+  }
+  const auto tail = text.find_last_not_of(' ');
+  text = tail == std::string::npos ? std::string() : text.substr(0, tail + 1);
+  std::string out;
+  bool space = false;
+  for (const char c : text)
+  {
+    if (c == ' ')
+    {
+      space = true;
+      continue;
+    }
+    if (space && !out.empty())
+      out.push_back(' ');
+    space = false;
+    out.push_back(c);
+  }
+  return out;
+}
+
 void RefreshDolPatchFingerprint(DolPatchSet* patches)
 {
   std::ranges::sort(patches->entries, {}, &DolPatch::address);
@@ -875,21 +903,51 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   const auto publish_module = [&]() -> std::optional<fs::path> {
     fs::create_directories(artifact);
     fs::copy_file(built, module, fs::copy_options::overwrite_existing);
+    // Two peers running the same game must agree on everything that changes
+    // the emitted code's behaviour, and may differ on everything that is just
+    // how this machine compiles it. Keep the two apart, and digest the first
+    // group so one line answers "were these built the same way?" - a question
+    // that previously had no answer at all once a build tree was gone.
+    const std::string behaviour =
+        "dol=" + game.dol_sha256 + "|backend=" + options.backend + "|opt=" + opt +
+        "|state_in_memory=" + (options.state_in_memory ? "1" : "0") +
+        "|inline_cache_ops=" + (codegen_env_identity.empty() ? "0" : "1") +
+        "|inline_fp=" + (inline_fp_identity.empty() ? "0" : inline_fp) +
+        "|patches=" + patches.fingerprint +
+        "|native_subst=" + (native_subst_list.empty() ? "none" : native_subst_list) +
+        "|arch_flags=" + (options.arch_flags.empty() ? "none" : options.arch_flags) +
+        "|module_abi=" + std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) +
+        "|cpu_abi=" + std::to_string(MODERNGEKKO_CPU_ABI_VERSION);
+    std::ostringstream behaviour_digest;
+    behaviour_digest << std::hex << std::setfill('0') << std::setw(16) << Fnv1a(behaviour);
+
     std::ofstream manifest(artifact / "manifest.txt");
-    manifest << "disc_id=" << game.disc_id << '\n' << "dol_sha256=" << game.dol_sha256 << '\n'
+    manifest << "# behaviour_digest covers the fields above it: two machines\n"
+                "# must match on those or their guests diverge. The fields\n"
+                "# below it are how this machine happened to compile, and are\n"
+                "# expected to differ between platforms.\n"
+             << "disc_id=" << game.disc_id << '\n' << "dol_sha256=" << game.dol_sha256 << '\n'
              << "recompcore_revision=" << RECOMPCORE_REVISION << '\n'
              << "dolrecomp_revision=" << DOLRECOMP_REVISION << '\n'
              << "dolrecomp_binary_sha256=" << *dolrecomp_hash << '\n'
              << "module_abi=" << MODERNGEKKO_MODULE_ABI_VERSION << '\n'
              << "cpu_abi=" << MODERNGEKKO_CPU_ABI_VERSION << '\n'
-             << "compiler=" << compiler_identity << '\n'
-             << "architecture=" << architecture << '\n'
-             << "flags=" << flags << '\n'
              << "backend=" << options.backend << '\n'
+             << "opt_level=" << opt << '\n'
              << "state_in_memory=" << (options.state_in_memory ? 1 : 0) << '\n'
              << "inline_cache_ops=" << (codegen_env_identity.empty() ? 0 : 1) << '\n'
              << "inline_fp=" << (inline_fp_identity.empty() ? "0" : inline_fp) << '\n'
-             << "patches=" << patches.fingerprint << '\n';
+             << "patches=" << patches.fingerprint << '\n'
+             << "native_subst=" << (native_subst_list.empty() ? "none" : native_subst_list)
+             << '\n'
+             << "arch_flags=" << (options.arch_flags.empty() ? "none" : options.arch_flags)
+             << '\n'
+             << "behaviour_digest=" << behaviour_digest.str() << '\n'
+             << "compiler=" << SingleLine(compiler_identity) << '\n'
+             << "architecture=" << architecture << '\n'
+             << "flags=" << flags << '\n';
+    manifest.close();
+    std::cout << "behaviour digest: " << behaviour_digest.str() << '\n';
     WriteActiveModuleMarkers(options.output, game.disc_id, options.backend, module);
     std::cout << "built module: " << module << '\n';
     return module;
