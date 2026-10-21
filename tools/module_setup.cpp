@@ -297,6 +297,14 @@ fs::path InstalledModule(const fs::path& user_directory, const std::string& disc
          ("g" + disc_id + (sixty_fps ? "_recomp_60fps" : "_recomp") + LibrarySuffix());
 }
 
+// What the module was built from, kept beside it. The build tree is not always
+// there later - the module that desynced a Mac against a Windows peer had none
+// left, so nothing could say which arguments produced it.
+static fs::path ManifestStamp(const fs::path& user_directory, const std::string& disc_id)
+{
+  return user_directory / "StaticRecompModules" / (disc_id + "-module-manifest.txt");
+}
+
 // The hook list a module was built with, kept beside it: a release whose mods hook other
 // addresses needs the module built again, or those hooks are silently skipped.
 static fs::path HookStamp(const fs::path& user_directory, const std::string& disc_id)
@@ -439,6 +447,10 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
   if (fs::is_regular_file(hooks, ec))
     fs::copy_file(hooks, HookStamp(user_directory, disc_id), fs::copy_options::overwrite_existing,
                   ec);
+  const fs::path manifest = built->parent_path() / "manifest.txt";
+  if (fs::is_regular_file(manifest, ec))
+    fs::copy_file(manifest, ManifestStamp(user_directory, disc_id),
+                  fs::copy_options::overwrite_existing, ec);
   progress("Game ready", 1, 1);
   return true;
 }
