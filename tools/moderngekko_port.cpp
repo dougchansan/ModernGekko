@@ -857,6 +857,21 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
       (inline_cache_ops && *inline_cache_ops && *inline_cache_ops != '0')
           ? std::string("|inline_cache_ops=1")
           : std::string();
+  // The hook-aware rewrite only happens on the zig path. Asking for it
+  // anywhere else produced a module with no hooks baked in and no record that
+  // anything was missing, which is how a release shipped one built from a list
+  // 19 addresses shorter than the mods needed.
+  std::string hook_list_digest = "none";
+  if (!options.hook_list.empty())
+  {
+    const auto hooks_hash = moderngekko::HashFileSha256(options.hook_list);
+    if (!hooks_hash)
+    {
+      std::cerr << "cannot read hook list: " << options.hook_list << '\n';
+      return std::nullopt;
+    }
+    hook_list_digest = *hooks_hash;
+  }
   const std::string subst_identity =
       native_subst_list.empty() ? std::string() : "|native_subst=" + native_subst_list;
   // An instrumented module and an optimized one are different binaries built
@@ -916,6 +931,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
         "|patches=" + patches.fingerprint +
         "|native_subst=" + (native_subst_list.empty() ? "none" : native_subst_list) +
         "|arch_flags=" + (options.arch_flags.empty() ? "none" : options.arch_flags) +
+        "|hook_list=" + hook_list_digest +
         "|module_abi=" + std::to_string(MODERNGEKKO_MODULE_ABI_VERSION) +
         "|cpu_abi=" + std::to_string(MODERNGEKKO_CPU_ABI_VERSION);
     std::ostringstream behaviour_digest;
@@ -942,6 +958,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
              << '\n'
              << "arch_flags=" << (options.arch_flags.empty() ? "none" : options.arch_flags)
              << '\n'
+             << "hook_list=" << hook_list_digest << '\n'
              << "behaviour_digest=" << behaviour_digest.str() << '\n'
              << "compiler=" << SingleLine(compiler_identity) << '\n'
              << "architecture=" << architecture << '\n'
@@ -1240,6 +1257,13 @@ int main(int argc, char** argv)
                  "function call.\n"
                  "         Use this for debugging codegen, not for anything you "
                  "will measure.\n";
+  }
+  if (!options.hook_list.empty() && options.zig.empty())
+  {
+    std::cerr << "--hook-list needs --zig: the hook-aware rewrite only runs"
+                 " on that path, so asking for it here builds a module with"
+                 " no hooks baked in and says nothing\n";
+    return 2;
   }
   if (!options.pgo_generate.empty() && !options.pgo_use.empty())
   {
