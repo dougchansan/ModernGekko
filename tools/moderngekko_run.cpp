@@ -13,7 +13,9 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -33,9 +35,75 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #endif
 
 namespace {
+#if defined(_WIN32)
+// Crash reporting. A runner that dies silently (an unhandled exception, an
+// abort, an unexpected exit) leaves nothing to go on, and headless automation
+// sees only a status file that stops updating. Say how it died, with a stack of
+// module+offset frames, and write a minidump for an unhandled exception.
+void PrintCrashFrame(const void *address) {
+  HMODULE module = nullptr;
+  char name[MAX_PATH] = "?";
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         static_cast<LPCSTR>(address), &module) &&
+      module) {
+    GetModuleFileNameA(module, name, MAX_PATH);
+    const char *base = std::strrchr(name, '\\');
+    std::fprintf(stderr, "  %s+0x%llx\n", base ? base + 1 : name,
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) -
+                                                 reinterpret_cast<uintptr_t>(module)));
+  } else {
+    std::fprintf(stderr, "  %p\n", address);
+  }
+}
+
+void PrintCrashStack(const char *why) {
+  void *frames[48];
+  const USHORT count = CaptureStackBackTrace(1, 48, frames, nullptr);
+  std::fprintf(stderr, "[crash] %s (thread %lu):\n", why, GetCurrentThreadId());
+  for (USHORT i = 0; i < count; ++i)
+    PrintCrashFrame(frames[i]);
+  std::fflush(stderr);
+}
+
+LONG WINAPI ReportUnhandledException(EXCEPTION_POINTERS *info) {
+  std::fprintf(stderr, "[crash] unhandled exception 0x%08lx at\n",
+               info->ExceptionRecord->ExceptionCode);
+  PrintCrashFrame(info->ExceptionRecord->ExceptionAddress);
+  PrintCrashStack("stack at the unhandled exception");
+  const char *dump_path = std::getenv("MODERNGEKKO_CRASH_DUMP");
+  const HANDLE file = CreateFileA(dump_path && *dump_path ? dump_path : "moderngekko-crash.dmp",
+                                  GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    MINIDUMP_EXCEPTION_INFORMATION exception{GetCurrentThreadId(), info, FALSE};
+    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                      static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo |
+                                                 MiniDumpWithIndirectlyReferencedMemory),
+                      &exception, nullptr, nullptr);
+    CloseHandle(file);
+    std::fprintf(stderr, "[crash] minidump written\n");
+  }
+  std::fflush(stderr);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void InstallCrashReporting() {
+  SetUnhandledExceptionFilter(ReportUnhandledException);
+  std::signal(SIGABRT, [](int) { PrintCrashStack("abort"); });
+  std::set_terminate([] {
+    PrintCrashStack("std::terminate");
+    std::abort();
+  });
+  std::atexit([] { PrintCrashStack("process exit"); });
+}
+#endif
+
 #ifndef MODERNGEKKO_RUNNER_NAME
 #define MODERNGEKKO_RUNNER_NAME "moderngekko-run"
 #endif
@@ -715,6 +783,7 @@ void PinProcessToLargestCache() {
 int main(int argc, char **argv) {
   try {
 #if defined(_WIN32)
+    InstallCrashReporting();
     // MODERNGEKKO_WAIT_PID: set by the pause menu's Graphics API switch. Let the
     // previous session finish shutting down (memory card, config writes) first.
     if (const char *wait_pid = std::getenv("MODERNGEKKO_WAIT_PID"); wait_pid && *wait_pid) {
