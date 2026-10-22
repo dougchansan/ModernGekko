@@ -1162,6 +1162,28 @@ struct NativeUltrawideTarget
 NativeUltrawideTarget GetNativeUltrawideTarget()
 {
   NativeUltrawideTarget target;
+  // Aurora rendering in-process (MODERNGEKKO_AURORA_NATIVE): Dolphin runs the
+  // Null video backend, whose presenter has no real backbuffer. Aurora's
+  // window (AURORA_NATIVE_SIZE, default 1920x1080) is the screen the frame is
+  // laid out for.
+  static const std::optional<std::pair<int, int>> aurora_native_size =
+      []() -> std::optional<std::pair<int, int>> {
+    const char* const dll = std::getenv("MODERNGEKKO_AURORA_NATIVE");
+    if (!dll || !*dll)
+      return std::nullopt;
+    int width = 1920, height = 1080;
+    if (const char* const size = std::getenv("AURORA_NATIVE_SIZE"))
+      std::sscanf(size, "%dx%d", &width, &height);
+    return std::pair{std::max(width, 1), std::max(height, 1)};
+  }();
+  if (aurora_native_size)
+  {
+    target.width = aurora_native_size->first;
+    target.height = aurora_native_size->second;
+    target.aspect = std::clamp(static_cast<float>(target.width) / static_cast<float>(target.height),
+                               1.0f, 4.0f);
+    return target;
+  }
   if (g_presenter)
   {
     target.width = std::max(g_presenter->GetBackbufferWidth(), 1);
@@ -1249,6 +1271,18 @@ bool SetNavigationWidescreenEnabled(bool enabled, std::string* status)
                     moderngekko_section->Exists("NativeUltrawideHeight");
     moderngekko_section->Get("NativeUltrawideWidth", &requested_width, 0);
     moderngekko_section->Get("NativeUltrawideHeight", &requested_height, 0);
+  }
+  // Aurora rendering in-process (MODERNGEKKO_AURORA_NATIVE) runs Dolphin
+  // headless: no window of Dolphin's to follow, so lay the frame out for
+  // Aurora's window (AURORA_NATIVE_SIZE, default 1920x1080).
+  const char* const aurora_native = std::getenv("MODERNGEKKO_AURORA_NATIVE");
+  if (!explicit_size && aurora_native && *aurora_native)
+  {
+    requested_width = 1920;
+    requested_height = 1080;
+    if (const char* const size = std::getenv("AURORA_NATIVE_SIZE"))
+      std::sscanf(size, "%dx%d", &requested_width, &requested_height);
+    explicit_size = true;
   }
   s_native_ultrawide_width.store(requested_width, std::memory_order_relaxed);
   s_native_ultrawide_height.store(requested_height, std::memory_order_relaxed);
@@ -4256,7 +4290,12 @@ RuntimeRunResult Runtime::Run() {
 
   if (m_impl->metadata.disc_id == "GC6E01")
   {
-    if (!m_impl->config.headless)
+    // Aurora rendering in-process runs Dolphin headless but shows the game,
+    // so it needs the projection setup a window gets: the recompiled widescreen
+    // hook scales every projection by the word at 0x8047E724, which nothing
+    // else seeds.
+    const char* const aurora_native = std::getenv("MODERNGEKKO_AURORA_NATIVE");
+    if (!m_impl->config.headless || (aurora_native && *aurora_native))
     {
       const bool widescreen_enabled = m_impl->config.graphics.native_ultrawide;
       std::string widescreen_status;
