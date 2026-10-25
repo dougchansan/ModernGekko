@@ -10,6 +10,14 @@
 
 #include <array>
 #include <cstdio>
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
+#endif
 #include <deque>
 #include <fstream>
 #include <iterator>
@@ -22,6 +30,30 @@ namespace moderngekko::frontend
 {
 namespace
 {
+// FMA3 usable on this x86-64 machine: the CPU has it (CPUID.1:ECX bit 12) and
+// the OS saves the AVX state its VEX encoding needs (OSXSAVE, XCR0 bits 1-2).
+// The module is built on the player's machine, so it can use the
+// instruction: fmaf/fma, which the Gekko's fused multiply-adds are written
+// with, are otherwise libm calls (~3% of the emulation thread).
+bool HostHasFma()
+{
+#if defined(__x86_64__) || defined(_M_X64)
+  int regs[4] = {};
+#if defined(_MSC_VER) && !defined(__clang__)
+  __cpuid(regs, 1);
+#else
+  __cpuid(1, regs[0], regs[1], regs[2], regs[3]);
+#endif
+  const bool fma = (regs[2] & (1 << 12)) != 0;
+  const bool osxsave = (regs[2] & (1 << 27)) != 0;
+  if (!fma || !osxsave)
+    return false;
+  return (_xgetbv(0) & 0x6) == 0x6;
+#else
+  return false;
+#endif
+}
+
 // The compiler, pinned: Zig's bundled clang, lld and C runtime headers build the module on
 // every platform without Visual Studio, Xcode or a system compiler. Checksums are the ones
 // ziglang.org publishes for each release file.
@@ -361,6 +393,9 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
                                    "build", game_root.string(), "--backend", "c",
                                    "--opt-level", "2", "--output", cache.string(), "--zig",
                                    zig.string(), "--progress"};
+  // Part of the module's cache key, so a module built on another CPU is not reused.
+  if (HostHasFma())
+    args.insert(args.end(), {"--arch-flags", "-mfma"});
   std::error_code ec;
   const fs::path hooks = tools / (disc_id + "-module-hooks.txt");
   if (fs::is_regular_file(hooks, ec))

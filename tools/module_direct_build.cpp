@@ -853,6 +853,9 @@ bool CompileModule(const CompileJob& job, std::string* error)
   }
   for (const std::string& define : job.extra_defines)
     common.push_back("-D" + define);
+  // As module-template's RECOMPCORE_MODULE_ARCH_FLAGS; -ffp-contract=off above
+  // still stops the compiler fusing anything the code does not write as fma.
+  common.insert(common.end(), job.arch_flags.begin(), job.arch_flags.end());
   if (fs::exists(job.generated_dir / "native_call_nofallback.inc"))
     common.push_back("-DDOLRECOMP_CALL_GUARD_MANIFEST=1");
   for (const fs::path& include : {job.generated_dir, job.gxruntime_dir / "include",

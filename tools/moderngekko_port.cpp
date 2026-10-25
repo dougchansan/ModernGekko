@@ -1070,6 +1070,11 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     job.game_id = game.disc_id;
     job.opt_level = opt;
     job.extra_defines = options.defines;
+    {
+      std::istringstream flags_in(options.arch_flags);
+      for (std::string flag; flags_in >> flag;)
+        job.arch_flags.push_back(flag);
+    }
     job.jobs = build_jobs;
     if (options.progress)
     {

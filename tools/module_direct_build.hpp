@@ -51,6 +51,7 @@ struct CompileJob
   std::string game_id;
   std::string opt_level = "2";
   std::vector<std::string> extra_defines;  // e.g. "DOLRECOMP_C_MAX_CALL_DEPTH=24"
+  std::vector<std::string> arch_flags;     // e.g. "-mfma" (module-template's ARCH_FLAGS)
   unsigned jobs = 0;
   // Called as work completes: (done, total, what). Compiles count one each; the link is the
   // last step.
