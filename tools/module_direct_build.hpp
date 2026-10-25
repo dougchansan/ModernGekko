@@ -35,9 +35,13 @@ bool ReadHookList(const fs::path& path, std::vector<Hook>* hooks, std::string* e
 // scripts/make-hook-aware-module.py, in place on a DolRecomp output directory: calls and jumps
 // to a hooked function go back through the chassis while that hook is live, and the module
 // exports the hooked addresses. `idle_continuations` are return addresses of idle-loop calls
-// that must go through the dispatcher (GC6E01: 0x800FEB9C).
+// that must go through the dispatcher (GC6E01: 0x800FEB9C). Constant branches into another
+// chunk become tail calls of that chunk's function, except into `idle_loops`, the [start, end)
+// ranges the runtime watches as idle loops (GC6E01: 0x800D31E0-0x800D321C).
 bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hooks,
-                   const std::vector<std::uint32_t>& idle_continuations, std::string* error);
+                   const std::vector<std::uint32_t>& idle_continuations,
+                   const std::vector<std::pair<std::uint32_t, std::uint32_t>>& idle_loops,
+                   std::string* error);
 
 struct CompileJob
 {

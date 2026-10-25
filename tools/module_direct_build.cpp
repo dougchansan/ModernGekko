@@ -3,6 +3,7 @@
 #include "module_direct_build.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -358,8 +359,49 @@ bool ReadHookList(const fs::path& path, std::vector<Hook>* hooks, std::string* e
   return true;
 }
 
+namespace
+{
+// A generated instruction comment, "<ws>// XXXXXXXX: <mnemonic> ...".
+bool InstructionComment(std::string_view line, std::uint32_t* address, std::string_view* mnemonic)
+{
+  std::size_t p = SkipSpace(line, 0);
+  if (line.compare(p, 3, "// ") != 0)
+    return false;
+  std::uint64_t value = 0;
+  if (ParseHex(line, p + 3, &value, true, 8) != 8 || line.compare(p + 11, 2, ": ") != 0)
+    return false;
+  const std::size_t m = p + 13;
+  std::size_t e = m;
+  while (e < line.size() && !IsSpace(line[e]))
+    ++e;
+  *address = static_cast<std::uint32_t>(value);
+  *mnemonic = line.substr(m, e - m);
+  return true;
+}
+
+bool IsCallMnemonic(std::string_view m)
+{
+  return m == "bl" || m == "bla" || m == "bcl" || m == "bcla";
+}
+
+bool IsBranchMnemonic(std::string_view m)
+{
+  return m == "b" || m == "ba" || m == "bc" || m == "bca";
+}
+
+// Defines DOLRECOMP_TAIL_JUMP(f): a guaranteed tail call of chunk function f where the compiler
+// has musttail, nothing (fall through to the dispatcher return) where it does not.
+constexpr std::string_view kTailJumpMacro =
+    "#if defined(__has_attribute)\n#if __has_attribute(musttail)\n"
+    "#define DOLRECOMP_TAIL_JUMP(f) { void f(CPUState* ctx); __attribute__((musttail)) return f(ctx); }\n"
+    "#endif\n#endif\n"
+    "#ifndef DOLRECOMP_TAIL_JUMP\n#define DOLRECOMP_TAIL_JUMP(f) {}\n#endif\n";
+}  // namespace
+
 bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_list,
-                   const std::vector<std::uint32_t>& idle_continuations, std::string* error)
+                   const std::vector<std::uint32_t>& idle_continuations,
+                   const std::vector<std::pair<std::uint32_t, std::uint32_t>>& idle_loops,
+                   std::string* error)
 {
   // address -> (end, has return hooks), and each hook's live-flag index in address order.
   std::map<std::uint32_t, std::pair<std::uint32_t, bool>> hooks;
@@ -399,6 +441,106 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
     return false;
   }
   std::sort(files.begin(), files.end());
+
+  // Chunk start addresses, from "chunk_NNNN_<section>_XXXXXXXX.c"; each chunk's function is
+  // func_XXXXXXXX and covers up to the next chunk (the last one, 16 KiB).
+  const auto chunk_address = [](const fs::path& file) -> std::optional<std::uint32_t> {
+    const std::string name = file.filename().string();
+    std::uint64_t value = 0;
+    if (!name.starts_with("chunk_") || name.size() < 10 || !name.ends_with(".c") ||
+        ParseHex(name, name.size() - 10, &value, true, 8) != 8)
+      return std::nullopt;
+    return static_cast<std::uint32_t>(value);
+  };
+  std::vector<std::uint32_t> chunk_starts;
+  for (const fs::path& file : files)
+  {
+    if (const auto start = chunk_address(file))
+      chunk_starts.push_back(*start);
+  }
+  std::sort(chunk_starts.begin(), chunk_starts.end());
+  const auto chunk_of = [&](std::uint32_t address) -> std::optional<std::uint32_t> {
+    const auto it = std::upper_bound(chunk_starts.begin(), chunk_starts.end(), address);
+    if (it == chunk_starts.begin())
+      return std::nullopt;
+    const std::uint32_t start = *(it - 1);
+    if (it == chunk_starts.end() && address >= start + 0x4000u)
+      return std::nullopt;
+    return start;
+  };
+
+  // Cross-chunk tail jumps. A constant branch (b/bc, no link) into another chunk returned to
+  // the dispatcher, which only dispatched the target: a function that straddles a chunk
+  // boundary paid two dispatcher round trips per loop iteration. The branch now tail-calls
+  // the target chunk's function while the loop cycle budget lasts, unless the target is a
+  // live hooked entry, leaves a return-hooked function (its return hook would be skipped) or
+  // enters an idle loop the runtime watches. Mirrors make-hook-aware-module.py.
+  const auto tail_jumps = [&](std::uint32_t here, const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 16384);
+    bool in_main = false, have_current = false;
+    std::uint32_t current = 0;
+    std::string_view mnemonic;
+    std::string previous;
+    std::size_t start = 0;
+    while (start <= text.size())
+    {
+      std::size_t end = text.find('\n', start);
+      const bool last = end == std::string::npos;
+      if (last)
+        end = text.size();
+      const std::string_view line = std::string_view(text).substr(start, end - start);
+      if (line.starts_with("void func_"))
+        in_main = true;
+      else if (line.starts_with("static void loop_"))
+        in_main = false;
+      std::uint32_t address = 0;
+      std::string_view m;
+      if (InstructionComment(line, &address, &m))
+      {
+        current = address;
+        mnemonic = m;
+        have_current = true;
+      }
+      out.append(line);
+      if (!last)
+        out += '\n';
+
+      // "<ws>ctx->pc = 0xTTTTTTTTu;" followed by "<ws>return;"
+      const std::size_t p = SkipSpace(line, 0);
+      std::uint64_t target = 0;
+      const std::size_t next_end = last ? std::string::npos : text.find('\n', end + 1);
+      const std::string_view next =
+          last ? std::string_view() : std::string_view(text).substr(end + 1, (next_end == std::string::npos ? text.size() : next_end) - end - 1);
+      if (in_main && have_current && IsBranchMnemonic(mnemonic) &&
+          line.compare(p, 12, "ctx->pc = 0x") == 0 && ParseHex(line, p + 12, &target, true, 8) == 8 &&
+          line.substr(p + 20) == "u;" && next.substr(SkipSpace(next, 0)) == "return;" &&
+          previous.find("DOLRECOMP_C_LOOP_CYCLE_BUDGET") == std::string::npos)
+      {
+        const auto to = static_cast<std::uint32_t>(target);
+        const auto target_chunk = chunk_of(to);
+        const auto* region = in_hook(current);
+        const bool leaves_returning = region && region->second.second &&
+                                      !(region->first <= to && to < region->second.first);
+        const bool idle = std::any_of(idle_loops.begin(), idle_loops.end(), [&](const auto& range) {
+          return range.first <= to && to < range.second;
+        });
+        if (target_chunk && *target_chunk != here && !leaves_returning && !idle)
+        {
+          std::string condition = "(ctx->downcount > -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET)";
+          if (hooks.contains(to))
+            condition += " && !" + live(to);
+          out.append(line.substr(0, p));
+          out += "if (" + condition + ") DOLRECOMP_TAIL_JUMP(func_" + Hex8(*target_chunk) + ")\n";
+        }
+      }
+      previous.assign(line);
+      if (last)
+        break;
+      start = end + 1;
+    }
+    return out;
+  };
 
   static constexpr std::string_view kEnter = "if (dolrecomp_call_enter()) {\n";
   for (const fs::path& file : files)
@@ -539,7 +681,7 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
 
       std::string out;
       out.reserve(text.size() + 4096);
-      bool in_main = false, entry_switch_done = false, have_current = false;
+      bool in_main = false, entry_switch_done = false, have_current = false, call_insn = false;
       std::uint32_t current = 0;
       std::size_t start = 0;
       while (start <= text.size())
@@ -549,6 +691,10 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
         if (last)
           end = text.size();
         std::string line = text.substr(start, end - start);
+        std::uint32_t insn_address = 0;
+        std::string_view mnemonic;
+        if (InstructionComment(line, &insn_address, &mnemonic))
+          call_insn = IsCallMnemonic(mnemonic);
         if (line.starts_with("void func_"))
         {
           in_main = true;
@@ -610,8 +756,10 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
               replaced.append(line, c, std::string::npos);
               line = std::move(replaced);
             }
+            // A call's callee returns into this body, so the return hook still fires at the
+            // function's own blr; only branches that leave the body for good are rerouted.
             line = rewrite_gotos(line, [&](std::uint32_t target) -> std::string {
-              if (!ret || (h <= target && target < end_address))
+              if (!ret || call_insn || (h <= target && target < end_address))
                 return {};
               return "{ if (" + live(h) + ") { ctx->pc = 0x" + Hex8(target) +
                      "u; return; } goto label_" + Hex8(target) + " /*ha*/; }";
@@ -626,7 +774,10 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
       }
       text = std::move(out);
     }
-    if (text != before && !WriteText(file, "extern unsigned char dolrecomp_hook_live[];\n" + text))
+    if (const auto here = chunk_address(file))
+      text = tail_jumps(*here, text);
+    if (text != before &&
+        !WriteText(file, "extern unsigned char dolrecomp_hook_live[];\n" + std::string(kTailJumpMacro) + text))
     {
       *error = "cannot write " + file.string();
       return false;

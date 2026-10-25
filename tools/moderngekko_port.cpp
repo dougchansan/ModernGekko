@@ -104,6 +104,9 @@ struct BuildOptions
   // return addresses of idle-loop calls. Zig builds only.
   fs::path hook_list;
   std::vector<std::uint32_t> idle_continuations;
+  // [start, end) idle loops the runtime watches: cross-chunk branches into them still return
+  // to the dispatcher. Zig builds only.
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> idle_loops;
   std::vector<std::string> defines;  // NAME=VALUE for every module translation unit
   // Print "progress <done> <total> <stage>" lines for a front end.
   bool progress = false;
@@ -795,12 +798,20 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
         std::cerr << "cannot read hook list: " << options.hook_list << '\n';
         return std::nullopt;
       }
-      flags += " hooks:" + *hooks_hash;
+      // transform: bumped when the rewrite itself changes (2: local calls out of
+      // return-hooked functions, cross-chunk tail jumps), so cached modules rebuild.
+      flags += " hooks:" + *hooks_hash + " transform:2";
       for (const std::uint32_t idle : options.idle_continuations)
       {
         std::ostringstream hex;
         hex << std::hex << idle;
         flags += " idle:" + hex.str();
+      }
+      for (const auto& [loop_start, loop_end] : options.idle_loops)
+      {
+        std::ostringstream hex;
+        hex << std::hex << loop_start << '-' << loop_end;
+        flags += " idleloop:" + hex.str();
       }
     }
   }
@@ -1052,7 +1063,8 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     {
       std::vector<mb::Hook> hooks;
       if (!mb::ReadHookList(options.hook_list, &hooks, &error) ||
-          !mb::MakeHookAware(generated, hooks, options.idle_continuations, &error))
+          !mb::MakeHookAware(generated, hooks, options.idle_continuations, options.idle_loops,
+                             &error))
       {
         std::cerr << error << '\n';
         return std::nullopt;
@@ -1161,7 +1173,7 @@ void Usage()
   std::cerr << "usage: moderngekko-port inspect <game-root>\n"
                "       moderngekko-port build <game-root> [--backend c|llvm] [--state-in-memory] [--toolchain auto|clang|gcc|msvc] [--opt-level 0-3] [--arch-flags \"flags\"] [--output path] [--dol-patch address=value] [--native-subst address:symbol]\n"
                "              [--pgo-generate dir | --pgo-use profile.profdata] [--profile-runtime path]\n"
-               "              [--zig path [--hook-list file] [--idle-continuation address] [--define NAME=VALUE] [--progress]]\n"
+               "              [--zig path [--hook-list file] [--idle-continuation address] [--idle-loop start:end] [--define NAME=VALUE] [--progress]]\n"
                "       moderngekko-port run <game-root> [build options] [-- runner options]\n";
 }
 }  // namespace
@@ -1221,6 +1233,19 @@ int main(int argc, char** argv)
         return 2;
       }
       options.idle_continuations.push_back(address);
+    }
+    else if (arg == "--idle-loop" && i + 1 < argc)
+    {
+      const std::string range = argv[++i];
+      const std::size_t colon = range.find(':');
+      std::uint32_t loop_start = 0, loop_end = 0;
+      if (colon == std::string::npos || !ParseHex32(range.substr(0, colon), &loop_start) ||
+          !ParseHex32(range.substr(colon + 1), &loop_end) || loop_end <= loop_start)
+      {
+        std::cerr << "invalid --idle-loop range (START:END): " << range << '\n';
+        return 2;
+      }
+      options.idle_loops.emplace_back(loop_start, loop_end);
     }
     else if (arg == "--define" && i + 1 < argc)
       options.defines.emplace_back(argv[++i]);

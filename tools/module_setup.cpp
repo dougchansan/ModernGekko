@@ -402,8 +402,9 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
   {
     args.insert(args.end(), {"--hook-list", hooks.string()});
     // The game's task scheduler: its idle loop has to come back through the dispatcher.
+    // And the idle loop the runtime watches (its configured idle pc range).
     if (disc_id == "GC6E01")
-      args.insert(args.end(), {"--idle-continuation", "800FEB9C"});
+      args.insert(args.end(), {"--idle-continuation", "800FEB9C", "--idle-loop", "800D31E0:800D321C"});
   }
   for (const std::string& patch : CsvPairs(tools / (disc_id + "-native-widescreen.csv"),
                                            "address", "replacement", '='))
