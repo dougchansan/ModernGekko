@@ -3,6 +3,7 @@
 #include "module_direct_build.hpp"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <atomic>
 #include <cstdio>
@@ -395,7 +396,124 @@ constexpr std::string_view kTailJumpMacro =
     "#if defined(__has_attribute)\n#if __has_attribute(musttail)\n"
     "#define DOLRECOMP_TAIL_JUMP(f) { void f(CPUState* ctx); __attribute__((musttail)) return f(ctx); }\n"
     "#endif\n#endif\n"
-    "#ifndef DOLRECOMP_TAIL_JUMP\n#define DOLRECOMP_TAIL_JUMP(f) {}\n#endif\n";
+    "#ifndef DOLRECOMP_TAIL_JUMP\n#define DOLRECOMP_TAIL_JUMP(f) {}\n#endif\n"
+    // Whether an indirect call's target is a live hooked entry: one bucket load for nearly
+    // every target (the table is in the marker).
+    "extern const unsigned short dolrecomp_hook_bucket[256];\n"
+    "extern const unsigned int dolrecomp_hook_aware_addresses[];\n"
+    "int dolrecomp_hook_live_slow(unsigned int address);\n"
+    "static inline int dolrecomp_hook_live_at(unsigned int address) {\n"
+    "    unsigned short e = dolrecomp_hook_bucket[(address >> 2) & 255u];\n"
+    "    if (!e) return 0;\n"
+    "    if (e != 0xFFFFu) return dolrecomp_hook_aware_addresses[e - 1] == address && "
+    "dolrecomp_hook_live[e - 1];\n"
+    "    return dolrecomp_hook_live_slow(address);\n"
+    "}\n";
+
+// dolrecomp_hook_live_at's table and slow path, for the marker: bucket (address >> 2) & 255
+// holds the hook's index + 1, 0 for no hook, 0xFFFF when two hooks share it (then a scan).
+std::string HookBucketTable(const std::map<std::uint32_t, std::pair<std::uint32_t, bool>>& hooks)
+{
+  std::array<unsigned, 256> buckets{};
+  unsigned index = 0;
+  for (const auto& [address, unused] : hooks)
+  {
+    unsigned& b = buckets[(address >> 2) & 255u];
+    b = b == 0 ? index + 1 : 0xFFFFu;
+    ++index;
+  }
+  std::string out = "/* Indirect calls' hooked-entry check (dolrecomp_hook_live_at). */\n"
+                    "const unsigned short dolrecomp_hook_bucket[256] = {\n";
+  char cell[16];
+  for (unsigned row = 0; row < 256; row += 16)
+  {
+    out += "    ";
+    for (unsigned c = 0; c < 16; ++c)
+    {
+      std::snprintf(cell, sizeof(cell), "0x%04Xu", buckets[row + c]);
+      out += cell;
+      if (c + 1 < 16)
+        out += ", ";
+    }
+    out += row + 16 < 256 ? ",\n" : "\n";
+  }
+  out += "};\n"
+         "int dolrecomp_hook_live_slow(unsigned int address) {\n"
+         "    for (unsigned int i = 0; i < " +
+         std::to_string(hooks.size()) +
+         "u; ++i)\n"
+         "        if (dolrecomp_hook_aware_addresses[i] == address) return dolrecomp_hook_live[i];\n"
+         "    return 0;\n"
+         "}\n";
+  return out;
+}
+
+bool IsIndirectCallMnemonic(std::string_view m)
+{
+  return m == "bctrl" || m == "bcctrl" || m == "blrl" || m == "bclrl";
+}
+
+// Indirect calls (bctrl/blrl: callbacks, function pointers) returned to the dispatcher twice,
+// to enter the target and to come back. They now call the target's chunk function nested, as
+// a direct cross-chunk call does, and continue at the return label - unless the target is a
+// live hooked entry, no compiled function covers it, the call depth is exhausted, or the
+// return label is in another chunk; then the original exit runs. Mirrors
+// make-hook-aware-module.py.
+std::string IndirectCalls(const std::string& text)
+{
+  std::string out;
+  out.reserve(text.size() + 65536);
+  bool in_main = false;
+  std::string_view mnemonic;
+  std::vector<std::string_view> lines;
+  for (std::size_t start = 0;;)
+  {
+    const std::size_t end = text.find('\n', start);
+    lines.push_back(std::string_view(text).substr(start, end == std::string::npos ? std::string::npos
+                                                                                  : end - start));
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  for (std::size_t i = 0; i < lines.size(); ++i)
+  {
+    const std::string_view line = lines[i];
+    if (line.starts_with("void func_"))
+      in_main = true;
+    else if (line.starts_with("static void loop_"))
+      in_main = false;
+    std::uint32_t address = 0;
+    std::string_view m;
+    if (InstructionComment(line, &address, &m))
+      mnemonic = m;
+    out.append(line);
+    if (i + 1 < lines.size())
+      out += '\n';
+    // "<ws>ctx->lr = 0xRRRRRRRRu;" then "<ws>ctx->pc = target;"
+    const std::size_t p = SkipSpace(line, 0);
+    std::uint64_t ret = 0;
+    if (!in_main || !IsIndirectCallMnemonic(mnemonic) || i + 1 >= lines.size() ||
+        line.compare(p, 12, "ctx->lr = 0x") != 0 || ParseHex(line, p + 12, &ret, true, 8) != 8 ||
+        line.substr(p + 20) != "u;" ||
+        lines[i + 1].substr(SkipSpace(lines[i + 1], 0)) != "ctx->pc = target;")
+      continue;
+    const std::string label = Hex8(static_cast<std::uint32_t>(ret));
+    if (text.find("\nlabel_" + label + ":") == std::string::npos)
+      continue;
+    const std::string indent(line.substr(0, p));
+    out.append(lines[++i]);
+    out += '\n';
+    out += indent + "if (!dolrecomp_hook_live_at(target) && dolrecomp_call_enter()) {\n";
+    out += indent + "    DolRecompFunction fn = dolrecomp_find_original(target);\n";
+    out += indent + "    if (fn) { fn(ctx); dolrecomp_call_leave(); if (ctx->pc == 0x" + label +
+           "u) goto label_" + label + "; return; }\n";
+    out += indent + "    dolrecomp_call_leave();\n";
+    out += indent + "}";
+    if (i + 1 < lines.size())
+      out += '\n';
+  }
+  return out;
+}
 }  // namespace
 
 bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_list,
@@ -775,7 +893,7 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
       text = std::move(out);
     }
     if (const auto here = chunk_address(file))
-      text = tail_jumps(*here, text);
+      text = IndirectCalls(tail_jumps(*here, text));
     if (text != before &&
         !WriteText(file, "extern unsigned char dolrecomp_hook_live[];\n" + std::string(kTailJumpMacro) + text))
     {
@@ -805,7 +923,7 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
       "   dispatcher). The runtime clears unused ones; all 1 is always correct. */\n"
       "HOOK_AWARE_EXPORT unsigned char dolrecomp_hook_live[" +
       std::to_string(std::max<std::size_t>(hooks.size(), 1)) + "] = {" +
-      (flags.empty() ? std::string("0") : flags) + "};\n";
+      (flags.empty() ? std::string("0") : flags) + "};\n" + HookBucketTable(hooks);
   if (!WriteText(chunks / "zz_hook_aware_marker.c", marker))
   {
     *error = "cannot write the hook-aware marker";
