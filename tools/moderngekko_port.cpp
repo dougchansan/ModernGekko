@@ -801,7 +801,7 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
       // transform: bumped when the rewrite itself changes (2: local calls out of
       // return-hooked functions, cross-chunk tail jumps; 3: nested indirect calls), so
       // cached modules rebuild.
-      flags += " hooks:" + *hooks_hash + " transform:3";
+      flags += " hooks:" + *hooks_hash + " transform:4";
       for (const std::uint32_t idle : options.idle_continuations)
       {
         std::ostringstream hex;

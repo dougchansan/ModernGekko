@@ -514,6 +514,68 @@ std::string IndirectCalls(const std::string& text)
   }
   return out;
 }
+
+// Data cache ops (dcbf/dcbst/dcbi) run through the runtime's instruction fallback, which only
+// invalidates compiled code at the line (the SMC guard) and steps pc; the dispatcher round trip
+// after it was what they cost - per 32-byte line of DCFlushRange, over half of all dispatches
+// in battle. When the line is outside the module's code [code_start, code_end) (no chunk can
+// have been marked for re-verification), nothing was raised and pc stepped normally, execution
+// continues at the next label. Mirrors make-hook-aware-module.py.
+std::string CacheOps(const std::string& text, std::uint32_t code_start, std::uint32_t code_end)
+{
+  std::string out;
+  out.reserve(text.size() + 4096);
+  bool in_main = false;
+  std::string_view mnemonic;
+  std::vector<std::string_view> lines;
+  for (std::size_t start = 0;;)
+  {
+    const std::size_t end = text.find('\n', start);
+    lines.push_back(std::string_view(text).substr(start, end == std::string::npos ? std::string::npos
+                                                                                  : end - start));
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  constexpr std::string_view call = "ppc_fallback_instruction(ctx, 0x";
+  for (std::size_t i = 0; i < lines.size(); ++i)
+  {
+    const std::string_view line = lines[i];
+    if (line.starts_with("void func_"))
+      in_main = true;
+    else if (line.starts_with("static void loop_"))
+      in_main = false;
+    std::uint32_t address = 0;
+    std::string_view m;
+    if (InstructionComment(line, &address, &m))
+      mnemonic = m;
+    out.append(line);
+    if (i + 1 < lines.size())
+      out += '\n';
+    // "<ws>ppc_fallback_instruction(ctx, 0xRRRRRRRRu, 0xAAAAAAAAu);" then "<ws>return;"
+    const std::size_t p = SkipSpace(line, 0);
+    const std::size_t q = p + call.size();
+    std::uint64_t raw = 0, at = 0;
+    if (!in_main || !(mnemonic == "dcbf" || mnemonic == "dcbst" || mnemonic == "dcbi") ||
+        i + 1 >= lines.size() || line.compare(p, call.size(), call) != 0 ||
+        ParseHex(line, q, &raw, true, 8) != 8 || line.compare(q + 8, 5, "u, 0x") != 0 ||
+        ParseHex(line, q + 13, &at, true, 8) != 8 || line.substr(q + 21) != "u);" ||
+        lines[i + 1].substr(SkipSpace(lines[i + 1], 0)) != "return;")
+      continue;
+    const std::string next = Hex8(static_cast<std::uint32_t>(at) + 4u);
+    if (text.find("\nlabel_" + next + ":") == std::string::npos)
+      continue;
+    const unsigned ra = (raw >> 16) & 31u, rb = (raw >> 11) & 31u;
+    const std::string ea = ra == 0 ? "ctx->gpr[" + std::to_string(rb) + "]"
+                                   : "(ctx->gpr[" + std::to_string(ra) + "] + ctx->gpr[" +
+                                         std::to_string(rb) + "])";
+    out += std::string(line.substr(0, p)) + "{ u32 phys = " + ea +
+           " & 0x01FFFFFFu; if (!ctx->exception && ctx->pc == 0x" + next + "u && (phys < 0x" +
+           Hex8(code_start & 0x01FFFFFFu) + "u || phys >= 0x" + Hex8(code_end & 0x01FFFFFFu) +
+           "u)) goto label_" + next + "; }\n";
+  }
+  return out;
+}
 }  // namespace
 
 bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_list,
@@ -577,6 +639,8 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
       chunk_starts.push_back(*start);
   }
   std::sort(chunk_starts.begin(), chunk_starts.end());
+  const std::uint32_t code_start = chunk_starts.empty() ? 0 : chunk_starts.front();
+  const std::uint32_t code_end = chunk_starts.empty() ? 0 : chunk_starts.back() + 0x4000u;
   const auto chunk_of = [&](std::uint32_t address) -> std::optional<std::uint32_t> {
     const auto it = std::upper_bound(chunk_starts.begin(), chunk_starts.end(), address);
     if (it == chunk_starts.begin())
@@ -893,7 +957,7 @@ bool MakeHookAware(const fs::path& generated_dir, const std::vector<Hook>& hook_
       text = std::move(out);
     }
     if (const auto here = chunk_address(file))
-      text = IndirectCalls(tail_jumps(*here, text));
+      text = CacheOps(IndirectCalls(tail_jumps(*here, text)), code_start, code_end);
     if (text != before &&
         !WriteText(file, "extern unsigned char dolrecomp_hook_live[];\n" + std::string(kTailJumpMacro) + text))
     {
