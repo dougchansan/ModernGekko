@@ -261,6 +261,9 @@ struct NavigationOverlayState
   unsigned int collision_room_id = std::numeric_limits<unsigned int>::max();
   int collision_refresh_delay_frames = 0;
   int collision_refresh_retries = 0;
+  // Fields until a confirmed battle with no known archive looks for the
+  // loaded arena archive again.
+  int battle_archive_lookup_delay = 0;
   // The game's active collision mesh when the map was last refreshed.
   u32 collision_game_mesh = 0;
   u32 collision_base = 0;
@@ -1089,6 +1092,10 @@ void RefreshNavigationCollisionMap(const Memory::MemoryManager& memory,
   state.collision_max_x = best.max_x;
   state.collision_min_z = best.min_z;
   state.collision_max_z = best.max_z;
+  if (std::getenv("MODERNGEKKO_PRESENTATION_TRACE"))
+    std::fprintf(stderr, "[presentation] collision scan room=%u valid=%d archive=%s retries=%d\n",
+                 room_id, state.collision_valid, state.collision_archive_name.c_str(),
+                 state.collision_refresh_retries);
 }
 
 std::vector<std::filesystem::path> ListNavigationSavestates(
@@ -4551,6 +4558,39 @@ RuntimeRunResult Runtime::Run() {
           const bool battle_gameplay_message =
               automation::IsColosseumBattleGameplayConfirmed(
                   m_impl->navigation_overlay.battle_gameplay_message_fields);
+          // The collision scan runs the moment the room id changes, which for
+          // a Battle Now arena is seconds before its archive (M1_water_colo,
+          // ...) streams in, and an arena has no field collision for the
+          // scan's retries to find: the name stays empty, the arena is never
+          // recognized, the battle session never opens, and every command
+          // menu (which raises the generic menu flag) pillarboxes the battle
+          // to 4:3. While a confirmed battle has no archive name, look for the
+          // loaded arena archive itself every 30 fields until it appears.
+          if (battle_gameplay_message)
+          {
+            auto& overlay = m_impl->navigation_overlay;
+            bool look = false;
+            {
+              std::lock_guard lock(overlay.mutex);
+              look = overlay.collision_archive_name.empty() &&
+                     --overlay.battle_archive_lookup_delay <= 0;
+              if (look)
+                overlay.battle_archive_lookup_delay = 30;
+            }
+            if (look)
+            {
+              const std::span<const u8> ram =
+                  memory.GetSpanForAddress(Memory::MEM1_BASE_ADDR);
+              std::string archive = FindLoadedFieldArchiveName(
+                  ram.first(std::min<std::size_t>(memory.GetRamSizeReal(), ram.size())));
+              if (automation::IsColosseumBattleFieldArchive(archive))
+              {
+                std::lock_guard lock(overlay.mutex);
+                if (overlay.collision_archive_name.empty())
+                  overlay.collision_archive_name = std::move(archive);
+              }
+            }
+          }
           // Colosseum publishes the arena message for a field in the middle of
           // the Battle Now canvas's own transitions, so the id leaves the
           // authored band and comes straight back. Reacting to that single
@@ -4765,7 +4805,9 @@ RuntimeRunResult Runtime::Run() {
                   complete_menu_active, valid, character_naming_active,
                   m_impl->navigation_overlay.ultrawide_gameplay_started.load(
                       std::memory_order_relaxed),
-                  battle_gameplay_active, battle_now_active);
+                  // A confirmed arena message is a live battle even before the
+                  // session latches (it waits for the arena archive to load).
+                  battle_gameplay_active || battle_gameplay_message, battle_now_active);
           // Despite the Config key's name, GFX_WIDESCREEN_AUTHORED_MENU is
           // deliberately naming-only. It drives two things: the model
           // projection scale in VertexShaderManager, which must not touch
@@ -4962,6 +5004,32 @@ RuntimeRunResult Runtime::Run() {
                   static_cast<int>(applied_aspect), std::memory_order_release);
               m_impl->navigation_overlay.presentation_transitions.fetch_add(
                   1, std::memory_order_relaxed);
+              // MODERNGEKKO_PRESENTATION_TRACE=1: each applied presentation
+              // with the guest observations that chose it.
+              static const bool presentation_trace =
+                  std::getenv("MODERNGEKKO_PRESENTATION_TRACE") != nullptr;
+              if (presentation_trace)
+              {
+                std::string archive;
+                {
+                  std::lock_guard lock(overlay.mutex);
+                  archive = overlay.collision_archive_name;
+                }
+                const std::string loaded = FindLoadedFieldArchiveName(
+                    memory.GetSpanForAddress(Memory::MEM1_BASE_ADDR)
+                        .first(memory.GetRamSizeReal()));
+                std::fprintf(stderr, "[presentation] room=%u loaded=%s\n",
+                             memory.Read_U8(room_id_address), loaded.c_str());
+                std::fprintf(stderr,
+                             "[presentation] aspect=%d authored_menu=%d hor_plus=%d msg=0x%04x "
+                             "menu=%d complete_menu=%d nav_valid=%d battle_now=%d/%d "
+                             "battle_msg=%d battle_session=%d battle_field=%d archive=%s\n",
+                             static_cast<int>(applied_aspect), authored_menu_active,
+                             gameplay_ultrawide, active_ui_message_id, menu_active,
+                             complete_menu_active, valid, battle_now_observed,
+                             battle_now_active, battle_gameplay_message, battle_gameplay_active,
+                             battle_field_archive, archive.c_str());
+              }
             }
             // Complete 2D menu canvases need ForceStandard presentation only.
             // Character naming additionally contains a 3D model and therefore
