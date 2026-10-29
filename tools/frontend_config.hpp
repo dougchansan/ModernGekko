@@ -62,6 +62,8 @@ struct ConfigResult {
   int accessibility_ui_scale = 100;
   bool sixty_fps = false;
   bool guest_idle_skip = true;
+  // Emulated CPU clock in 60 FPS mode, percent of the GameCube's 486 MHz.
+  int cpu_clock = 200;
   // Emulate on one thread and render on another (Dolphin's dual core).
   bool dual_core = true;
   bool fast_forward = false;

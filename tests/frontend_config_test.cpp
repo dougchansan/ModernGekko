@@ -38,7 +38,7 @@ int main() {
       loaded.graphics_backend != "Vulkan" || loaded.hires_textures ||
 #endif
       loaded.community_hd_texture_pack ||
-      loaded.text_upscale || loaded.sixty_fps ||
+      loaded.text_upscale || loaded.sixty_fps || loaded.cpu_clock != 200 ||
       loaded.aspect_ratio != moderngekko::frontend::kFrontendAspectAuto ||
       loaded.fast_forward) {
     return 2;
@@ -63,6 +63,7 @@ int main() {
   netplay_config.minimap_high_contrast = true;
   netplay_config.accessibility_ui_scale = 150;
   netplay_config.sixty_fps = true;
+  netplay_config.cpu_clock = 150;
   netplay_config.fast_forward = true;
   netplay_config.fast_forward_multiplier = 3;
   netplay_config.autosave = false;
@@ -102,7 +103,7 @@ int main() {
       !netplay_loaded.input_overlay ||
       !netplay_loaded.minimap_high_contrast ||
       netplay_loaded.accessibility_ui_scale != 150 ||
-      !netplay_loaded.sixty_fps ||
+      !netplay_loaded.sixty_fps || netplay_loaded.cpu_clock != 150 ||
       !netplay_loaded.fast_forward ||
       netplay_loaded.fast_forward_multiplier != 3 ||
       netplay_loaded.autosave || netplay_loaded.autosave_slots != 7 ||

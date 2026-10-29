@@ -54,6 +54,12 @@ struct GraphicsSettings
 struct QualityOfLifeSettings
 {
   bool sixty_fps = false;
+  // Emulated CPU clock while sixty_fps is on, percent of the GameCube's
+  // 486 MHz (Dolphin's overclock). The 60 FPS patch doubles the game's
+  // per-second work, and its heaviest battle frames then overrun a stock
+  // GameCube's frame and drop to 30 for that frame; 200 holds them at 60.
+  // Emulated time is unchanged: the CPU only gets more cycles per frame.
+  int cpu_clock = 200;
   // The task-list-aware guest idle skip. On by default: it is what lets
   // battle scenes hold 60. It is a trade, not a free win -- on a field
   // scene the task list is rarely empty, so each pass pays for the list

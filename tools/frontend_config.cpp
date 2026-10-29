@@ -222,6 +222,9 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     } else if (key == "sixty_fps") {
       if (!ParseBoolean(value, &config.sixty_fps))
         return {.error = "sixty_fps must be true or false"};
+    } else if (key == "cpu_clock") {
+      if (!ParseIntValue(value, &config.cpu_clock, 100, 300))
+        return {.error = "cpu_clock must be from 100 to 300"};
     } else if (key == "guest_idle_skip") {
       if (!ParseBoolean(value, &config.guest_idle_skip))
         return {.error = "guest_idle_skip must be true or false"};
@@ -340,6 +343,7 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
       config.navigation_overlay < 0 || config.navigation_overlay > 2 ||
       config.accessibility_ui_scale < 75 ||
       config.accessibility_ui_scale > 200 ||
+      config.cpu_clock < 100 || config.cpu_clock > 300 ||
       config.fast_forward_multiplier < 2 ||
       config.fast_forward_multiplier > 4 || config.autosave_slots < 1 ||
       config.autosave_slots > 10 || config.crash_watchdog_seconds < 10 ||
@@ -387,7 +391,7 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
       "text_upscale", "input_overlay", "minimap_high_contrast",
       "accessibility_ui_scale", "ultrawide_efb_scale", "fullscreen",
       "exclusivefullscreen", "show_fps_in_title", "sixty_fps",
-      "guest_idle_skip", "dual_core", "fast_forward",
+      "cpu_clock", "guest_idle_skip", "dual_core", "fast_forward",
       "fast_forward_multiplier", "autosave", "autosave_slots",
       "crash_watchdog", "crash_watchdog_seconds", "controller",
       "controller1", "controller2", "controller3", "controller4",
@@ -450,6 +454,7 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
        << '\n'
        << "[QualityOfLife]\n"
        << "sixty_fps=" << (config.sixty_fps ? "true" : "false") << '\n'
+       << "cpu_clock=" << config.cpu_clock << '\n'
        << "guest_idle_skip="
        << (config.guest_idle_skip ? "true" : "false") << '\n'
        << "dual_core=" << (config.dual_core ? "true" : "false") << '\n'

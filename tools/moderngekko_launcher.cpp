@@ -2546,6 +2546,10 @@ int main(int argc, char** argv)
                             "Presents every video field instead of every other one. 60 is the "
                             "ceiling; it roughly doubles the emulation work, so a slower "
                             "machine runs below full speed."));
+      rows.push_back(slider("CPU CLOCK", &config.cpu_clock, 100, 300, 25, "%",
+                            "The console's CPU speed in 60 FPS mode. 200% keeps heavy battles at "
+                            "60; 100% is a stock GameCube, which drops some battle frames to 30.",
+                            config.sixty_fps));
       rows.push_back(toggle("GUEST IDLE SKIP", &config.guest_idle_skip,
                             "Lets the console sleep through the game's idle loop. This is what "
                             "holds heavy battles at 60; it costs about 8% in the field."));

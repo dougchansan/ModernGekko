@@ -3996,6 +3996,11 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
   Config::SetBase(Config::MAIN_CPU_THREAD, impl->config.qol.dual_core);
   std::fprintf(stderr, "[core] dual core %s\n", impl->config.qol.dual_core ? "on" : "off");
+  // The CPU clock applies to 60 FPS mode only: at 30 the stock clock has room.
+  const int cpu_clock = impl->config.qol.sixty_fps ? impl->config.qol.cpu_clock : 100;
+  Config::SetBase(Config::MAIN_OVERCLOCK_ENABLE, cpu_clock != 100);
+  Config::SetBase(Config::MAIN_OVERCLOCK, static_cast<float>(cpu_clock) / 100.0f);
+  std::fprintf(stderr, "[core] cpu clock %d%%\n", cpu_clock);
   if (!impl->config.graphics.backend.empty())
     Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
   else if (impl->config.headless)
