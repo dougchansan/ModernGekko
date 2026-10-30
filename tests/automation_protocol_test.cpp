@@ -114,6 +114,11 @@ int main()
       !automation::IsColosseumBattleNowMenu(0x3dff) ||
       automation::IsColosseumBattleNowMenu(0x3bff) ||
       automation::IsColosseumBattleNowMenu(0x3e00) ||
+      // The front-end is its room (Options publishes no band message) or a
+      // band message elsewhere; the attract title room is not part of it.
+      !automation::IsColosseumFrontEnd(0xa1, false) ||
+      !automation::IsColosseumFrontEnd(0x00, true) ||
+      automation::IsColosseumFrontEnd(0x99, false) ||
       // The live arena reports from separate bands and must stay ultrawide.
       automation::IsColosseumBattleNowMenu(0x00ce) ||
       automation::IsColosseumBattleNowMenu(0x00cf) ||
@@ -158,12 +163,8 @@ int main()
       // battle_now parameter left to pin them to the authored canvas.
       automation::ShouldUseColosseumAuthoredMenuPresentation(
           true, true, false, true, true) ||
-      !automation::ShouldUseColosseumAuthoredMenuPresentation(
-          false, false, false, true, false, true) ||
-      !automation::ShouldUseColosseumAuthoredMenuPresentation(
-          false, true, false, true, false, true) ||
       automation::ShouldUseColosseumAuthoredMenuPresentation(
-          true, true, false, true, true, true) ||
+          false, true, false, true, false) ||
       !automation::ResolveColosseumBattleGameplaySession(
           false, false, true, false, false, false) ||
       !automation::ResolveColosseumBattleGameplaySession(

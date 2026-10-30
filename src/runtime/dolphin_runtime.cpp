@@ -211,6 +211,10 @@ struct NavigationOverlayState
   bool field_aspect_active = false;
   bool movie_aspect_active = false;
   std::atomic<bool> menu_edge_fill_active{false};
+  // The front-end menus are on screen (debounced), and the Hor+ multiplier last
+  // handed to the renderer for them.
+  bool front_end_active = false;
+  float front_end_hor_plus = 0.0f;
   // Presentation telemetry. The mirrors above are CPU-thread-only bookkeeping;
   // these publish the same decisions so automation can observe what was
   // actually presented. The counter is monotonic so a sampler cannot miss a
@@ -230,6 +234,7 @@ struct NavigationOverlayState
   bool pending_field_aspect = false;
   bool pending_movie_aspect = false;
   bool pending_menu_edge_fill = false;
+  bool pending_front_end = false;
   int presentation_stable_fields = 0;
   // Fields remaining before the naming state is released. The confirmation
   // dialog blinks its UI message, so the raw predicate cannot be trusted from
@@ -239,6 +244,9 @@ struct NavigationOverlayState
   // keeps changing would never reach the stable threshold and the presented
   // state would stay frozen at whatever it held when the game loaded.
   int presentation_fields_since_apply = 0;
+  // Consecutive fields the render surface has been narrower than the cached
+  // target; see kNarrowerSurfaceAcceptFields.
+  int narrower_surface_fields = 0;
   // The guest widescreen multiplier, decided once on the CPU thread from the
   // debounced state. The video thread enforces this value rather than deriving
   // its own: this word scales the 3D model, so two threads sampling the flags
@@ -1341,6 +1349,7 @@ bool SetNavigationWidescreenEnabled(bool enabled, std::string* status)
                      gameplay_ultrawide);
   Config::SetCurrent(Config::GFX_WIDESCREEN_AUTHORED_MENU, false);
   Config::SetCurrent(Config::GFX_COLOSSEUM_NAMING_PRESENTATION, false);
+  Config::SetCurrent(Config::GFX_COLOSSEUM_FRONT_END_HOR_PLUS, 0.0f);
   Config::SetCurrent(
       Config::GFX_WIDESCREEN_HUD_SAFE_AREA_SCALE,
       gameplay_ultrawide ? NativeHudSafeAreaScale(GetNativeUltrawideTarget()) :
@@ -4807,7 +4816,7 @@ RuntimeRunResult Runtime::Run() {
                       std::memory_order_relaxed),
                   // A confirmed arena message is a live battle even before the
                   // session latches (it waits for the arena archive to load).
-                  battle_gameplay_active || battle_gameplay_message, battle_now_active);
+                  battle_gameplay_active || battle_gameplay_message);
           // Despite the Config key's name, GFX_WIDESCREEN_AUTHORED_MENU is
           // deliberately naming-only. It drives two things: the model
           // projection scale in VertexShaderManager, which must not touch
@@ -4907,10 +4916,21 @@ RuntimeRunResult Runtime::Run() {
             // 4:3 backbuffer even though the host window is still ultrawide.
             // Keep the last wider physical target so those transient surfaces
             // cannot collapse the Hor+ projection during a menu transition.
+            //
+            // Hold it only while the narrower surface is transient, though.
+            // The ratchet used to be permanent, so a window that was ever wider
+            // (a 3840x2160 window clipped by the desktop at creation, or the
+            // user narrowing it) laid every later menu camera out for the old
+            // aspect and squeezed its 2D for the rest of the session.
+            constexpr int kNarrowerSurfaceAcceptFields = 120;
             const float cached_aspect =
                 m_impl->navigation_overlay.render_surface_aspect.load(
                     std::memory_order_relaxed);
-            if (cached_aspect > target.aspect + 0.001f)
+            int& narrower_fields = m_impl->navigation_overlay.narrower_surface_fields;
+            narrower_fields =
+                cached_aspect > target.aspect + 0.001f ? narrower_fields + 1 : 0;
+            if (cached_aspect > target.aspect + 0.001f &&
+                narrower_fields < kNarrowerSurfaceAcceptFields)
             {
               target.width = m_impl->navigation_overlay.render_surface_width.load(
                   std::memory_order_relaxed);
@@ -4932,12 +4952,15 @@ RuntimeRunResult Runtime::Run() {
             // leaving an authored menu are both debounced. ~50 ms at 60 fields.
             constexpr int kPresentationStableFields = 3;
             auto& overlay = m_impl->navigation_overlay;
+            const bool front_end_active = automation::IsColosseumFrontEnd(
+                memory.Read_U8(room_id_address), battle_now_active);
             if (authored_menu_active != overlay.pending_menu_aspect ||
                 authored_projection_active != overlay.pending_menu_projection ||
                 character_naming_active != overlay.pending_naming_presentation ||
                 gameplay_ultrawide != overlay.pending_field_aspect ||
                 movie_active != overlay.pending_movie_aspect ||
-                menu_edge_fill != overlay.pending_menu_edge_fill)
+                menu_edge_fill != overlay.pending_menu_edge_fill ||
+                front_end_active != overlay.pending_front_end)
             {
               overlay.pending_menu_aspect = authored_menu_active;
               overlay.pending_menu_projection = authored_projection_active;
@@ -4945,6 +4968,7 @@ RuntimeRunResult Runtime::Run() {
               overlay.pending_field_aspect = gameplay_ultrawide;
               overlay.pending_movie_aspect = movie_active;
               overlay.pending_menu_edge_fill = menu_edge_fill;
+              overlay.pending_front_end = front_end_active;
               overlay.presentation_stable_fields = 1;
             }
             else if (overlay.presentation_stable_fields < kPresentationStableFields)
@@ -4972,7 +4996,8 @@ RuntimeRunResult Runtime::Run() {
                 movie_active !=
                     m_impl->navigation_overlay.movie_aspect_active ||
                 menu_edge_fill !=
-                    m_impl->navigation_overlay.menu_edge_fill_active)))
+                    m_impl->navigation_overlay.menu_edge_fill_active ||
+                front_end_active != m_impl->navigation_overlay.front_end_active)))
             {
               m_impl->navigation_overlay.presentation_fields_since_apply = 0;
               m_impl->navigation_overlay.menu_aspect_active = authored_menu_active;
@@ -4983,6 +5008,7 @@ RuntimeRunResult Runtime::Run() {
               m_impl->navigation_overlay.field_aspect_active = gameplay_ultrawide;
               m_impl->navigation_overlay.movie_aspect_active = movie_active;
               m_impl->navigation_overlay.menu_edge_fill_active = menu_edge_fill;
+              m_impl->navigation_overlay.front_end_active = front_end_active;
               m_impl->navigation_overlay.authored_backdrop.store(
                   static_cast<int>(authored_backdrop), std::memory_order_release);
               Config::SetCurrent(Config::GFX_WIDESCREEN_HUD_SAFE_AREA,
@@ -5018,8 +5044,9 @@ RuntimeRunResult Runtime::Run() {
                 const std::string loaded = FindLoadedFieldArchiveName(
                     memory.GetSpanForAddress(Memory::MEM1_BASE_ADDR)
                         .first(memory.GetRamSizeReal()));
-                std::fprintf(stderr, "[presentation] room=%u loaded=%s\n",
-                             memory.Read_U8(room_id_address), loaded.c_str());
+                std::fprintf(stderr, "[presentation] room=%u loaded=%s target=%dx%d %.3f\n",
+                             memory.Read_U8(room_id_address), loaded.c_str(), target.width,
+                             target.height, target.aspect);
                 std::fprintf(stderr,
                              "[presentation] aspect=%d authored_menu=%d hor_plus=%d msg=0x%04x "
                              "menu=%d complete_menu=%d nav_valid=%d battle_now=%d/%d "
@@ -5050,6 +5077,19 @@ RuntimeRunResult Runtime::Run() {
                 projection_bits, std::memory_order_release);
             if (memory.Read_U32(0x8047E724) != projection_bits)
               memory.Write_U32(projection_bits, 0x8047E724);
+            // The front-end presents Hor+ with this same multiplier; the
+            // renderer needs it to widen the menu backdrop and to bring the
+            // popups' 4:3 clipping into the Hor+ layout.
+            const float front_end_hor_plus =
+                m_impl->navigation_overlay.front_end_active && settled_gameplay_ultrawide ?
+                    guest_projection_aspect / kAuthoredGameAspect :
+                    0.0f;
+            if (cache_invalidated ||
+                front_end_hor_plus != m_impl->navigation_overlay.front_end_hor_plus)
+            {
+              m_impl->navigation_overlay.front_end_hor_plus = front_end_hor_plus;
+              Config::SetCurrent(Config::GFX_COLOSSEUM_FRONT_END_HOR_PLUS, front_end_hor_plus);
+            }
             const float previous_aspect =
                 m_impl->navigation_overlay.render_surface_aspect.load(
                     std::memory_order_relaxed);

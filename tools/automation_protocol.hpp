@@ -131,6 +131,17 @@ constexpr bool IsColosseumBattleNowMenu(std::uint32_t message_id)
   return message_id >= 0x3c00u && message_id <= 0x3dffu;
 }
 
+// The room the front-end runs in: mode select, Options, the Story Mode
+// continue prompt and the Battle Now setup. The mode select only publishes a
+// band message while its help window is up, and Options never does, so the
+// room is what identifies the front-end as a whole.
+constexpr std::uint32_t kColosseumFrontEndRoom = 0xa1;
+
+constexpr bool IsColosseumFrontEnd(std::uint32_t room_id, bool battle_now_menu_active)
+{
+  return battle_now_menu_active || room_id == kColosseumFrontEndRoom;
+}
+
 // The front-end never clears active_ui_message_id when it hands the screen back
 // to the attract title. Quitting out of mode select leaves the last highlighted
 // entry's id (0x3c1d) resident for the rest of the session, so a band match on
@@ -309,8 +320,7 @@ constexpr bool ShouldUseColosseumAuthoredMenuPresentation(bool complete_menu_act
                                                            bool navigation_valid,
                                                            bool character_naming_active,
                                                            bool gameplay_started = false,
-                                                           bool battle_gameplay_active = false,
-                                                           bool battle_now_menu_active = false)
+                                                           bool battle_gameplay_active = false)
 {
   // Field submenus and the pre-field character naming scene are authored as
   // complete 4:3 canvases. Applying the Hor+ projection multiplier to the
@@ -320,12 +330,15 @@ constexpr bool ShouldUseColosseumAuthoredMenuPresentation(bool complete_menu_act
   // immediately after loading a savestate. Once gameplay has started, a complete
   // menu bit is sufficient evidence that the frame is an authored 4:3 canvas.
   //
-  // Battle Now's popup backing uses authored clipping while its border/text
-  // use the menu projection. Keep the whole setup canvas at its authored aspect
-  // so both agree. An identified arena takes precedence over menu overlays.
+  // The front-end (mode select, Options, Battle Now setup) is deliberately not
+  // here: the game lays it out for the widescreen target itself, so it presents
+  // Hor+ like the live title behind it. Its backdrop and its popups' authored
+  // clipping are adapted in the renderer (GFX_COLOSSEUM_FRONT_END_HOR_PLUS).
+  // Pinning it to 4:3 made the presentation flip whenever the front-end's
+  // message window came and went. An identified arena takes precedence over
+  // menu overlays.
   return !battle_gameplay_active &&
-         (battle_now_menu_active ||
-          (!navigation_valid && character_naming_active) ||
+         ((!navigation_valid && character_naming_active) ||
           (complete_menu_active && (navigation_valid || gameplay_started)));
 }
 
