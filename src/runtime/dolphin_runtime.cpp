@@ -4017,7 +4017,14 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   Config::SetBase(Config::MAIN_OVERCLOCK_ENABLE, cpu_clock != 100);
   Config::SetBase(Config::MAIN_OVERCLOCK, static_cast<float>(cpu_clock) / 100.0f);
   std::fprintf(stderr, "[core] cpu clock %d%%\n", cpu_clock);
-  if (!impl->config.graphics.backend.empty())
+  // Aurora rendering in-process draws, copies and presents everything itself,
+  // so Dolphin's backend is Null whatever is configured: a Vulkan one, though
+  // idle, held ~2.9 GB more memory and ~1.4 GB more VRAM at the same FPS
+  // (battle savestate, 2026-10-31).
+  const char* const aurora_native = std::getenv("MODERNGEKKO_AURORA_NATIVE");
+  if (aurora_native && *aurora_native)
+    Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("Null"));
+  else if (!impl->config.graphics.backend.empty())
     Config::SetBase(Config::MAIN_GFX_BACKEND, impl->config.graphics.backend);
   else if (impl->config.headless)
     Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("Null"));
