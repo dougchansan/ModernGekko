@@ -258,6 +258,8 @@ struct NavigationOverlayState
   std::atomic<int> published_aspect_mode{-1};
   std::atomic<std::uint64_t> presentation_transitions{0};
   bool field_overlay_session_active = false;
+  bool menu_was_active = false;
+  bool stale_field_overlay = false;
   bool battle_gameplay_session_active = false;
   unsigned int battle_now_arena_room = 0;
   int battle_gameplay_message_fields = 0;
@@ -4476,13 +4478,23 @@ RuntimeRunResult Runtime::Run() {
           const u32 field_overlay_mode = memory.Read_U8(field_overlay_mode_address);
           const u32 field_overlay_phase = memory.Read_U8(field_overlay_phase_address);
           const u32 dialogue_object = memory.Read_U32(dialogue_object_address);
+          // Leaving the PDA leaves overlay mode 0x18 behind. The Start menu
+          // (root page 0x013A) opening over that stale value is a complete
+          // menu, not a field overlay; only a fresh 0x18 inside it is.
+          auto& nav = m_impl->navigation_overlay;
+          if (menu_active && !nav.menu_was_active)
+            nav.stale_field_overlay = field_overlay_mode == 0x18 &&
+                                      memory.Read_U16(active_ui_message_id_address) == 0x013A;
+          if (field_overlay_mode != 0x18)
+            nav.stale_field_overlay = false;
+          nav.menu_was_active = menu_active;
           if (!menu_active)
           {
-            m_impl->navigation_overlay.field_overlay_session_active = false;
+            nav.field_overlay_session_active = false;
           }
-          else if (field_overlay_mode == 0x18)
+          else if (field_overlay_mode == 0x18 && !nav.stale_field_overlay)
           {
-            m_impl->navigation_overlay.field_overlay_session_active = true;
+            nav.field_overlay_session_active = true;
           }
 
           // A savestate may resume directly inside a nested shop inventory
