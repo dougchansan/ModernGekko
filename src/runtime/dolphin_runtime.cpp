@@ -260,6 +260,7 @@ struct NavigationOverlayState
   bool field_overlay_session_active = false;
   bool menu_was_active = false;
   bool stale_field_overlay = false;
+  bool start_menu_session = false;
   bool battle_gameplay_session_active = false;
   unsigned int battle_now_arena_room = 0;
   int battle_gameplay_message_fields = 0;
@@ -4472,8 +4473,12 @@ RuntimeRunResult Runtime::Run() {
           // menu, not a field overlay; only a fresh 0x18 inside it is.
           auto& nav = m_impl->navigation_overlay;
           if (menu_active && !nav.menu_was_active)
-            nav.stale_field_overlay = field_overlay_mode == 0x18 &&
-                                      memory.Read_U16(active_ui_message_id_address) == 0x013A;
+          {
+            // Whether this menu opened on the Start menu's root page; the PC
+            // and other opaque canvases open on their own pages.
+            nav.start_menu_session = memory.Read_U16(active_ui_message_id_address) == 0x013A;
+            nav.stale_field_overlay = field_overlay_mode == 0x18 && nav.start_menu_session;
+          }
           if (field_overlay_mode != 0x18)
             nav.stale_field_overlay = false;
           nav.menu_was_active = menu_active;
@@ -4822,7 +4827,8 @@ RuntimeRunResult Runtime::Run() {
           // field overlays. Only the PDA is an opaque 4:3 canvas (its sides get
           // the PDA backdrop).
           const bool field_page_active =
-              complete_menu_active && !pda_message_active && valid &&
+              complete_menu_active && m_impl->navigation_overlay.start_menu_session &&
+              !pda_message_active && valid &&
               m_impl->navigation_overlay.ultrawide_gameplay_started.load(std::memory_order_relaxed) &&
               !battle_field_archive && !character_naming_active && !movie_active &&
               !battle_gameplay_active && memory.Read_U8(room_id_address) != 0xA1;
