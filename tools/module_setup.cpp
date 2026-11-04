@@ -48,7 +48,14 @@ bool HostHasFma()
   const bool osxsave = (regs[2] & (1 << 27)) != 0;
   if (!fma || !osxsave)
     return false;
+#if defined(_MSC_VER) && !defined(__clang__)
   return (_xgetbv(0) & 0x6) == 0x6;
+#else
+  // XGETBV directly: GCC only inlines _xgetbv into code built with -mxsave.
+  unsigned int eax = 0, edx = 0;
+  __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+  return (eax & 0x6) == 0x6;
+#endif
 #else
   return false;
 #endif
