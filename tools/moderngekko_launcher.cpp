@@ -395,20 +395,30 @@ std::optional<fs::path> PrepareDisc(const fs::path& image, const fs::path& user_
 // (release packages carry no game-derived code). Progress goes to `state`.
 bool EnsureGameModule(const fs::path& game, const fs::path& user_directory,
                       const fs::path& release_directory, ExtractionState* state,
-                      std::string* error)
+                      std::string* error, bool standalone = false)
 {
   const auto inspected = moderngekko::InspectGame(game);
   if (!inspected)
     return true;  // the caller reports an invalid game
   const std::string& disc_id = inspected.metadata->disc_id;
-  if (moderngekko::frontend::HasGameModule(release_directory, user_directory, disc_id))
+  if (standalone)
+  {
+    // The experimental Dolphin-free host loads a module of its own.
+    if (moderngekko::frontend::HasStandaloneModule(release_directory, user_directory, disc_id))
+      return true;
+  }
+  else if (moderngekko::frontend::HasGameModule(release_directory, user_directory, disc_id))
+  {
     return true;
-  if (!moderngekko::frontend::CanBuildGameModule(release_directory))
+  }
+  if (!standalone && !moderngekko::frontend::CanBuildGameModule(release_directory))
   {
     *error = "The game module is missing and this release cannot build it.";
     return false;
   }
-  return moderngekko::frontend::BuildGameModule(
+  const auto build = standalone ? moderngekko::frontend::BuildStandaloneModule :
+                                  moderngekko::frontend::BuildGameModule;
+  return build(
       game, disc_id, release_directory, user_directory,
       [state](const std::string& status, unsigned done, unsigned total)
       {
@@ -452,6 +462,13 @@ bool ExtractDisc(const fs::path& image, const fs::path& user_directory,
   std::string disc_id = volume->GetGameID(partition);
   if (disc_id.size() != 6)
     return fail("the selected image has an invalid disc ID");
+  {
+    // The Dolphin-free standalone host boots the disc image itself, not the extraction.
+    std::error_code stamp_error;
+    fs::create_directories(user_directory / "Setup", stamp_error);
+    std::ofstream(user_directory / "Setup" / (disc_id + "-source-image.txt"), std::ios::trunc)
+        << image.string();
+  }
 #ifdef MODERNGEKKO_REQUIRED_DISC_ID
   if (disc_id != MODERNGEKKO_REQUIRED_DISC_ID)
     return fail("this frontend requires disc ID " MODERNGEKKO_REQUIRED_DISC_ID "; selected " +
@@ -1795,10 +1812,20 @@ int main(int argc, char** argv)
   };
   // A game extracted without its native module (by an older release, or the module was
   // removed) is built from the extracted game, once, before it can be played.
+  const auto standalone_selected = [&]
+  {
+    return config.experimental_standalone &&
+           moderngekko::frontend::HasStandaloneHost(release_directory);
+  };
   const auto module_missing_for = [&](const moderngekko::GameInspectResult& metadata)
   {
-    return metadata && !moderngekko::frontend::HasGameModule(release_directory, user_directory,
-                                                              metadata.metadata->disc_id);
+    if (!metadata)
+      return false;
+    const std::string& disc_id = metadata.metadata->disc_id;
+    return !moderngekko::frontend::HasGameModule(release_directory, user_directory, disc_id) ||
+           (standalone_selected() &&
+            !moderngekko::frontend::HasStandaloneModule(release_directory, user_directory,
+                                                        disc_id));
   };
   bool module_missing = module_missing_for(current_metadata);
   const auto start_module_build = [&]
@@ -1815,11 +1842,14 @@ int main(int argc, char** argv)
       extraction.status = "Preparing to build the game";
     }
     const fs::path game = current_game;
+    const bool standalone = standalone_selected();
     extraction_thread = std::jthread(
-        [game, user_directory, release_directory, &extraction]
+        [game, user_directory, release_directory, standalone, &extraction]
         {
           std::string error;
-          if (EnsureGameModule(game, user_directory, release_directory, &extraction, &error))
+          if (EnsureGameModule(game, user_directory, release_directory, &extraction, &error) &&
+              (!standalone || EnsureGameModule(game, user_directory, release_directory,
+                                               &extraction, &error, true)))
           {
             extraction.module_ready = true;
           }
@@ -3086,6 +3116,30 @@ int main(int argc, char** argv)
       rows.push_back(toggle("HD DYNAMIC TEXT", &config.text_upscale,
                             "Rebuilds the game's dialogue and menu text at 4x on the GPU."));
       {
+        const bool available = moderngekko::frontend::HasStandaloneHost(release_directory);
+        theme::Row standalone = toggle(
+            "DOLPHIN-FREE (EXPERIMENTAL)", &config.experimental_standalone,
+            available ?
+                "Plays on the standalone host instead of Dolphin. No mods (free camera, "
+                "followers), online battle, netplay, GBA link or savestates. Uses its own "
+                "memory card, which starts with copies of your saves; needs an ISO or GCM." :
+                "This release does not include the standalone host.");
+        standalone.enabled = available;
+        standalone.changed = [&](const theme::Row& row)
+        {
+          const bool previous = config.experimental_standalone;
+          config.experimental_standalone = row.on;
+          if (!persist())
+          {
+            config.experimental_standalone = previous;
+            return false;
+          }
+          module_missing = module_missing_for(current_metadata);
+          return true;
+        };
+        rows.push_back(standalone);
+      }
+      {
         theme::Row pack = toggle("COMMUNITY HD PACK (SEPHIE)", &config.community_hd_texture_pack,
                                  community_pack_status.available ?
                                      "Sephie's community texture pack, installed into the "
@@ -3671,6 +3725,63 @@ int main(int argc, char** argv)
     {
       SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Launch failed", launch_error.c_str(), window);
       result = 1;
+    }
+    else if (standalone_selected() && current_metadata)
+    {
+      const std::string disc_id = current_metadata.metadata->disc_id;
+      std::ifstream stamp(user_directory / "Setup" / (disc_id + "-source-image.txt"));
+      std::string image_text((std::istreambuf_iterator<char>(stamp)), std::istreambuf_iterator<char>());
+      while (!image_text.empty() && (image_text.back() == '\n' || image_text.back() == '\r'))
+        image_text.pop_back();
+      const fs::path image = fs::path(image_text);
+      std::string extension = image.extension().string();
+      std::ranges::transform(extension, extension.begin(),
+                             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      std::error_code ec;
+      std::string standalone_error;
+      if (image_text.empty() || !fs::is_regular_file(image, ec))
+        standalone_error = "The Dolphin-free mode boots the original disc image, and the launcher "
+                           "does not know where it is. Extract the game again from your ISO.";
+      else if (extension != ".iso" && extension != ".gcm")
+        standalone_error = "The Dolphin-free mode needs an ISO or GCM disc image; " +
+                           image.filename().string() + " is not one.";
+      if (!standalone_error.empty())
+      {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Dolphin-free mode",
+                                 standalone_error.c_str(), window);
+        result = 1;
+      }
+      else
+      {
+        const fs::path pref = user_directory / "Standalone";
+        fs::create_directories(pref, ec);
+        SDL_Environment* environment = SDL_GetEnvironment();
+        // Its own settings and card; a new card starts with copies of the GCI saves.
+        SDL_SetEnvironmentVariable(environment, "STANDALONE_PREF_DIR",
+                                   (pref.string() + "/").c_str(), true);
+        const fs::path card_folder = user_directory / "GC" / "USA" / "Card A";
+        if (fs::is_directory(card_folder, ec))
+          SDL_SetEnvironmentVariable(environment, "STANDALONE_IMPORT_GCI",
+                                     card_folder.string().c_str(), true);
+        const std::string executable =
+            moderngekko::frontend::StandaloneExecutable(release_directory).string();
+        const std::string image_argument = image.string();
+        const std::string module_argument =
+            moderngekko::frontend::StandaloneModule(user_directory, disc_id).string();
+        const char* arguments[] = {executable.c_str(), image_argument.c_str(),
+                                   module_argument.c_str(), nullptr};
+        SDL_Process* process = SDL_CreateProcess(arguments, false);
+        if (!process)
+        {
+          const std::string message = "Could not start " + executable + ": " + SDL_GetError();
+          SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Launch failed", message.c_str(), window);
+          result = 1;
+        }
+        else
+        {
+          SDL_DestroyProcess(process);
+        }
+      }
     }
     else
     {

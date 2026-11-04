@@ -34,4 +34,17 @@ using ModuleProgress = std::function<void(const std::string& status, unsigned do
 bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
                      const fs::path& release_directory, const fs::path& user_directory,
                      const ModuleProgress& progress, std::string* error);
+
+// The experimental Dolphin-free standalone host a release may carry in Standalone/: its
+// executable, the module it loads (built by its own module tool, without fastmem where
+// the host has none), and whether that module is there.
+fs::path StandaloneDirectory(const fs::path& release_directory);
+fs::path StandaloneExecutable(const fs::path& release_directory);
+bool HasStandaloneHost(const fs::path& release_directory);
+fs::path StandaloneModule(const fs::path& user_directory, const std::string& disc_id);
+bool HasStandaloneModule(const fs::path& release_directory, const fs::path& user_directory,
+                         const std::string& disc_id);
+bool BuildStandaloneModule(const fs::path& game_root, const std::string& disc_id,
+                           const fs::path& release_directory, const fs::path& user_directory,
+                           const ModuleProgress& progress, std::string* error);
 }  // namespace moderngekko::frontend

@@ -207,6 +207,9 @@ ConfigResult LoadConfig(const fs::path &user_directory,
     } else if (key == "dump_textures") {
       if (!ParseBoolean(value, &config.dump_textures))
         return {.error = "dump_textures must be true or false"};
+    } else if (key == "experimental_standalone") {
+      if (!ParseBoolean(value, &config.experimental_standalone))
+        return {.error = "experimental_standalone must be true or false"};
     } else if (key == "text_upscale") {
       if (!ParseBoolean(value, &config.text_upscale))
         return {.error = "text_upscale must be true or false"};
@@ -388,7 +391,7 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
       "aspect_ratio", "force_texture_filtering", "max_anisotropy",
       "osd_font_size", "navigation_overlay", "hires_textures",
       "community_hd_texture_pack", "cache_hires_textures", "dump_textures",
-      "text_upscale", "input_overlay", "minimap_high_contrast",
+      "text_upscale", "experimental_standalone", "input_overlay", "minimap_high_contrast",
       "accessibility_ui_scale", "ultrawide_efb_scale", "fullscreen",
       "exclusivefullscreen", "show_fps_in_title", "sixty_fps",
       "cpu_clock", "guest_idle_skip", "dual_core", "fast_forward",
@@ -442,6 +445,8 @@ bool SaveConfig(const fs::path &user_directory, const ConfigResult &config,
         << (config.cache_hires_textures ? "true" : "false") << '\n'
         << "dump_textures=" << (config.dump_textures ? "true" : "false") << '\n'
         << "text_upscale=" << (config.text_upscale ? "true" : "false") << '\n'
+        << "experimental_standalone=" << (config.experimental_standalone ? "true" : "false")
+        << '\n'
         << "input_overlay=" << (config.input_overlay ? "true" : "false") << '\n'
         << "minimap_high_contrast="
         << (config.minimap_high_contrast ? "true" : "false") << '\n'

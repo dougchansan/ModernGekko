@@ -56,6 +56,8 @@ struct ConfigResult {
   bool cache_hires_textures = false;
   bool dump_textures = false;
   bool text_upscale = false;
+  // Run the game on the Dolphin-free standalone host (Standalone/ in the release).
+  bool experimental_standalone = false;
   int ultrawide_efb_scale = 5;
   bool input_overlay = false;
   bool minimap_high_contrast = false;

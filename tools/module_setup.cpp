@@ -374,22 +374,18 @@ bool CanBuildGameModule(const fs::path& release_directory)
          fs::is_directory(tools / "ModuleSource", ec);
 }
 
-bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
-                     const fs::path& release_directory, const fs::path& user_directory,
-                     const ModuleProgress& progress, std::string* error)
+// Runs a bundled module tool (moderngekko-port, or the standalone host's
+// colosseum-module-tool) over the extracted game; `built` receives the module.
+static bool RunModuleTool(const fs::path& tool, const fs::path& tools, const fs::path& game_root,
+                          const std::string& disc_id, const fs::path& cache, bool hook_aware,
+                          const fs::path& user_directory, const ModuleProgress& progress,
+                          std::optional<fs::path>& built, std::string* error)
 {
-  if (!CanBuildGameModule(release_directory))
-  {
-    *error = "this release cannot build the game module (Tools folder missing)";
-    return false;
-  }
   fs::path zig;
   if (!EnsureZig(user_directory, progress, &zig, error))
     return false;
 
-  const fs::path tools = ToolsDirectory(release_directory);
-  const fs::path cache = user_directory / "StaticRecompModules" / "build";
-  std::vector<std::string> args = {(tools / ExecutableName("moderngekko-port")).string(),
+  std::vector<std::string> args = {tool.string(),
                                    "build", game_root.string(), "--backend", "c",
                                    "--opt-level", "2", "--output", cache.string(), "--zig",
                                    zig.string(), "--progress"};
@@ -398,7 +394,7 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
     args.insert(args.end(), {"--arch-flags", "-mfma"});
   std::error_code ec;
   const fs::path hooks = tools / (disc_id + "-module-hooks.txt");
-  if (fs::is_regular_file(hooks, ec))
+  if (hook_aware && fs::is_regular_file(hooks, ec))
   {
     args.insert(args.end(), {"--hook-list", hooks.string()});
     // The game's task scheduler: its idle loop has to come back through the dispatcher.
@@ -417,7 +413,6 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
   fs::create_directories(log_path.parent_path(), ec);
   std::ofstream log(log_path, std::ios::trunc);
   std::deque<std::string> recent;
-  std::optional<fs::path> built;
   progress("Converting the game's code", 0, 0);
   const int exit_code = RunProcess(
       args, {{"MODERNGEKKO_SOURCE_DIR", (tools / "ModuleSource").string()}},
@@ -469,6 +464,26 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
              "); details are in " + log_path.string() + "\n" + tail;
     return false;
   }
+  return true;
+}
+
+bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
+                     const fs::path& release_directory, const fs::path& user_directory,
+                     const ModuleProgress& progress, std::string* error)
+{
+  if (!CanBuildGameModule(release_directory))
+  {
+    *error = "this release cannot build the game module (Tools folder missing)";
+    return false;
+  }
+  const fs::path tools = ToolsDirectory(release_directory);
+  std::optional<fs::path> built;
+  if (!RunModuleTool(tools / ExecutableName("moderngekko-port"), tools, game_root, disc_id,
+                     user_directory / "StaticRecompModules" / "build", true, user_directory,
+                     progress, built, error))
+    return false;
+  std::error_code ec;
+  const fs::path hooks = tools / (disc_id + "-module-hooks.txt");
   // The 60 FPS module is the same build: the frame period is set host-side.
   for (const bool sixty : {false, true})
   {
@@ -486,6 +501,90 @@ bool BuildGameModule(const fs::path& game_root, const std::string& disc_id,
   const fs::path manifest = built->parent_path() / "manifest.txt";
   if (fs::is_regular_file(manifest, ec))
     fs::copy_file(manifest, ManifestStamp(user_directory, disc_id),
+                  fs::copy_options::overwrite_existing, ec);
+  progress("Game ready", 1, 1);
+  return true;
+}
+
+fs::path StandaloneDirectory(const fs::path& release_directory)
+{
+  return release_directory / "Standalone";
+}
+
+fs::path StandaloneExecutable(const fs::path& release_directory)
+{
+  return StandaloneDirectory(release_directory) / ExecutableName("colosseum-standalone");
+}
+
+bool HasStandaloneHost(const fs::path& release_directory)
+{
+  std::error_code ec;
+  const fs::path tools = StandaloneDirectory(release_directory) / "Tools";
+  return fs::is_regular_file(StandaloneExecutable(release_directory), ec) &&
+         fs::is_regular_file(tools / ExecutableName("colosseum-module-tool"), ec) &&
+         fs::is_regular_file(tools / ExecutableName("dolrecomp"), ec) &&
+         fs::is_directory(tools / "ModuleSource", ec);
+}
+
+fs::path StandaloneModule(const fs::path& user_directory, const std::string& disc_id)
+{
+  return user_directory / "StaticRecompModules" / "standalone" /
+         ("g" + disc_id + "_recomp" + LibrarySuffix());
+}
+
+bool HasStandaloneModule(const fs::path& release_directory, const fs::path& user_directory,
+                         const std::string& disc_id)
+{
+  std::error_code ec;
+  const fs::path module = StandaloneModule(user_directory, disc_id);
+  if (!fs::is_regular_file(module, ec))
+    return false;
+  // A release with another host revision needs its module built again.
+  const fs::path revisions = StandaloneDirectory(release_directory) / "SOURCE_REVISIONS.txt";
+  return !fs::is_regular_file(revisions, ec) ||
+         ReadWhole(revisions) == ReadWhole(module.parent_path() / "host-revision.txt");
+}
+
+bool BuildStandaloneModule(const fs::path& game_root, const std::string& disc_id,
+                           const fs::path& release_directory, const fs::path& user_directory,
+                           const ModuleProgress& progress, std::string* error)
+{
+  if (!HasStandaloneHost(release_directory))
+  {
+    *error = "this release does not carry the standalone host (Standalone folder missing)";
+    return false;
+  }
+  const fs::path standalone = StandaloneDirectory(release_directory);
+  const fs::path tools = standalone / "Tools";
+  // The tool takes the patch lists from Tools/<disc>-native-*.csv; the standalone package
+  // keeps them in patches/.
+  std::error_code ec;
+  for (const char* list : {"-native-widescreen.csv", "-native-substitutions.csv"})
+  {
+    const fs::path from = standalone / "patches" / (disc_id + list);
+    if (fs::is_regular_file(from, ec))
+      fs::copy_file(from, tools / (disc_id + list), fs::copy_options::overwrite_existing, ec);
+  }
+  std::optional<fs::path> built;
+  if (!RunModuleTool(tools / ExecutableName("colosseum-module-tool"), tools, game_root, disc_id,
+                     user_directory / "StaticRecompModules" / "standalone-build", false,
+                     user_directory, progress, built, error))
+    return false;
+  const fs::path destination = StandaloneModule(user_directory, disc_id);
+  fs::create_directories(destination.parent_path(), ec);
+  fs::copy_file(*built, destination, fs::copy_options::overwrite_existing, ec);
+  if (ec)
+  {
+    *error = "could not install the standalone module: " + ec.message();
+    return false;
+  }
+  const fs::path revisions = standalone / "SOURCE_REVISIONS.txt";
+  if (fs::is_regular_file(revisions, ec))
+    fs::copy_file(revisions, destination.parent_path() / "host-revision.txt",
+                  fs::copy_options::overwrite_existing, ec);
+  const fs::path manifest = built->parent_path() / "manifest.txt";
+  if (fs::is_regular_file(manifest, ec))
+    fs::copy_file(manifest, destination.parent_path() / (disc_id + "-module-manifest.txt"),
                   fs::copy_options::overwrite_existing, ec);
   progress("Game ready", 1, 1);
   return true;
