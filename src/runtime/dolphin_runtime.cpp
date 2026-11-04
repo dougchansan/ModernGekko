@@ -4835,7 +4835,10 @@ RuntimeRunResult Runtime::Run() {
                       std::memory_order_relaxed),
                   // A confirmed arena message is a live battle even before the
                   // session latches (it waits for the arena archive to load).
-                  battle_gameplay_active || battle_gameplay_message);
+                  // In a field with a non-battle archive the same ids (0x00E7)
+                  // belong to the Start menu's Pokemon list, not a battle.
+                  battle_gameplay_active ||
+                      (battle_gameplay_message && !(valid && !battle_field_archive)));
           // Despite the Config key's name, GFX_WIDESCREEN_AUTHORED_MENU is
           // deliberately naming-only. It drives two things: the model
           // projection scale in VertexShaderManager, which must not touch
