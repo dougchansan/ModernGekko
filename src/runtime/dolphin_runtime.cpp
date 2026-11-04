@@ -4828,9 +4828,18 @@ RuntimeRunResult Runtime::Run() {
                   character_naming_active, movie_active, battle_field_archive);
           const bool battle_gameplay_active =
               m_impl->navigation_overlay.battle_gameplay_session_active;
+          // The Start menu's Pokemon, Items and other field pages draw over
+          // the live field, so they keep the Hor+ world behind them like the
+          // field overlays. Only the PDA is an opaque 4:3 canvas (its sides get
+          // the PDA backdrop).
+          const bool field_page_active =
+              complete_menu_active && !pda_message_active && valid &&
+              m_impl->navigation_overlay.ultrawide_gameplay_started.load(std::memory_order_relaxed) &&
+              !battle_field_archive && !character_naming_active && !movie_active &&
+              !battle_gameplay_active && memory.Read_U8(room_id_address) != 0xA1;
           const bool authored_menu_active =
               automation::ShouldUseColosseumAuthoredMenuPresentation(
-                  complete_menu_active, valid, character_naming_active,
+                  complete_menu_active && !field_page_active, valid, character_naming_active,
                   m_impl->navigation_overlay.ultrawide_gameplay_started.load(
                       std::memory_order_relaxed),
                   // A confirmed arena message is a live battle even before the
