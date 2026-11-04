@@ -1748,23 +1748,12 @@ void DrawNavigationOverlay()
     {
       ImDrawList* const overlay = ImGui::GetForegroundDrawList();
       const ImU32 background = IM_COL32(3, 20, 14, 255);
-      const ImU32 scanline = IM_COL32(1, 74, 7, 255);
       overlay->AddRectFilled({0.0f, 0.0f},
                              {static_cast<float>(layout.left_end), display.y},
                              background);
       overlay->AddRectFilled({static_cast<float>(layout.right_begin), 0.0f},
                              display, background);
 
-      for (float y = 0.0f; y < display.y; y += layout.scanline_spacing)
-      {
-        const float line_end =
-            std::min(y + static_cast<float>(layout.scanline_thickness), display.y);
-        overlay->AddRectFilled({0.0f, y},
-                               {static_cast<float>(layout.left_end), line_end},
-                               scanline);
-        overlay->AddRectFilled({static_cast<float>(layout.right_begin), y},
-                               {display.x, line_end}, scanline);
-      }
     }
   }
 
