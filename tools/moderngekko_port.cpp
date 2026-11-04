@@ -836,6 +836,11 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
   }
   if (!options.arch_flags.empty())
     flags += " arch:" + options.arch_flags;
+#if defined(COLOSSEUM_STANDALONE_MODULE) && !defined(COLOSSEUM_STANDALONE_FASTMEM)
+  // The standalone host has no fault-backed fastmem view. Its modules should
+  // use the checked inline RAM path, not an out-of-line fastmem miss per access.
+  flags += " -DDOLRECOMP_NO_FASTMEM=1";
+#endif
   // The substitution set changes the emitted code itself - each named entry
   // point gets a guarded call to a native routine - so two builds that differ
   // only in it must not share a cache entry. Without this, switching
@@ -1083,6 +1088,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
     job.game_id = game.disc_id;
     job.opt_level = opt;
     job.extra_defines = options.defines;
+#if defined(COLOSSEUM_STANDALONE_MODULE) && !defined(COLOSSEUM_STANDALONE_FASTMEM)
+    job.extra_defines.emplace_back("DOLRECOMP_NO_FASTMEM=1");
+#endif
     {
       std::istringstream flags_in(options.arch_flags);
       for (std::string flag; flags_in >> flag;)
@@ -1122,6 +1130,9 @@ std::optional<fs::path> Build(const char* argv0, const fs::path& root,
            : " \"-DRECOMPCORE_MODULE_ARCH_FLAGS=" + options.arch_flags + "\"") +
       " -DCHASSIS_ABI_DIR=" +
       Quote(source_root / "vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp");
+#if defined(COLOSSEUM_STANDALONE_MODULE) && !defined(COLOSSEUM_STANDALONE_FASTMEM)
+  configure += " -DRECOMPCORE_MODULE_NO_FASTMEM=ON";
+#endif
   if (!options.pgo_generate.empty())
   {
     fs::path runtime = options.profile_runtime;
