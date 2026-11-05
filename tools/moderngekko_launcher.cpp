@@ -1213,10 +1213,20 @@ int main(int argc, char** argv)
       configured_controllers = moderngekko::frontend::ReadConfiguredControllers(user_directory);
       if (configured_controllers.empty())
       {
-        std::lock_guard lock(dialog.mutex);
-        dialog.error = std::string(CONTROLLER_PROFILE_NAME) +
-                       " has no configured controller device";
-        return false;
+        // A profile without a device (one an older release left behind) plays on the
+        // keyboard, which is always in the list, rather than refusing to start.
+        controller_profile_exists = false;
+        const int keyboard =
+            FindController(controllers, moderngekko::frontend::KeyboardDevice());
+        if (keyboard < 0)
+        {
+          std::lock_guard lock(dialog.mutex);
+          dialog.error = std::string(CONTROLLER_PROFILE_NAME) +
+                         " has no configured controller device";
+          return false;
+        }
+        controller_index = keyboard;
+        return select_controller(keyboard);
       }
       selected_controller = configured_controllers.front();
       controller_index = FindController(controllers, selected_controller);
