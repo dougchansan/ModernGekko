@@ -4814,6 +4814,15 @@ RuntimeRunResult Runtime::Run() {
                 automation::ShouldRetainColosseumBattleNowArena(
                     overlay.battle_now_arena_room, current_room, valid);
           }
+          // The game's own fight flag (decomp lbl_8047B5DA: set by _fightInitialize,
+          // cleared by _fightFinalize) settles the rest. A story battle can start
+          // without the collision rescan ever seeing its _bf archive (a trainer
+          // battle in Pyrite kept reporting M2_out), and its field actor table
+          // stays valid, so its Items and Pokemon screens and the intro were
+          // presented as authored 4:3 menus: the side margins came back mid-battle.
+          constexpr u32 fight_active_address = 0x8047B5DA;
+          battle_field_archive =
+              battle_field_archive || memory.Read_U8(fight_active_address) != 0;
           m_impl->navigation_overlay.battle_gameplay_session_active =
               automation::ResolveColosseumBattleGameplaySession(
                   m_impl->navigation_overlay.battle_gameplay_session_active,
