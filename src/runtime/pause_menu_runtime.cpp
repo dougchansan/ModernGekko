@@ -83,6 +83,7 @@ void Host_TogglePauseMenuFullscreen();
 void Host_SetExclusiveFullscreen(bool exclusive);
 bool Host_IsExclusiveFullscreen();
 void Host_SetFastForwardActive(bool active);
+bool Host_IsFastForwardEnabled();
 void Host_SetPauseMenuResolution(int scale);
 void Host_SaveCameraForState(const std::string &state_path);
 
@@ -256,6 +257,19 @@ bool SpinTestActive(const Menu &menu) {
 void Filter(int port, GCPadStatus &pad) {
   if (port != 0 || polling_menu)
     return;
+  // Controller 1's right trigger holds fast-forward, like Space, when the
+  // fast-forward option is on. It changes the speed only on a press or a
+  // release, so it never cancels a fast-forward that Space is holding, and the
+  // game still receives R.
+  {
+    static bool trigger_fast_forward = false;
+    const bool held = Host_IsFastForwardEnabled() &&
+                      ((pad.button & PAD_TRIGGER_R) != 0 || pad.triggerRight > 200);
+    if (held != trigger_fast_forward) {
+      trigger_fast_forward = held;
+      Host_SetFastForwardActive(held);
+    }
+  }
   const auto menu = current.load();
   if (!menu || !menu->active)
     return;
