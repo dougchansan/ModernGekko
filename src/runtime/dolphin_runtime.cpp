@@ -266,6 +266,12 @@ struct NavigationOverlayState
   unsigned int battle_now_arena_room = 0;
   int battle_gameplay_message_fields = 0;
   int battle_now_hold_fields = 0;
+  // Fields since the generic menu flag rose (capped), and fields left in the
+  // hold after the game's fight flag last read set: a story battle raises the
+  // menu flag ~13 fields before _fightInitialize sets the fight flag, and
+  // clears the fight flag a couple of fields before the menu flag.
+  int field_menu_open_fields = 0;
+  int fight_recent_fields = 0;
   int front_end_dismiss_hold_fields = 0;
   u32 pyrite_sky_root = 0;
   u32 pyrite_sky_original_translate_y = 0;
@@ -4824,8 +4830,8 @@ RuntimeRunResult Runtime::Run() {
           // stays valid, so its Items and Pokemon screens and the intro were
           // presented as authored 4:3 menus: the side margins came back mid-battle.
           constexpr u32 fight_active_address = 0x8047B5DA;
-          battle_field_archive =
-              battle_field_archive || memory.Read_U8(fight_active_address) != 0;
+          const bool fight_active = memory.Read_U8(fight_active_address) != 0;
+          battle_field_archive = battle_field_archive || fight_active;
           m_impl->navigation_overlay.battle_gameplay_session_active =
               automation::ResolveColosseumBattleGameplaySession(
                   m_impl->navigation_overlay.battle_gameplay_session_active,
@@ -4844,9 +4850,34 @@ RuntimeRunResult Runtime::Run() {
               m_impl->navigation_overlay.ultrawide_gameplay_started.load(std::memory_order_relaxed) &&
               !battle_field_archive && !character_naming_active && !movie_active &&
               !battle_gameplay_active && memory.Read_U8(room_id_address) != 0xA1;
+          // A story trainer battle starts with fightStartEncount (0x8020DAD0):
+          // the menu flag rises with its wipe, the distortion over the field,
+          // and the fight flag only follows ~13 fields later from
+          // _fightInitialize. In that gap the wipe read as a complete 4:3
+          // menu and was pillarboxed for a moment. Leaving, the fight flag
+          // clears a couple of fields before the menu flag does. So a complete
+          // menu that opens in a walkable field waits a short grace before it
+          // becomes a 4:3 canvas (the PC opens behind a fade), and a fight
+          // flag seen within that grace keeps the battle's Hor+ either side.
+          constexpr int kFieldMenuEntryGraceFields = 24;
+          auto& field_menu = m_impl->navigation_overlay;
+          field_menu.field_menu_open_fields =
+              menu_active ? std::min(field_menu.field_menu_open_fields + 1, 1000) : 0;
+          if (fight_active)
+            field_menu.fight_recent_fields = kFieldMenuEntryGraceFields;
+          else if (field_menu.fight_recent_fields > 0)
+            --field_menu.fight_recent_fields;
+          const bool battle_transition_pending =
+              complete_menu_active && !field_page_active && valid &&
+              field_menu.ultrawide_gameplay_started.load(std::memory_order_relaxed) &&
+              !battle_field_archive && !battle_gameplay_active && !battle_now_active &&
+              !character_naming_active && !movie_active &&
+              (field_menu.field_menu_open_fields <= kFieldMenuEntryGraceFields ||
+               field_menu.fight_recent_fields > 0);
           const bool authored_menu_active =
               automation::ShouldUseColosseumAuthoredMenuPresentation(
-                  complete_menu_active && !field_page_active, valid, character_naming_active,
+                  complete_menu_active && !field_page_active && !battle_transition_pending,
+                  valid, character_naming_active,
                   m_impl->navigation_overlay.ultrawide_gameplay_started.load(
                       std::memory_order_relaxed),
                   // A confirmed arena message is a live battle even before the
