@@ -256,6 +256,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
   src/runtime/colosseum_font.cpp
   src/runtime/gc_controller_art.cpp
   tools/launcher_theme.cpp
+  src/runtime/discord_presence.cpp
   src/runtime/shadow_tracker.cpp
   src/runtime/quick_boot.cpp
   src/runtime/attract_video.cpp

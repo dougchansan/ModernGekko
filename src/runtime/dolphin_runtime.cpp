@@ -8,6 +8,7 @@
 #include "gc_controller_art.hpp"
 #include "launcher_savestates.hpp"
 #include "quick_boot.hpp"
+#include "discord_presence.hpp"
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
@@ -4240,6 +4241,8 @@ RuntimeRunResult Runtime::Run() {
                          "Dolphin could not boot sys/main.dol"}};
   }
   m_impl->booted = true;
+  if (restore_colosseum_guest_hook)
+    discord::Start(m_impl->config.user_directory / "config.ini");
   m_impl->present_hook =
       GetVideoEvents().after_present_event.Register([this](const PresentInfo& info) {
         m_impl->automation_state.frame_count.store(info.frame_count,
@@ -5257,6 +5260,7 @@ RuntimeRunResult Runtime::Run() {
     s_navigation_overlay_state.store(nullptr, std::memory_order_release);
   }
   m_impl->platform->SaveWindowGeometry();
+  discord::Stop();
   if (restore_colosseum_guest_hook)
     State::SetOnAfterLoadCallback(nullptr);
   Core::Stop(Core::System::GetInstance());
